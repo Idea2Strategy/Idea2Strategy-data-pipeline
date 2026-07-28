@@ -1,152 +1,332 @@
-# 미국 주식 10년 장기봉 파이프라인
+# Idea2Strategy DB 정합 시장 데이터 파이프라인
 
-기존 종목 유니버스 정책을 유지하면서 Alpaca SIP의 최근 10년 데이터를 정규장 기준 `1시간봉`, `4시간봉`, `일봉`으로 수집·갱신하는 프로젝트입니다.
+Alpaca SIP의 미국 주식·ETF 30분봉을 RAW와 ADJUSTED로 보존하고, XNYS
+정규장 1시간·4시간·일봉을 불변 Parquet 객체와 DBML 형태의 Catalog로
+관리합니다.
 
-## 현재 통합 파이프라인
+공식 진입점은 `market_pipeline.py`입니다. `daily_pipeline.py`도 기본적으로
+동일한 DAY 증분 엔진을 사용합니다. 기존 종목별 10년 파일 갱신은
+`--legacy-long-term`을 명시한 경우에만 실행됩니다.
 
-`daily_pipeline.py`는 다음 순서로 실행됩니다.
+## 데이터 계약
 
-1. Wikipedia에서 현재 및 최근 10년 S&P 500 편출입 관련 티커를 갱신
-2. `ticker_info/etf_universe.csv`의 검토된 ETF·ETP 27개를 병합
-3. 각 종목의 Alpaca SIP 30분봉을 Raw와 Adjusted로 조회
-4. XNYS 캘린더로 정규장 30분봉만 선택
-5. 개장 시각에 맞춘 1시간봉·4시간봉·일봉을 생성
-6. 결과 파일과 종목별 체크포인트를 저장
-7. OHLCV 구조와 기간·커버리지를 검사하고 보고서 생성
-
-30분봉은 집계를 위한 임시 입력입니다. 디스크에는 저장하지 않으며 1분봉·5분봉·15분봉도 새 통합 파이프라인에서 만들지 않습니다.
-
-## 데이터 범위
-
-- 가격 데이터: 최근 10년의 롤링 윈도우
-- 피드: Alpaca SIP
-- 가격 타입: Adjusted와 Raw 모두
-- 출력 주기: 1시간, 4시간, 1일
-- 거래 세션: XNYS 정규장
-- 종목 정책: 현재·최근 10년 S&P 500 관련 종목 + ETF·ETP 27개
-
-Alpaca 미국 주식 과거 데이터는 2016년부터 제공됩니다. 따라서 실행일 기준 10년 시작점이 2016년보다 빠르면 실제 결과는 Alpaca에 존재하는 최초 데이터부터 시작합니다. 신규 상장 종목은 상장일 이후 데이터만 생성됩니다.
-
-## 출력 구조
+연도마다 가격 유형을 섞지 않는 다음 8개 논리 데이터셋을 사용합니다.
 
 ```text
-market_hist_script/
-├── regular_sip_1hour_market_data/
-│   ├── adjusted/{csv,parquet}/
-│   └── raw/{csv,parquet}/
-├── regular_sip_4hour_market_data/
-│   ├── adjusted/{csv,parquet}/
-│   └── raw/{csv,parquet}/
-├── regular_sip_1day_market_data/
-│   ├── adjusted/{csv,parquet}/
-│   └── raw/{csv,parquet}/
-├── ticker_info/
-│   ├── sp500_tickers_10years.txt
-│   └── etf_universe.csv
-├── pipeline_state/
-│   ├── daily_pipeline_state.json
-│   └── inactive_symbols.json
-└── report/
-    ├── latest/{format}/
-    └── history/{XNYS-session-date}/{format}/
+ALPACA_SIP_RAW_30M
+├─ RAW 30m
+├─ DERIVED 1h
+├─ DERIVED 4h
+└─ DERIVED 1d
+
+ALPACA_SIP_ADJUSTED_30M
+├─ ADJUSTED 30m
+├─ DERIVED 1h
+├─ DERIVED 4h
+└─ DERIVED 1d
 ```
 
-파일명 예시:
+공급자 30분봉은 정규장 필터 전에 보존합니다. DERIVED만 XNYS 정규장으로
+필터링하며 `source_minutes`에 실제 관측된 30분봉 분량을 기록합니다.
+누락·미상장·공급자 미제공 구간은 생성하거나 보간하지 않습니다.
+
+공식 Parquet 열:
 
 ```text
-AAPL_1hour_sip_historical.parquet
-AAPL_4hour_sip_historical.parquet
-AAPL_1day_sip_historical.parquet
+instrument_id string UUID
+provider_symbol string
+bar_start_at timestamp[us, UTC]
+session_date_et date32
+open/high/low/close float64
+volume int64
+trade_count nullable int64
+vwap nullable float64
+source_minutes int16  # DERIVED에만 존재
 ```
-
-각 파일은 `symbol`, `timestamp` MultiIndex와 OHLCV, `trade_count`, `vwap`, `source_minutes`를 사용합니다. `source_minutes`는 결과 봉에 실제로 포함된 정규장 분량입니다.
-
-정상 거래일의 예상 분량:
-
-- 1시간봉: `60, 60, 60, 60, 60, 60, 30`
-- 4시간봉: `240, 150`
-- 일봉: `390`
-
-조기 폐장일은 실제 세션 길이에 맞게 짧아지며 무거래 원본 봉은 임의로 채우지 않습니다.
 
 ## 설치
 
-Python 3.10 이상을 권장합니다.
-
 ```powershell
-py -3.10 -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`.env.example`을 `.env`로 복사하고 Alpaca 키를 설정합니다.
+`.env.example`을 참고하여 Alpaca 키를 환경변수로 제공합니다. S3와
+PostgreSQL 실행은 각각 선택 의존성 `boto3`, `psycopg[binary]`가 필요합니다.
+인증정보는 객체, Catalog, 상태, 보고서에 저장하지 않습니다.
 
-## 실행
+`instrument_map.csv`에는 최소 다음 열이 필요합니다.
 
-```powershell
-python daily_pipeline.py --format parquet
+```csv
+provider_symbol,instrument_id
+AAPL,검증된-market_data.instruments-UUID
 ```
 
+임의 UUID는 생성하지 않습니다. 권장 추가 열은 `provider_reference`,
+`asset_type`, `primary_exchange_mic`입니다.
+
+## 읽기 전용 계획
+
 ```powershell
-python daily_pipeline.py --format csv
+python market_pipeline.py plan `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --instrument-map .\instrument_map.csv `
+  --start-year 2016 --end-year 2025 `
+  --price-type all --resolution all --dry-run
 ```
 
-전체 기간의 누락 구간 상세 CSV까지 생성:
+`plan`은 API, S3, DB, 로컬 객체와 Catalog를 변경하지 않습니다.
+
+## 과거 백필
 
 ```powershell
-python daily_pipeline.py --format parquet --deep-quality
+python market_pipeline.py backfill `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --instrument-map .\instrument_map.csv `
+  --start-year 2016 --end-year 2025 `
+  --price-type all --resolution all `
+  --shard-count 16 --target-size-mib 256 --max-size-mib 512 `
+  --resume
 ```
 
-기본 검사는 빠른 요약 모드입니다. `--deep-quality`는 누락 구간을 보고하지만 무거래 구간을 인위적으로 채우지는 않습니다.
+Alpaca 요청은 종목·가격 유형별 180일 chunk입니다. chunk 결과를 staging
+Parquet으로 보존한 후 월 단위 RecordBatch 범위로 읽어 연도·shard YEAR
+객체를 직접 만듭니다. 10년 전체를 하나의 DataFrame에 올리지 않습니다.
 
-## 증분 갱신과 중단 재개
+전체 실행 전 대표 샘플과 `--max-symbols`로 검증해야 합니다. 이 저장소의
+구현 과정에서는 실제 10년 전체 수집을 실행하지 않았습니다.
 
-- 최초 실행은 종목별 최근 10년을 180일 단위로 조회합니다.
-- 이후 실행은 마지막 출력 세션부터 다시 조회해 최신 세션을 교체합니다.
-- Adjusted 데이터는 최근 10거래일을 항상 재조회합니다.
-- 수정주가 이력 변경이 발견되면 해당 종목의 최근 10년 전체를 다시 계산합니다.
-- 종목 하나가 실패하면 최대 3회 재시도합니다.
-- 종목별 성공 상태는 `pipeline_state/daily_pipeline_state.json`에 즉시 저장됩니다.
-- 재실행 시 같은 대상 세션에 대해 세 출력 파일이 모두 존재하는 완료 종목은 건너뜁니다.
-- 상태 파일과 결과 파일은 임시 파일을 완성한 뒤 교체합니다.
+## 일별 증분
 
-## 보고서
+```powershell
+python market_pipeline.py incremental `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --instrument-map .\instrument_map.csv `
+  --start 2026-07-28 --end 2026-07-29 `
+  --price-type all --resume
+```
 
-`report/latest/{format}/`과 거래일별 이력 폴더에 다음 파일이 저장됩니다.
+완료된 XNYS 세션만 DAY 객체와 새 Manifest Revision으로 publish합니다.
+종목마다 파일을 만들지 않고 연도·shard·layer·resolution 단위로 묶습니다.
+기존 객체는 덮어쓰지 않습니다.
+
+ADJUSTED 증분 전에는 최근 10개 완료 세션의 겹치는 공급자 값을 다시
+비교합니다. 가격 Revision이 감지되면 Catalog에 보존 중인 Adjusted 연도를
+새 Revision으로 자동 백필하고 그 원천을 사용하는 파생 데이터도 다시 만든
+후 당일 DAY publish를 계속합니다.
+
+현재 완료 거래일 한 건을 처리하는 운영용 래퍼:
+
+```powershell
+python daily_pipeline.py `
+  --instrument-map .\instrument_map.csv `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --price-type all --resume
+```
+
+## 파생봉과 Compaction
+
+공급자 30분봉에서 파생 데이터를 다시 만들기:
+
+```powershell
+python market_pipeline.py derive `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --instrument-map .\instrument_map.csv `
+  --start-year 2024 --end-year 2024 `
+  --price-type adjusted --resolution all
+```
+
+Compaction은 재실행 가능한 별도 명령입니다.
+
+```powershell
+python market_pipeline.py compact ... `
+  --price-type adjusted --layer DERIVED --resolution 1h `
+  --granularity WEEK --period 2026-07-20
+
+python market_pipeline.py compact ... `
+  --price-type adjusted --layer DERIVED --resolution 1h `
+  --granularity MONTH --period 2026-07-01
+
+python market_pipeline.py compact ... `
+  --price-type adjusted --layer DERIVED --resolution 1h `
+  --granularity YEAR --period 2025-01-01
+```
+
+수명주기는 `DAY → WEEK → MONTH → YEAR`입니다. 월 경계를 넘는 주는 DAY로
+유지하여 MONTH 경계를 보존합니다. MONTH는 완성된 WEEK와 경계의 DAY를,
+YEAR는 MONTH와 남은 WEEK·DAY를 사용합니다. 모든 입력 객체는
+`dataset_object_lineage`의 `COMPACTED_FROM`으로 기록됩니다.
+
+새 AVAILABLE Manifest에서 같은 shard·시간을 나타내는 서로 다른
+granularity는 함께 활성화되지 않습니다. 이전 Manifest와 객체는
+`SUPERSEDED` 상태로 남아 고정된 과거 백테스트를 재현할 수 있습니다.
+
+## 기존 파일 마이그레이션
+
+```powershell
+python market_pipeline.py migrate `
+  --input-root . `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --instrument-map .\instrument_map.csv `
+  --start-year 2016 --end-year 2025 `
+  --price-type all --resolution all --resume
+```
+
+기존 종목별 파일은 staging 입력으로만 읽으며 삭제하거나 덮어쓰지 않습니다.
+`market_data_backfill.py`는 이전 구현과 출력 검토를 위한 legacy 도구이고,
+새 작업에는 `market_pipeline.py migrate`를 사용합니다.
+
+## 객체 키
+
+로컬과 S3는 같은 상대 키를 사용합니다.
 
 ```text
-run_summary.json
-pipeline_failures.json
-1hour_summary.csv
-4hour_summary.csv
-1day_summary.csv
-raw_1hour_summary.csv
-raw_4hour_summary.csv
-raw_1day_summary.csv
+market-data/
+  provider=ALPACA/
+  feed=ALPACA_SIP_ADJUSTED_30M/
+  dataset={stable-logical-dataset-id}/
+  revision=1/
+  layer=ADJUSTED/
+  resolution=30m/
+  granularity=YEAR/
+  partition_start=2024-01-01/
+  partition_end=2025-01-01/
+  shard=s03-of-16/
+  part-00001.parquet
 ```
 
-`--deep-quality` 사용 시 `deep_quality/` 아래에 주기별 누락 구간 CSV가 추가됩니다.
+shard는 다음 고정식으로 계산합니다.
 
-## 코드 구조
+```text
+first_unsigned_64_bits(SHA256(canonical instrument UUID UTF-8)) % shard_count
+```
 
-| 파일 | 역할 |
-| --- | --- |
-| `daily_pipeline.py` | 10년 장기봉 통합 실행과 체크포인트·보고서 관리 |
-| `data_collection/collect_sip_long_term.py` | 임시 30분봉 조회와 1시간·4시간·일봉 갱신 |
-| `data_collection/get_ticker.py` | 현재 및 최근 10년 S&P 500 종목 정책 |
-| `data_collection/etf_universe.py` | ETF·ETP 유니버스 검증 |
-| `data_filtering/filter_regular_session.py` | XNYS 정규장 필터링 |
-| `data_filtering/resample_sip_5min.py` | 세션 개장 기준 공통 봉 집계 함수 |
-| `data_validation/audit_regular_session.py` | 기간·커버리지·누락 구간 계산 |
-| `pipeline_state.py` | 원자적 종목별 체크포인트 |
-| `pipeline_reporting.py` | 최신 및 거래일별 보고서 저장 |
+객체는 임시 파일 완성·Footer 검사·SHA-256 검사 후 원자적으로 publish됩니다.
+같은 키에 다른 바이트가 있으면 덮어쓰지 않고 실패합니다.
 
-## 기존 데이터와 보조 스크립트
+## 검증과 benchmark
 
-기존 `sip_market_data`, `regular_sip_1min_market_data`, `regular_sip_5min_market_data` 데이터는 자동으로 삭제하지 않습니다. 새 통합 파이프라인은 해당 폴더를 읽거나 갱신하지 않습니다.
+```powershell
+python market_pipeline.py validate --local-root .\market_data_store
+python market_pipeline.py benchmark --local-root .\market_data_store
+```
 
-기존 1분봉 수집기와 5분봉 필터·집계 스크립트도 독립 실행용으로 남겨 두었지만 `daily_pipeline.py`의 실행 경로에는 포함되지 않습니다.
+검증 범위:
+
+- 고정 스키마와 UTC/ET 날짜
+- 중복 키, OHLC 관계, 유한·양수 가격
+- 음수 volume/trade_count
+- DERIVED XNYS 범위와 조기 폐장 `source_minutes`
+- 파티션 경계와 활성 객체 시간 비중첩
+- Parquet Footer, 행 수, 바이트 SHA-256
+- Manifest 객체 합계와 canonical dataset hash
+
+benchmark는 파일 크기, part/granularity 수, 전체 Manifest 조회 시간,
+종목·월 조회 시간과 Python peak memory를 측정합니다. 실제 대표 데이터
+측정 전에는 production-ready로 표현하지 않습니다.
+
+## Catalog, S3, PostgreSQL
+
+로컬 Catalog는 `market_data_store/catalog-export` 아래 DBML 열 이름의
+JSONL을 저장합니다.
+
+```text
+providers.jsonl
+feeds.jsonl
+pipeline-runs.jsonl
+dataset-manifests.jsonl
+storage-objects.jsonl
+dataset-objects.jsonl
+dataset-lineage.jsonl
+dataset-object-lineage.jsonl
+quality-incidents.jsonl
+pipeline-run-outputs.local.jsonl  # DBML 보완 전 로컬 provenance
+summary.json
+```
+
+DBML 계약 검증 및 별도 export:
+
+```powershell
+python market_pipeline.py export-db-plan `
+  --local-root .\market_data_store `
+  --output-root .\db-plan `
+  --dbml C:\path\to\schema.draft.dbml
+```
+
+S3는 기본 dry-run이고 `--execute`가 있어야 업로드합니다.
+
+```powershell
+python market_pipeline.py upload `
+  --local-root .\market_data_store `
+  --output-catalog-root .\s3-catalog-export `
+  --bucket example-bucket --prefix historical
+```
+
+PostgreSQL도 기본 dry-run입니다.
+
+```powershell
+python market_pipeline.py apply-db `
+  --local-root .\market_data_store `
+  --dbml C:\path\to\schema.draft.dbml
+```
+
+`--execute`를 사용해도 provider의 `rights_version=UNVERIFIED` 또는
+`status=REVIEW_REQUIRED`이면 차단됩니다. 실제 저장·장기 보존·백테스트·
+재배포 권리 근거를 검토하여 승인된 버전을 반영해야 합니다.
+
+S3와 PostgreSQL은 하나의 분산 트랜잭션이 아닙니다. S3 검증 후 DB를
+반영하며 DB 실패 시 업로드한 불변 객체를 즉시 삭제하지 않고 재시도 가능한
+orphan으로 보존합니다.
+
+## 재개와 staging 정리
+
+`--resume`은 완료된 staging fragment와 검증된 불변 객체를 재사용합니다.
+정리는 기본 실행에 포함되지 않으며 성공한 pipeline run만 대상으로 합니다.
+
+```powershell
+python market_pipeline.py cleanup-staging `
+  --local-root .\market_data_store `
+  --staging-root .\pipeline_state\staging `
+  --run-id {pipeline-run-uuid}
+
+python market_pipeline.py cleanup-staging ... --execute
+```
+
+## 종목 범위와 법적 주의
+
+현재 및 최근 편출입 S&P 500 티커의 합집합은 point-in-time 지수 구성 종목이
+아닙니다. 개별 종목 데이터 수집과 시점별 지수 Universe 재현을 구분합니다.
+상장 전 또는 Alpaca 제공 시작 전 데이터를 만들지 않습니다.
+
+## DBML 공백
+
+현재 DBML은 최초 수집 실행과 그 실행이 생성한 source
+`dataset_objects`를 직접 연결하는 출력 테이블이 부족합니다. DBML을
+임의 수정하지 않았으며 다음 보완 후보를 문서화합니다.
+
+```text
+pipeline_run_outputs
+├─ pipeline_run_id
+├─ dataset_manifest_id
+└─ dataset_object_id
+```
+
+또한 `dataset_manifests.dataset_hash`의 전역 UNIQUE는 서로 다른 논리
+데이터셋이 동일 바이트 집합을 가질 때 충돌할 수 있습니다. DB dry-run은
+중복을 표시하고 실행을 차단합니다.
+
+상세 설계와 현재 구조 분석은
+[`docs/db-aligned-market-pipeline.md`](docs/db-aligned-market-pipeline.md)와
+[`docs/current-pipeline-analysis.md`](docs/current-pipeline-analysis.md)를
+참조합니다.
 
 ## 테스트
 

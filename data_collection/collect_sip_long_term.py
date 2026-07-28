@@ -1,9 +1,15 @@
-"""Collect long-term SIP bars without persisting minute-level source data."""
+"""Alpaca SIP 30m adapter plus deprecated per-symbol long-term migration path.
+
+The official pipeline publishes provider-native 30m bars through
+``market_pipeline.py`` and its ObjectStore/Catalog boundaries.  The legacy
+``update_symbol_data`` function remains only so existing local files and tests
+can be migrated without silently deleting user data.
+"""
 
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -239,7 +245,7 @@ def update_symbol_data(
     output_roots: dict[str, Path] | None = None,
     calendar_name: str = DEFAULT_CALENDAR,
 ) -> CollectionResult:
-    """Update 10-year regular-session 1h/4h/1d files from temporary 30m bars."""
+    """Legacy-only updater for old per-symbol 1h/4h/1d files."""
     paths = output_paths(
         symbol,
         data_type,
@@ -359,4 +365,40 @@ def update_symbol_data(
         changed_from_utc=changed_from,
         adjustment_revision=adjusted_revision,
         added_rows=total_added,
+    )
+
+
+def run_immutable_collection(
+    *,
+    config,
+    start_time: datetime,
+    end_time: datetime,
+    price_types: tuple[str, ...],
+    resolutions: tuple[str, ...] = ("30m", "1h", "4h", "1d"),
+    symbols: list[str] | None = None,
+    incremental_sessions: list[date] | None = None,
+    source=None,
+):
+    """Publish native 30m and derived objects using the official boundaries.
+
+    ``source`` is injectable for sample tests. When omitted, credentials are
+    read by the caller and an ``AlpacaBarSource`` must be supplied; this helper
+    never writes credentials to state or reports.
+    """
+    from market_pipeline_lib.engine import MarketPipelineEngine
+
+    engine = MarketPipelineEngine(config, source=source)
+    if incremental_sessions is not None:
+        return engine.incremental(
+            sessions=incremental_sessions,
+            price_types=price_types,
+            resolutions=resolutions,
+            symbols=symbols,
+        )
+    return engine.backfill(
+        start=start_time,
+        end=end_time,
+        price_types=price_types,
+        resolutions=resolutions,
+        symbols=symbols,
     )

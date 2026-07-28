@@ -166,3 +166,91 @@ class PipelineStateStore:
             entry.update(details)
         self.save()
 
+    @staticmethod
+    def partition_key(
+        pipeline: str,
+        layer: str,
+        resolution: str,
+        partition_start: str,
+        partition_end: str,
+        shard_key: str,
+        revision: int,
+    ) -> str:
+        """Return the DB-aligned immutable partition checkpoint key."""
+        if revision <= 0:
+            raise ValueError("revision must be positive")
+        return "|".join(
+            (
+                pipeline,
+                layer,
+                resolution,
+                partition_start,
+                partition_end,
+                shard_key,
+                str(revision),
+            )
+        )
+
+    def is_partition_complete(
+        self,
+        pipeline: str,
+        layer: str,
+        resolution: str,
+        partition_start: str,
+        partition_end: str,
+        shard_key: str,
+        revision: int,
+        *,
+        expected_content_hash: str | None = None,
+    ) -> bool:
+        key = self.partition_key(
+            pipeline,
+            layer,
+            resolution,
+            partition_start,
+            partition_end,
+            shard_key,
+            revision,
+        )
+        entry = self.data.setdefault("partition_checkpoints", {}).get(key, {})
+        return (
+            entry.get("status") == "success"
+            and (
+                expected_content_hash is None
+                or entry.get("content_hash") == expected_content_hash
+            )
+        )
+
+    def mark_partition(
+        self,
+        pipeline: str,
+        layer: str,
+        resolution: str,
+        partition_start: str,
+        partition_end: str,
+        shard_key: str,
+        revision: int,
+        *,
+        status: str,
+        object_ids: list[str] | None = None,
+        content_hash: str | None = None,
+        error: str = "",
+    ) -> None:
+        key = self.partition_key(
+            pipeline,
+            layer,
+            resolution,
+            partition_start,
+            partition_end,
+            shard_key,
+            revision,
+        )
+        self.data.setdefault("partition_checkpoints", {})[key] = {
+            "status": status,
+            "object_ids": object_ids or [],
+            "content_hash": content_hash,
+            "error": error,
+            "updated_at_utc": utc_now_iso(),
+        }
+        self.save()
+

@@ -1,0 +1,123 @@
+// Test-only column contract excerpt. The canonical DBML remains in Idea2Strategy.
+Table storage.objects {
+  id uuid
+  status varchar
+  storage_provider varchar
+  bucket_name varchar
+  object_key varchar
+  provider_version_id varchar
+  content_hash varchar
+  byte_size bigint
+  file_format varchar
+  compression_codec varchar
+  media_type varchar
+  schema_version varchar
+  row_count bigint
+  period_start timestamptz
+  period_end timestamptz
+  encryption_key_ref varchar
+  retention_policy_version varchar
+  retention_until timestamptz
+  legal_hold boolean
+  created_at timestamptz
+  verified_at timestamptz
+  quarantined_at timestamptz
+  superseded_at timestamptz
+  deleted_at timestamptz
+}
+
+Table market_data.providers {
+  id uuid
+  code varchar
+  display_name varchar
+  rights_version varchar
+  status varchar
+  created_at timestamptz
+}
+
+Table market_data.feeds {
+  id uuid
+  provider_id uuid
+  code varchar
+  data_kind varchar
+  resolution varchar
+  timezone_name varchar
+  feed_version varchar
+  created_at timestamptz
+  retired_at timestamptz
+}
+
+Table market_data.pipeline_runs {
+  id uuid
+  pipeline_code varchar
+  pipeline_version varchar
+  idempotency_key varchar
+  status varchar
+  input_hash varchar
+  output_hash varchar
+  started_at timestamptz
+  completed_at timestamptz
+  failure_code varchar
+}
+
+Table market_data.dataset_manifests {
+  id uuid
+  feed_id uuid
+  instrument_id uuid
+  data_layer varchar
+  resolution varchar
+  revision_number int
+  status varchar
+  period_start timestamptz
+  period_end timestamptz
+  schema_version varchar
+  dataset_hash varchar
+  supersedes_manifest_id uuid
+  created_at timestamptz
+  available_at timestamptz
+}
+
+Table market_data.dataset_objects {
+  id uuid
+  dataset_manifest_id uuid
+  object_id uuid
+  object_kind varchar
+  partition_granularity varchar
+  partition_start date
+  partition_end date
+  period_start timestamptz
+  period_end timestamptz
+  shard_key varchar
+  part_number int
+  row_count bigint
+  min_instrument_id uuid
+  max_instrument_id uuid
+}
+
+Table market_data.dataset_lineage {
+  derived_manifest_id uuid
+  source_manifest_id uuid
+  relation_type varchar
+}
+
+Table market_data.dataset_object_lineage {
+  derived_dataset_object_id uuid
+  source_dataset_object_id uuid
+  pipeline_run_id uuid
+  relation_type varchar
+  created_at timestamptz
+}
+
+Table market_data.quality_incidents {
+  id uuid
+  dataset_manifest_id uuid
+  instrument_id uuid
+  severity varchar
+  incident_code varchar
+  period_start timestamptz
+  period_end timestamptz
+  status varchar
+  evidence_object_id uuid
+  detected_at timestamptz
+  resolved_at timestamptz
+}
