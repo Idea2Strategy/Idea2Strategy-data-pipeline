@@ -134,6 +134,45 @@ class DailyReportStore:
             atomic_write_json(payload, destination)
         return destinations
 
+    def save_manifest_summary(
+        self,
+        *,
+        pipeline_run_id: str,
+        status: str,
+        manifests: list[dict[str, Any]],
+        objects: list[dict[str, Any]],
+        incidents: list[dict[str, Any]],
+    ) -> tuple[Path, Path]:
+        """Preserve the daily report while adding Manifest/object health."""
+        payload = {
+            "pipeline_run_id": pipeline_run_id,
+            "status": status,
+            "session_date": self.session_date,
+            "manifest_count": len(manifests),
+            "available_manifest_count": sum(
+                row.get("status") == "AVAILABLE" for row in manifests
+            ),
+            "quarantined_manifest_count": sum(
+                row.get("status") == "QUARANTINED" for row in manifests
+            ),
+            "object_count": len(objects),
+            "row_count": sum(int(row.get("row_count", 0)) for row in objects),
+            "quality_incident_count": len(incidents),
+            "quality_incidents_by_code": {
+                code: sum(
+                    row.get("incident_code") == code for row in incidents
+                )
+                for code in sorted(
+                    {
+                        str(row.get("incident_code"))
+                        for row in incidents
+                        if row.get("incident_code")
+                    }
+                )
+            },
+        }
+        return self.save_json(payload, "manifest_summary.json")
+
     def load_history_dataframe(
         self,
         filename: str,

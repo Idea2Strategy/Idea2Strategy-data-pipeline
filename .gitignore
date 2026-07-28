@@ -11,6 +11,7 @@ sip_market_data/
 regular_sip_1min_market_data/
 regular_sip_5min_market_data/
 regular_sip_15min_market_data/
+regular_sip_30min_market_data/
 regular_sip_1hour_market_data/
 regular_sip_4hour_market_data/
 regular_sip_1day_market_data/
@@ -22,6 +23,11 @@ report/history/
 *.csv
 *.txt
 !ticker_info/etf_universe.csv
+!examples/*.csv
+backfill-output/
+market_data_store/
+db-plan/
+s3-catalog-export/
 
 # === Python 가상환경 및 캐시 파일 제외 ===
 __pycache__/

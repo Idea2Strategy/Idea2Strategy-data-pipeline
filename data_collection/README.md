@@ -2,16 +2,20 @@
 
 ## 통합 파이프라인 수집기
 
-`collect_sip_long_term.py`는 Alpaca SIP 30분봉을 기간별로 조회하고 메모리에서 XNYS 정규장만 선택한 뒤 다음 결과를 만듭니다.
+공식 수집 경로는 `market_pipeline.py backfill`과 `incremental`입니다.
+`collect_sip_long_term.py`의 Alpaca 30분봉 adapter를 통해 다음 데이터를
+불변 객체로 보존합니다.
 
-- 최근 10년 정규장 1시간봉
-- 최근 10년 정규장 4시간봉
-- 최근 10년 정규장 일봉
-- Raw와 Adjusted 각각 생성
+- 공급자 RAW 30분봉
+- 공급자 ADJUSTED 30분봉
+- 각각을 원천으로 한 XNYS 정규장 1시간·4시간·일봉
 
-30분봉은 중간 계산에만 사용하고 저장하지 않습니다. 최초 수집은 180일 단위로 요청하며, 이후에는 마지막 결과 세션부터 증분 갱신합니다. Adjusted는 최근 10거래일을 재조회하고 수정주가 변경이 발견되면 해당 종목의 10년 전체를 다시 계산합니다.
+최초 백필은 180일 chunk와 연도·shard YEAR 객체를 사용합니다. 이후에는
+완료 거래 세션 DAY 객체를 추가하고 WEEK→MONTH→YEAR로 Compaction합니다.
+30분봉을 버리지 않으며 종목별 10년 파일을 공식 출력으로 갱신하지 않습니다.
 
-이 모듈은 `daily_pipeline.py`에서 호출하며 직접 실행용 CLI는 제공하지 않습니다.
+기존 종목별 장기 파일 함수는 마이그레이션 호환을 위해 남아 있으며
+`daily_pipeline.py --legacy-long-term`에서만 명시적으로 사용합니다.
 
 ## 종목 유니버스
 

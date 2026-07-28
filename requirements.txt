@@ -2,6 +2,6 @@
 alpaca-py==0.43.5
 lxml==6.1.1
 python-dotenv==1.0.1
-pandas
-pandas-market-calendars
-pyarrow
+pandas==3.0.3
+pandas-market-calendars==5.4.0
+pyarrow==25.0.0

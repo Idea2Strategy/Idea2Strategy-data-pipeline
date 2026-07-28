@@ -1,8 +1,13 @@
-"""Run the ten-year regular-session SIP 1h/4h/1d pipeline."""
+"""Run the immutable DAY market-data pipeline.
+
+Legacy per-symbol helpers remain available for migration compatibility, but the
+CLI entry point publishes provider 30m and derived DAY objects.
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -38,6 +43,8 @@ from data_validation.audit_regular_session import (
 from data_validation.quality_control import invalid_market_rows
 from pipeline_reporting import DailyReportStore
 from pipeline_state import PipelineStateStore
+from market_pipeline_lib.catalog import LocalCatalog
+from market_pipeline_lib.engine import AlpacaBarSource, MarketPipelineEngine, PipelineConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -487,7 +494,7 @@ def run_pipeline(
         "started_at_utc": started_at_utc,
         "finished_at_utc": datetime.now(timezone.utc).isoformat(),
         "history_years": HISTORY_YEARS,
-        "source_timeframe": "30Min (not persisted)",
+        "source_timeframe": "30Min (legacy temporary input)",
         "output_intervals": list(OUTPUT_INTERVALS),
         "data_types": list(DATA_TYPES),
         "symbols_total": len(symbols),
@@ -534,13 +541,130 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="종목별 누락 구간 상세 CSV도 생성합니다.",
     )
+    parser.add_argument(
+        "--local-root",
+        type=Path,
+        default=PROJECT_ROOT / "market_data_store",
+        help="불변 객체와 local Catalog 루트",
+    )
+    parser.add_argument(
+        "--staging-root",
+        type=Path,
+        default=PROJECT_ROOT / "pipeline_state" / "staging",
+    )
+    parser.add_argument("--instrument-map", type=Path)
+    parser.add_argument(
+        "--price-type",
+        choices=("raw", "adjusted", "all"),
+        default="all",
+    )
+    parser.add_argument("--symbols", nargs="*")
+    parser.add_argument("--max-symbols", type=int)
+    parser.add_argument("--shard-count", type=int, default=16)
+    parser.add_argument("--target-size-mib", type=int, default=256)
+    parser.add_argument("--max-size-mib", type=int, default=512)
+    parser.add_argument("--revision", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--legacy-long-term",
+        action="store_true",
+        help="기존 종목별 10년 파일 갱신을 명시적으로 실행",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    storage_format = args.storage_format or choose_storage_format()
-    return run_pipeline(storage_format, deep_quality=args.deep_quality)
+    if args.legacy_long_term:
+        storage_format = args.storage_format or choose_storage_format()
+        return run_pipeline(storage_format, deep_quality=args.deep_quality)
+    if args.instrument_map is None:
+        print(
+            "[오류] 공식 DAY 파이프라인에는 --instrument-map이 필요합니다. "
+            "기존 경로는 --legacy-long-term을 명시하세요.",
+            file=sys.stderr,
+        )
+        return 2
+    load_dotenv(PROJECT_ROOT / ".env")
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not args.dry_run and (not api_key or not secret_key):
+        print("[오류] Alpaca API 키와 Secret 키를 설정해 주세요.", file=sys.stderr)
+        return 2
+    try:
+        _, end_time = completed_collection_window()
+        session_date = pd.Timestamp(end_time).tz_convert(
+            mcal.get_calendar(DEFAULT_CALENDAR).tz
+        ).date()
+        config = PipelineConfig(
+            local_root=args.local_root,
+            staging_root=args.staging_root,
+            instrument_map_path=args.instrument_map,
+            shard_count=args.shard_count,
+            target_size_mib=args.target_size_mib,
+            max_size_mib=args.max_size_mib,
+            revision=args.revision,
+            resume=args.resume,
+            dry_run=args.dry_run,
+        )
+        source = (
+            None
+            if args.dry_run
+            else AlpacaBarSource(api_key, secret_key)
+        )
+        engine = MarketPipelineEngine(config, source=source)
+        symbols = list(args.symbols or [])
+        if not symbols:
+            etf_symbols = load_etf_symbols(as_of=end_time)
+            symbols = load_pipeline_symbols(additional_symbols=etf_symbols)
+            missing_mappings = sorted(
+                {
+                    symbol.replace("/", ".")
+                    for symbol in symbols
+                }.difference(engine.mappings)
+            )
+            if missing_mappings:
+                raise ValueError(
+                    "공식 instrument map에 없는 universe 종목이 있습니다: "
+                    f"{missing_mappings[:20]}"
+                    + (
+                        f" 외 {len(missing_mappings) - 20}개"
+                        if len(missing_mappings) > 20
+                        else ""
+                    )
+                )
+        if args.max_symbols is not None:
+            symbols = symbols[: args.max_symbols]
+        result = engine.incremental(
+            sessions=[session_date],
+            price_types=(
+                ("raw", "adjusted")
+                if args.price_type == "all"
+                else (args.price_type,)
+            ),
+            resolutions=("30m", "1h", "4h", "1d"),
+            symbols=symbols or None,
+        )
+        if not args.dry_run:
+            catalog = LocalCatalog(args.local_root / "catalog-export")
+            reports = DailyReportStore.for_target_session(
+                pd.Timestamp(end_time).isoformat(),
+                "parquet",
+                DEFAULT_CALENDAR,
+            )
+            reports.save_manifest_summary(
+                pipeline_run_id=result["pipeline_run_id"],
+                status=result["status"],
+                manifests=catalog.records("market_data.dataset_manifests"),
+                objects=catalog.records("market_data.dataset_objects"),
+                incidents=catalog.records("market_data.quality_incidents"),
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result["status"] not in {"FAILED"} else 1
+    except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as exc:
+        print(f"[오류] {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
