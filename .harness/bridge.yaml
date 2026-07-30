@@ -1,0 +1,7 @@
+schema_version: 1
+project_id: idea2strategy.platform
+root_remote: https://github.com/Idea2Strategy/Idea2Strategy.git
+workspace_id: workspace.data-pipeline
+discovery: git-superproject
+commands_path: .harness/commands.yaml
+
