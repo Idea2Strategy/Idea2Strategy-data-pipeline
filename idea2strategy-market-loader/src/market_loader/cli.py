@@ -69,6 +69,11 @@ def _database(settings: EnvironmentSettings) -> Database:
     return database
 
 
+def _historical_sip_probe_window(now: datetime) -> tuple[datetime, datetime]:
+    end = now - timedelta(days=1)
+    return end - timedelta(days=3), end
+
+
 def _fail(exc: Exception) -> None:
     code = exc.code if isinstance(exc, LoaderError) else type(exc).__name__
     _echo_json({"ok": False, "error_code": code, "message": str(redact(str(exc)))})
@@ -158,12 +163,12 @@ def doctor(
         check("provider_rights", rights_check)
 
         def alpaca_check() -> str:
-            now = datetime.now(UTC)
+            start, end = _historical_sip_probe_window(datetime.now(UTC))
             with AlpacaBarsClient(
                 loaded.alpaca, settings.ALPACA_API_KEY, settings.ALPACA_API_SECRET
             ) as client:
-                next(client.iter_bar_pages(["SPY"], now - timedelta(days=3), now, "raw"))
-            return "authenticated SIP bars request succeeded"
+                next(client.iter_bar_pages(["SPY"], start, end, "raw"))
+            return "authenticated historical SIP bars request succeeded"
 
         check("alpaca_sip", alpaca_check)
         session = _aws_session(settings)
