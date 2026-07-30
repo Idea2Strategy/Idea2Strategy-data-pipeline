@@ -191,3 +191,15 @@ WHERE status = 'AVAILABLE';
 
 CREATE INDEX ix_dataset_objects_manifest
 ON market_data.dataset_objects(dataset_manifest_id, partition_key);
+
+GRANT USAGE ON SCHEMA operations, storage, market_data TO market_loader;
+GRANT USAGE ON TYPE operations.work_status, market_data.dataset_status TO market_loader;
+GRANT SELECT ON TABLE public.flyway_schema_history TO market_loader;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA market_data TO market_loader;
+GRANT SELECT, INSERT ON TABLE storage.objects TO market_loader;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA market_data
+GRANT SELECT, INSERT, UPDATE ON TABLES TO market_loader;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA storage
+GRANT SELECT, INSERT ON TABLES TO market_loader;

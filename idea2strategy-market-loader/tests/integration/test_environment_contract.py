@@ -18,12 +18,18 @@ pytestmark = pytest.mark.integration
 )
 def test_flyway_schema_catalog_seed_and_run_idempotency() -> None:
     connection = psycopg.connect(
-        "host=127.0.0.1 port=55432 dbname=idea2strategy_test user=postgres password=postgres"
+        "host=127.0.0.1 port=55432 dbname=idea2strategy_test "
+        "user=market_loader password=market-loader-test"
     )
     try:
         with connection.transaction():
             repository = MarketRepository(connection)
             repository.assert_schema()
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT version FROM public.flyway_schema_history WHERE success = true"
+                )
+                assert cursor.fetchone() == ("001",)
             repository.seed_provider_and_feeds("test-rights-v1")
             instrument = UniverseInstrument(
                 provider_symbol="AAPL",
@@ -58,3 +64,14 @@ def test_flyway_schema_catalog_seed_and_run_idempotency() -> None:
             assert same_run_id == run_id
     finally:
         connection.close()
+
+    restricted = psycopg.connect(
+        "host=127.0.0.1 port=55432 dbname=idea2strategy_test "
+        "user=market_loader password=market-loader-test"
+    )
+    try:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with restricted.transaction(), restricted.cursor() as cursor:
+                cursor.execute("CREATE TABLE market_data.forbidden_ddl (id integer)")
+    finally:
+        restricted.close()

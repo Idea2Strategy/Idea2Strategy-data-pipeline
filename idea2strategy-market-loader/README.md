@@ -24,7 +24,10 @@ access keys. AWS access uses the named CLI profile; private RDS access uses the 
 port-forwarding script and `sslmode=verify-full`.
 
 Apply `db/migration/V001__market_data_initial_schema.sql` through the deployment
-Flyway process before executing any write command. The loader never applies DDL.
+Flyway process before executing any write command. The `market_loader` login role
+must already exist; V001 grants it only the runtime schema and table privileges it
+needs. Run Flyway with the deployment or master account, never with
+`market_loader`. The loader never applies DDL.
 
 ## Safe workflow
 
