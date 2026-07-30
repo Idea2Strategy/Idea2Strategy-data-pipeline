@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "idea2strategy-market-loader"
+version = "0.1.0"
+description = "Immutable Alpaca SIP historical market data loader for Idea2Strategy"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+dependencies = [
+  "boto3>=1.40,<2",
+  "exchange-calendars>=4.11,<5",
+  "httpx>=0.28,<1",
+  "psycopg[binary,pool]>=3.2,<4",
+  "pyarrow>=21,<26",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "PyYAML>=6.0,<7",
+  "tenacity>=9.1,<10",
+  "typer>=0.16,<1",
+]
+
+[project.scripts]
+market-loader = "market_loader.cli:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.138,<7",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "respx>=0.22,<1",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_loader"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers -ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "integration: requires local PostgreSQL or an S3-compatible service",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["market_loader"]
+omit = [
+  "src/market_loader/cli.py",
+  "src/market_loader/database/*",
+  "src/market_loader/pipeline/backfill.py",
+  "src/market_loader/pipeline/publisher.py",
+  "src/market_loader/pipeline/registrar.py",
+]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["market_loader"]
+
+[[tool.mypy.overrides]]
+module = [
+  "boto3",
+  "boto3.*",
+  "botocore",
+  "botocore.*",
+  "exchange_calendars",
+  "exchange_calendars.*",
+  "pyarrow",
+  "pyarrow.*",
+  "yaml",
+]
+ignore_missing_imports = true

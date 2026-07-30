@@ -1,0 +1,36 @@
+project:
+  environment: development
+  processing_version: "market-loader/1.0.0"
+  schema_version: "market-bars/1"
+
+alpaca:
+  base_url: "https://data.alpaca.markets"
+  feed: "sip"
+  request_timeframe: "30Min"
+  chunk_days: 180
+  symbols_per_request: 50
+  page_limit: 10000
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 60
+  max_attempts: 5
+
+data:
+  session_calendar: "XNYS"
+  adjustments: ["raw", "all"]
+  output_resolutions: ["30m", "1h", "4h", "1d"]
+  shard_count: 8
+  parquet_compression: "zstd"
+  parquet_compression_level: 3
+  parquet_row_group_size: 131072
+
+storage:
+  prefix: "historical"
+  staging_directory: "./.staging"
+  sse_algorithm: "AES256"
+
+quality:
+  fail_on_duplicate: true
+  fail_on_invalid_ohlc: true
+  fail_on_out_of_session: true
+  fail_on_negative_activity: true
+  warn_on_missing_expected_bar: true

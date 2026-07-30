@@ -1,0 +1,14 @@
+.env
+.venv/
+.staging/
+reports/
+htmlcov/
+.coverage
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+dist/
+build/

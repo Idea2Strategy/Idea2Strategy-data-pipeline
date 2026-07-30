@@ -1,0 +1,23 @@
+from enum import StrEnum
+
+
+class WorkStatus(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class DatasetStatus(StrEnum):
+    BUILDING = "BUILDING"
+    AVAILABLE = "AVAILABLE"
+    QUARANTINED = "QUARANTINED"
+    SUPERSEDED = "SUPERSEDED"
+    DELETED = "DELETED"
+
+
+class QualityStatus(StrEnum):
+    PASSED = "PASSED"
+    PASSED_WITH_WARNINGS = "PASSED_WITH_WARNINGS"
+    FAILED = "FAILED"
