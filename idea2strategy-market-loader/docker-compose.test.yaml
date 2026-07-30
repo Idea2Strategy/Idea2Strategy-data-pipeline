@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: idea2strategy_test
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+    volumes:
+      - "./db/test-init:/docker-entrypoint-initdb.d:ro"
     ports:
       - "55432:5432"
     healthcheck:
