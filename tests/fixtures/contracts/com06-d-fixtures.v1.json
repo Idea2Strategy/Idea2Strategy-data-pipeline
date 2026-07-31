@@ -1,0 +1,119 @@
+{
+  "fixture_set_id": "com06.d.compatibility-fixtures",
+  "fixture_set_version": 1,
+  "dataset_manifest": {
+    "contract_id": "com06.dataset-manifest",
+    "schema_version": 1,
+    "manifest_id": "11111111-1111-4111-8111-111111111111",
+    "dataset_id": "22222222-2222-4222-8222-222222222222",
+    "revision": 1,
+    "status": "AVAILABLE",
+    "dataset_hash": "d9f6310297b7eb858570086d7292a709261eecc7bf92fc9a03745c46f514161c",
+    "schema_id": "market-bars-v2",
+    "period_start": "2024-01-02T14:30:00Z",
+    "period_end": "2024-01-02T21:00:00Z",
+    "available_at": "2024-01-03T01:00:00Z",
+    "objects": [
+      {
+        "storage_object_id": "33333333-3333-4333-8333-333333333333",
+        "object_key": "market-data/provider=ALPACA/feed=ALPACA_SIP_RAW_30M/dataset=22222222-2222-4222-8222-222222222222/revision=1/layer=RAW/resolution=30m/granularity=DAY/partition_start=2024-01-02/partition_end=2024-01-03/shard=s00-of-01/part-00001.parquet",
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "object_kind": "PARQUET",
+        "partition_granularity": "DAY",
+        "partition_start": "2024-01-02",
+        "partition_end": "2024-01-03",
+        "period_start": "2024-01-02T14:30:00Z",
+        "period_end": "2024-01-02T21:00:00Z",
+        "shard_key": "s00-of-01",
+        "part_number": 1,
+        "row_count": 2,
+        "schema_version": "market-bars-v2"
+      }
+    ]
+  },
+  "backtest_request": {
+    "contract_id": "com06.backtest-request",
+    "schema_version": 1,
+    "event_type": "BACKTEST_REQUESTED",
+    "message_id": "44444444-4444-4444-8444-444444444444",
+    "occurred_at": "2024-01-03T01:05:00Z",
+    "correlation_id": "55555555-5555-4555-8555-555555555555",
+    "idempotency_key": "backtest:77777777-7777-4777-8777-777777777777:v1",
+    "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+    "strategy_version_id": "88888888-8888-4888-8888-888888888888",
+    "strategy_snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "compiled_plan_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "dataset_manifest_id": "11111111-1111-4111-8111-111111111111",
+    "dataset_hash": "d9f6310297b7eb858570086d7292a709261eecc7bf92fc9a03745c46f514161c",
+    "execution_policy_version": "official-backtest-policy-v1",
+    "requested_at": "2024-01-03T01:05:00Z"
+  },
+  "backtest_results": [
+    {
+      "contract_id": "com06.backtest-result",
+      "schema_version": 1,
+      "event_type": "BACKTEST_QUEUED",
+      "message_id": "90000000-0000-4000-8000-000000000001",
+      "occurred_at": "2024-01-03T01:05:01Z",
+      "correlation_id": "55555555-5555-4555-8555-555555555555",
+      "idempotency_key": "backtest-result:77777777-7777-4777-8777-777777777777:queued",
+      "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+      "status": "QUEUED",
+      "queued_at": "2024-01-03T01:05:01Z"
+    },
+    {
+      "contract_id": "com06.backtest-result",
+      "schema_version": 1,
+      "event_type": "BACKTEST_RUNNING",
+      "message_id": "90000000-0000-4000-8000-000000000002",
+      "occurred_at": "2024-01-03T01:06:00Z",
+      "correlation_id": "55555555-5555-4555-8555-555555555555",
+      "idempotency_key": "backtest-result:77777777-7777-4777-8777-777777777777:running:1",
+      "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+      "status": "RUNNING",
+      "started_at": "2024-01-03T01:06:00Z",
+      "attempt": 1
+    },
+    {
+      "contract_id": "com06.backtest-result",
+      "schema_version": 1,
+      "event_type": "BACKTEST_COMPLETE",
+      "message_id": "90000000-0000-4000-8000-000000000003",
+      "occurred_at": "2024-01-03T01:10:00Z",
+      "correlation_id": "55555555-5555-4555-8555-555555555555",
+      "idempotency_key": "backtest-result:77777777-7777-4777-8777-777777777777:complete",
+      "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+      "status": "COMPLETE",
+      "completed_at": "2024-01-03T01:10:00Z",
+      "result_manifest_id": "99999999-9999-4999-8999-999999999999"
+    },
+    {
+      "contract_id": "com06.backtest-result",
+      "schema_version": 1,
+      "event_type": "BACKTEST_FAILED",
+      "message_id": "90000000-0000-4000-8000-000000000004",
+      "occurred_at": "2024-01-03T01:07:00Z",
+      "correlation_id": "55555555-5555-4555-8555-555555555555",
+      "idempotency_key": "backtest-result:77777777-7777-4777-8777-777777777777:failed:1",
+      "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+      "status": "FAILED",
+      "failed_at": "2024-01-03T01:07:00Z",
+      "failure_code": "WORKER_TIMEOUT",
+      "retryable": true
+    },
+    {
+      "contract_id": "com06.backtest-result",
+      "schema_version": 1,
+      "event_type": "BACKTEST_UNAVAILABLE",
+      "message_id": "90000000-0000-4000-8000-000000000005",
+      "occurred_at": "2024-01-03T01:05:02Z",
+      "correlation_id": "55555555-5555-4555-8555-555555555555",
+      "idempotency_key": "backtest-result:77777777-7777-4777-8777-777777777777:unavailable",
+      "backtest_run_id": "77777777-7777-4777-8777-777777777777",
+      "status": "UNAVAILABLE",
+      "decided_at": "2024-01-03T01:05:02Z",
+      "reason_code": "REQUIRED_DATA_MISSING",
+      "missing_requirements": ["resolution:1m"]
+    }
+  ]
+}
