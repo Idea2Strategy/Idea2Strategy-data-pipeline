@@ -6,7 +6,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Protocol, runtime_checkable
 
 from .contracts import sha256_file
 
@@ -152,41 +152,117 @@ class S3ObjectStore:
             part for part in (self.prefix, normalized) if part
         )
 
-    def put(self, source_path: Path, object_key: str) -> ObjectReceipt:
-        source = source_path.expanduser().resolve()
-        content_hash = sha256_file(source)
-        byte_size = source.stat().st_size
-        key = self._key(object_key)
-        self.client.upload_file(
-            str(source),
-            self.bucket,
-            key,
-            ExtraArgs={"Metadata": {"sha256": content_hash}},
-        )
-        head = self.client.head_object(Bucket=self.bucket, Key=key)
-        remote_hash = head.get("Metadata", {}).get("sha256", "")
-        if int(head["ContentLength"]) != byte_size or remote_hash != content_hash:
+    @staticmethod
+    def _error_details(exc: Exception) -> tuple[str, int | None]:
+        response = getattr(exc, "response", {})
+        if not isinstance(response, dict):
+            return "", None
+        error = response.get("Error", {})
+        metadata = response.get("ResponseMetadata", {})
+        code = str(error.get("Code", "")) if isinstance(error, dict) else ""
+        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+        return code, status if isinstance(status, int) else None
+
+    @classmethod
+    def _is_missing(cls, exc: Exception) -> bool:
+        code, status = cls._error_details(exc)
+        return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+
+    @classmethod
+    def _is_precondition_failed(cls, exc: Exception) -> bool:
+        code, status = cls._error_details(exc)
+        return status == 412 or code in {"412", "PreconditionFailed"}
+
+    def _head(self, key: str) -> dict[str, Any]:
+        return self.client.head_object(Bucket=self.bucket, Key=key)
+
+    def _receipt_from_head(
+        self,
+        *,
+        key: str,
+        expected_hash: str,
+        expected_size: int,
+        head: dict[str, Any],
+        conflict: bool,
+    ) -> ObjectReceipt:
+        metadata = head.get("Metadata", {})
+        actual_hash = metadata.get("sha256", "") if isinstance(metadata, dict) else ""
+        actual_size = int(head.get("ContentLength", 0))
+        if actual_hash != expected_hash or actual_size != expected_size:
+            message = f"불변 객체 경로에 다른 바이트가 이미 있습니다: {key}"
+            if conflict:
+                raise FileExistsError(message)
             raise RuntimeError(f"S3 업로드 검증 실패: s3://{self.bucket}/{key}")
+        etag = str(head.get("ETag", "")).strip('"') or None
         return ObjectReceipt(
             storage_provider="S3_COMPATIBLE",
             bucket_name=self.bucket,
             object_key=key,
-            provider_version_id=(
-                head.get("VersionId")
-                or str(head.get("ETag", "")).strip('"')
-                or None
-            ),
-            content_hash=content_hash,
-            byte_size=byte_size,
-            etag=str(head.get("ETag", "")).strip('"') or None,
+            provider_version_id=head.get("VersionId") or etag,
+            content_hash=actual_hash,
+            byte_size=actual_size,
+            etag=etag,
+        )
+
+    def put(self, source_path: Path, object_key: str) -> ObjectReceipt:
+        source = source_path.expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"publish할 파일이 없습니다: {source}")
+        content_hash = sha256_file(source)
+        byte_size = source.stat().st_size
+        key = self._key(object_key)
+        try:
+            existing = self._head(key)
+        except Exception as exc:
+            if not self._is_missing(exc):
+                raise
+        else:
+            return self._receipt_from_head(
+                key=key,
+                expected_hash=content_hash,
+                expected_size=byte_size,
+                head=existing,
+                conflict=True,
+            )
+
+        try:
+            with source.open("rb") as body:
+                self.client.put_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Body=body,
+                    ContentLength=byte_size,
+                    ContentType="application/vnd.apache.parquet",
+                    IfNoneMatch="*",
+                    Metadata={"sha256": content_hash},
+                )
+        except Exception as exc:
+            if not self._is_precondition_failed(exc):
+                raise
+            raced = self._head(key)
+            return self._receipt_from_head(
+                key=key,
+                expected_hash=content_hash,
+                expected_size=byte_size,
+                head=raced,
+                conflict=True,
+            )
+        return self._receipt_from_head(
+            key=key,
+            expected_hash=content_hash,
+            expected_size=byte_size,
+            head=self._head(key),
+            conflict=False,
         )
 
     def exists(self, object_key: str) -> bool:
         try:
-            self.client.head_object(Bucket=self.bucket, Key=self._key(object_key))
+            self._head(self._key(object_key))
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            if self._is_missing(exc):
+                return False
+            raise
 
     def open(self, object_key: str) -> BinaryIO:
         body = self.client.get_object(
@@ -201,12 +277,11 @@ class S3ObjectStore:
         expected_sha256: str,
     ) -> VerificationResult:
         try:
-            head = self.client.head_object(
-                Bucket=self.bucket,
-                Key=self._key(object_key),
-            )
+            head = self._head(self._key(object_key))
         except Exception as exc:
-            return VerificationResult(False, "", 0, str(exc))
+            if self._is_missing(exc):
+                return VerificationResult(False, "", 0, "object missing")
+            raise
         actual = head.get("Metadata", {}).get("sha256", "")
         return VerificationResult(
             actual == expected_sha256,
