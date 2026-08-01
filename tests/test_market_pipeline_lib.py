@@ -29,6 +29,7 @@ from market_pipeline_lib.processing import (
 )
 from market_pipeline_lib.storage import LocalObjectStore, S3ObjectStore
 from pipeline_state import PipelineStateStore
+from d_storage_testkit import FakeS3Client
 
 
 IDS = {
@@ -99,27 +100,6 @@ class RevisedAdjustedSource(FakeSource):
             for column in ("open", "high", "low", "close", "vwap"):
                 frame[column] = frame[column] + 5.0
         return frame
-
-
-class FakeS3Client:
-    def __init__(self):
-        self.objects = {}
-
-    def upload_file(self, source, bucket, key, ExtraArgs):
-        content = Path(source).read_bytes()
-        self.objects[(bucket, key)] = {
-            "Body": content,
-            "Metadata": ExtraArgs["Metadata"],
-        }
-
-    def head_object(self, Bucket, Key):
-        value = self.objects[(Bucket, Key)]
-        return {
-            "ContentLength": len(value["Body"]),
-            "Metadata": value["Metadata"],
-            "VersionId": "v1",
-            "ETag": '"etag"',
-        }
 
 
 class MarketPipelineContractTests(unittest.TestCase):
