@@ -24,6 +24,22 @@ from .contracts import (
     InstrumentMapping,
     bar_schema,
 )
+from .fs_paths import short_temp_path
+from .quality import (
+    Finding,
+    bar_span,
+    detect_derived_session_issues,
+    detect_duplicate_bars,
+    detect_invalid_values,
+    detect_missing_bars,
+    detect_out_of_order_bars,
+    detect_partition_boundary_violation,
+    detect_price_outliers,
+    detect_session_date_mismatch,
+    detect_volume_anomalies,
+    normalise_bar_frame,
+    schema_mismatch_finding,
+)
 
 
 ROW_GROUP_SIZE = 131_072
@@ -291,6 +307,60 @@ def derive_regular_bars(
     return sort_bar_table(table).replace_schema_metadata(bar_schema(True).metadata)
 
 
+def quality_findings(
+    table: pa.Table,
+    contract: DatasetContract,
+    *,
+    partition_start: date | None = None,
+    partition_end: date | None = None,
+    calendar_name: str = CALENDAR_NAME,
+) -> list[Finding]:
+    """Every D10 check family, each finding carrying its own impact scope.
+
+    Ordering (역순) is detected on the row order of ``table`` **as given**.  The
+    caller must therefore validate *before* sorting: ``sort_bar_table`` repairs
+    the defect and destroys the evidence in the same step.
+
+    Missing bars (누락 bar) are derived from the session calendar for the base
+    RAW/ADJUSTED layer.  The DERIVED layer keeps its ``source_minutes`` checks,
+    which measure a different thing (how much 30m input each derived bar
+    aggregated), and adding a second calendar expectation on top of unevenly
+    spaced derived bars would double-report the same gap.
+    """
+    expected_schema = bar_schema(contract.has_source_minutes)
+    if table.schema != expected_schema:
+        return [schema_mismatch_finding(expected_schema, table.schema)]
+    if table.num_rows == 0:
+        return []
+    frame = normalise_bar_frame(table.to_pandas())
+    span = bar_span(contract.resolution)
+    findings: list[Finding] = []
+    findings.extend(detect_duplicate_bars(frame, span=span))
+    findings.extend(detect_out_of_order_bars(frame, span=span))
+    findings.extend(detect_invalid_values(frame, span=span))
+    findings.extend(detect_price_outliers(frame, span=span))
+    findings.extend(detect_volume_anomalies(frame, span=span))
+    findings.extend(detect_session_date_mismatch(frame, span=span))
+    if partition_start is not None and partition_end is not None:
+        findings.extend(
+            detect_partition_boundary_violation(frame, partition_start, partition_end)
+        )
+    if contract.data_layer == "DERIVED":
+        findings.extend(
+            detect_derived_session_issues(
+                frame,
+                resolution=contract.resolution,
+                span=span,
+                calendar_name=calendar_name,
+            )
+        )
+    else:
+        findings.extend(
+            detect_missing_bars(frame, span=span, calendar_name=calendar_name)
+        )
+    return findings
+
+
 def quality_issues(
     table: pa.Table,
     contract: DatasetContract,
@@ -299,163 +369,30 @@ def quality_issues(
     partition_end: date | None = None,
     calendar_name: str = CALENDAR_NAME,
 ) -> list[dict[str, Any]]:
-    issues: list[dict[str, Any]] = []
-    expected = bar_schema(contract.has_source_minutes)
-    if table.schema != expected:
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "SCHEMA_MISMATCH",
-                "message": f"expected={expected}, actual={table.schema}",
-            }
+    """Flat, JSON-safe rendering of :func:`quality_findings`.
+
+    ``severity``/``code``/``message`` keep their historical names so existing
+    callers are unaffected; ``instrument_id``, ``scope_breadth``,
+    ``period_start``, ``period_end``, ``affected_bar_count`` and
+    ``policy_version`` are added so the impact scope survives the trip to
+    ``engine.py``, which is what finally lands it in
+    ``market_data.quality_incidents``.
+    """
+    return [
+        finding.as_issue()
+        for finding in quality_findings(
+            table,
+            contract,
+            partition_start=partition_start,
+            partition_end=partition_end,
+            calendar_name=calendar_name,
         )
-        return issues
-    if table.num_rows == 0:
-        return issues
-    frame = table.to_pandas()
-    timestamps = pd.to_datetime(frame["bar_start_at"], utc=True)
-    duplicate = frame.duplicated(["instrument_id", "bar_start_at"], keep=False)
-    if duplicate.any():
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "DUPLICATE_BAR",
-                "message": f"중복 키 {int(duplicate.sum())}행",
-            }
-        )
-    prices = frame[["open", "high", "low", "close"]]
-    finite_positive = np.isfinite(prices.to_numpy()).all(axis=1) & (prices > 0).all(axis=1)
-    if not bool(finite_positive.all()):
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "INVALID_PRICE",
-                "message": f"가격 오류 {int((~finite_positive).sum())}행",
-            }
-        )
-    ohlc = (
-        frame["high"].ge(frame[["open", "close", "low"]].max(axis=1))
-        & frame["low"].le(frame[["open", "close", "high"]].min(axis=1))
-    )
-    if not bool(ohlc.all()):
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "INVALID_OHLC",
-                "message": f"OHLC 관계 오류 {int((~ohlc).sum())}행",
-            }
-        )
-    negative_volume = frame["volume"] < 0
-    negative_trades = frame["trade_count"].notna() & frame["trade_count"].lt(0)
-    if negative_volume.any() or negative_trades.any():
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "NEGATIVE_ACTIVITY",
-                "message": (
-                    f"volume={int(negative_volume.sum())}, "
-                    f"trade_count={int(negative_trades.sum())}"
-                ),
-            }
-        )
-    expected_dates = timestamps.dt.tz_convert(ET).dt.date
-    if not (expected_dates == frame["session_date_et"]).all():
-        issues.append(
-            {
-                "severity": "ERROR",
-                "code": "SESSION_DATE_ET_MISMATCH",
-                "message": "bar_start_at과 session_date_et가 일치하지 않습니다.",
-            }
-        )
-    if partition_start is not None and partition_end is not None:
-        outside = (
-            frame["session_date_et"].lt(partition_start)
-            | frame["session_date_et"].ge(partition_end)
-        )
-        if outside.any():
-            issues.append(
-                {
-                    "severity": "ERROR",
-                    "code": "PARTITION_BOUNDARY_VIOLATION",
-                    "message": f"파티션 밖 {int(outside.sum())}행",
-                }
-            )
-    if contract.data_layer == "DERIVED":
-        schedule = _schedule(
-            frame["session_date_et"].min(),
-            frame["session_date_et"].max(),
-            calendar_name,
-        )
-        bounds = {
-            pd.Timestamp(index).date(): (
-                pd.Timestamp(row["market_open"]).tz_convert("UTC"),
-                pd.Timestamp(row["market_close"]).tz_convert("UTC"),
-            )
-            for index, row in schedule.iterrows()
-        }
-        outside_count = 0
-        bad_source = 0
-        missing_source = 0
-        maximum = {"1h": 60, "4h": 240, "1d": 390}[contract.resolution]
-        for row in frame.itertuples(index=False):
-            session = bounds.get(row.session_date_et)
-            if session is None or not (session[0] <= row.bar_start_at < session[1]):
-                outside_count += 1
-            session_minutes = (
-                int((session[1] - session[0]).total_seconds() // 60)
-                if session is not None
-                else maximum
-            )
-            allowed_max = min(maximum, session_minutes)
-            if (
-                row.source_minutes <= 0
-                or row.source_minutes % 30
-                or row.source_minutes > allowed_max
-            ):
-                bad_source += 1
-            if session is not None:
-                if contract.resolution == "1d":
-                    expected_minutes = session_minutes
-                else:
-                    remaining = int(
-                        (session[1] - row.bar_start_at).total_seconds() // 60
-                    )
-                    expected_minutes = min(maximum, max(0, remaining))
-                if row.source_minutes < expected_minutes:
-                    missing_source += 1
-        if outside_count:
-            issues.append(
-                {
-                    "severity": "ERROR",
-                    "code": "XNYS_SESSION_VIOLATION",
-                    "message": f"정규장 밖 {outside_count}행",
-                }
-            )
-        if bad_source:
-            issues.append(
-                {
-                    "severity": "ERROR",
-                    "code": "INVALID_SOURCE_MINUTES",
-                    "message": f"source_minutes 오류 {bad_source}행",
-                }
-            )
-        if missing_source:
-            issues.append(
-                {
-                    "severity": "WARNING",
-                    "code": "UNEXPECTED_MISSING_SOURCE_BARS",
-                    "message": (
-                        f"기대 분량보다 적은 파생봉 {missing_source}행; "
-                        "누락 봉은 생성하지 않았습니다."
-                    ),
-                }
-            )
-    return issues
+    ]
 
 
 def write_parquet(table: pa.Table, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary = short_temp_path(destination)
     try:
         pq.write_table(table, temporary, **PARQUET_WRITE_OPTIONS)
         metadata = pq.read_metadata(temporary)
