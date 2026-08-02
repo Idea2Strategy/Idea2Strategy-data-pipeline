@@ -454,6 +454,7 @@ jobs:
           python -m pytest
           tests/test_storage_adapter_localstack.py
           tests/test_realtime_ingest.py
+          tests/test_d90_c_integration.py
           tests/test_app_smoke.py
           -p no:cacheprovider -rs --junitxml=localstack-results.xml
       - name: The LocalStack legs actually ran (a skip is not a pass)

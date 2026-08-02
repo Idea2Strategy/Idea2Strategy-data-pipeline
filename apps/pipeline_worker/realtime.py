@@ -93,6 +93,8 @@ class EngineRealtimeIngestPort:
         spec = RealtimeIngestSpec(
             contract=contract,
             event_type=settings.event_type,
+            source_provider=settings.source_provider,
+            source_feed=settings.source_feed,
             source_resolution=settings.source_resolution,
             partition_granularity=settings.partition_granularity,
             fields=BarFieldMap(**dict(settings.value_fields)),
