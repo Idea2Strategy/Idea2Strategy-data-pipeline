@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "events": [
+    {
+      "eventId": "evt_cffe872742cbbc8c471e84cca929ab3922d636f881f676792cd8a3886a49a008",
+      "schemaVersion": 1,
+      "instrumentId": "8a35e6b5-cf84-4f63-920d-57c1f1b95df0",
+      "provider": "ALPACA",
+      "feed": "SIP",
+      "eventType": "QUOTE",
+      "providerEventId": "quote-42",
+      "occurredAt": "2026-07-31T14:30:00Z",
+      "receivedAt": "2026-07-31T14:30:00.125Z",
+      "sequence": 42,
+      "revision": 0,
+      "correctionOfEventId": null,
+      "values": {"bidPrice": 210.10, "bidSize": 100, "askPrice": 210.12, "askSize": 80}
+    },
+    {
+      "eventId": "evt_5bb3d64d6ac9c1be4e58b738054f455d5a453c315a8db745b73176ab17fa988e",
+      "schemaVersion": 1,
+      "instrumentId": "8a35e6b5-cf84-4f63-920d-57c1f1b95df0",
+      "provider": "ALPACA",
+      "feed": "SIP",
+      "eventType": "TRADE",
+      "providerEventId": "trade-43",
+      "occurredAt": "2026-07-31T14:30:00.010Z",
+      "receivedAt": "2026-07-31T14:30:00.135Z",
+      "sequence": 43,
+      "revision": 0,
+      "correctionOfEventId": null,
+      "values": {"price": 210.11, "size": 25}
+    },
+    {
+      "eventId": "evt_96e3d1d3e45d92ab162eee652010595bae90825203db15590d2ee3afcac3c834",
+      "schemaVersion": 1,
+      "instrumentId": "8a35e6b5-cf84-4f63-920d-57c1f1b95df0",
+      "provider": "ALPACA",
+      "feed": "SIP",
+      "eventType": "BAR_1M",
+      "providerEventId": "bar-20260731T143000Z",
+      "occurredAt": "2026-07-31T14:30:00Z",
+      "receivedAt": "2026-07-31T14:31:00.050Z",
+      "sequence": 45,
+      "revision": 0,
+      "correctionOfEventId": null,
+      "values": {"open": 210.10, "high": 210.25, "low": 210.05, "close": 210.20, "volume": 2500}
+    }
+  ]
+}
