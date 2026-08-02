@@ -56,7 +56,7 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 
 from ..contracts import deterministic_uuid
-from .calculators import BarPoint, FeatureValue
+from .calculators import BarPoint, FeatureValue, render
 from .definitions import FeatureDefinition, FeatureDefinitionRegistry
 from .errors import (
     FeatureDefinitionNotPublished,
@@ -278,7 +278,8 @@ class MaterializationResult:
 
 
 def _rows_payload(values: Sequence[FeatureValue]) -> list[dict[str, str]]:
-    return [{"at": iso_utc(item.bar_start_at), "value": str(item.value)} for item in values]
+    # `render`, not `str`: see the note on negative and scientific-notation zeros there.
+    return [{"at": iso_utc(item.bar_start_at), "value": render(item.value)} for item in values]
 
 
 def _result_hash(

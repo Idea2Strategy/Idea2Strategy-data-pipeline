@@ -9,6 +9,7 @@ from __future__ import annotations
 
 __all__ = [
     "DefinitionIntegrityError",
+    "FeatureCatalogIntegrityError",
     "FeatureDefinitionImmutable",
     "FeatureDefinitionNotPublished",
     "FeatureError",
@@ -19,6 +20,7 @@ __all__ = [
     "PartialSnapshotBatch",
     "SnapshotBatchNotConsumable",
     "UnknownCalculator",
+    "UnknownOfficialFeature",
 ]
 
 
@@ -78,3 +80,22 @@ class PartialSnapshotBatch(FeatureError, RuntimeError):
 
 class SnapshotBatchNotConsumable(FeatureError, RuntimeError):
     """A consumer asked for a batch that has not reached ``SUCCEEDED``."""
+
+
+class UnknownOfficialFeature(FeatureError, LookupError):
+    """A name that is not in the official feature catalog.
+
+    The catalog is a closed list on purpose: a strategy may only ask for a feature whose
+    meaning has been agreed and versioned, so "not in the catalog" is an answer rather
+    than a prompt to invent one.
+    """
+
+
+class FeatureCatalogIntegrityError(FeatureError, ValueError):
+    """The official feature catalog does not match what it promised.
+
+    Raised for two things, and they are the same thing seen from either end: the
+    catalog's own content no longer hashes to its declared `catalog_hash` (someone
+    edited an entry without minting a new catalog version), or the definitions published
+    for a catalog version are not the ones its entries resolve to.
+    """

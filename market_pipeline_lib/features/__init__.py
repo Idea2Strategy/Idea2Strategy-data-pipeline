@@ -29,6 +29,8 @@ already exist in the central schema.
 from __future__ import annotations
 
 from .calculators import (
+    MACD_OUTPUT_LINES,
+    PRECISION_RULES_VERSION,
     PRICE_FIELDS,
     QUANTUM,
     BarPoint,
@@ -38,6 +40,13 @@ from .calculators import (
     known_calculators,
     quantize,
 )
+from .catalog import (
+    INPUT_ADJUSTMENTS,
+    OFFICIAL_FEATURE_CATALOG_HASH,
+    OFFICIAL_FEATURE_CATALOG_VERSION,
+    OfficialFeature,
+    OfficialFeatureCatalog,
+)
 from .definitions import (
     FEATURE_DEFINITION_SCHEMA_VERSION,
     FeatureDefinition,
@@ -45,6 +54,7 @@ from .definitions import (
 )
 from .errors import (
     DefinitionIntegrityError,
+    FeatureCatalogIntegrityError,
     FeatureDefinitionImmutable,
     FeatureDefinitionNotPublished,
     FeatureError,
@@ -55,6 +65,7 @@ from .errors import (
     PartialSnapshotBatch,
     SnapshotBatchNotConsumable,
     UnknownCalculator,
+    UnknownOfficialFeature,
 )
 from .hashing import (
     FEATURE_VERSION_PREFIX,
@@ -90,12 +101,18 @@ __all__ = [
     "FEATURE_MATERIALIZATIONS",
     "FEATURE_SNAPSHOT_BATCHES",
     "FEATURE_VERSION_PREFIX",
+    "INPUT_ADJUSTMENTS",
+    "MACD_OUTPUT_LINES",
+    "OFFICIAL_FEATURE_CATALOG_HASH",
+    "OFFICIAL_FEATURE_CATALOG_VERSION",
+    "PRECISION_RULES_VERSION",
     "PRICE_FIELDS",
     "QUANTUM",
     "BarPoint",
     "DefinitionIntegrityError",
     "FeatureCalculator",
     "FeatureCatalog",
+    "FeatureCatalogIntegrityError",
     "FeatureDefinition",
     "FeatureDefinitionImmutable",
     "FeatureDefinitionNotPublished",
@@ -112,6 +129,8 @@ __all__ = [
     "MaterializationConflict",
     "MaterializationRequest",
     "MaterializationResult",
+    "OfficialFeature",
+    "OfficialFeatureCatalog",
     "ParsedFeatureVersion",
     "PartialSnapshotBatch",
     "SealedSnapshotBatch",
@@ -119,6 +138,7 @@ __all__ = [
     "SnapshotBatchPlan",
     "SourceObject",
     "UnknownCalculator",
+    "UnknownOfficialFeature",
     "batch_version",
     "get_calculator",
     "input_bundle_fingerprint",
