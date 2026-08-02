@@ -1,14 +1,20 @@
-"""Catalog validation, export, upload, and benchmark operations."""
+"""Catalog validation, export, upload, and benchmark operations.
+
+`apply_catalog_to_postgres` used to be a second, independent raw-psycopg writer that
+duplicated everything `PostgresCatalog` does.  It now validates and then replays the
+local catalog through that one SQLAlchemy Core adapter, so there is a single place where
+this repository writes `market_data`.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import re
-import shutil
 import time
 import tracemalloc
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,10 +22,152 @@ from typing import Any
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from .catalog import TABLE_FILES, LocalCatalog
+from .catalog import (
+    TABLE_FILES,
+    LocalCatalog,
+    MarketDataCatalog,
+    PostgresCatalog,
+    StorageObjectsPolicy,
+)
 from .contracts import DATASET_CONTRACTS, canonical_dataset_hash
 from .processing import quality_issues
+from .quality import (
+    QualityIncident,
+    content_hash_mismatch_incident,
+    incident_from_issue,
+    record_quality_incidents,
+)
 from .storage import LocalObjectStore, S3ObjectStore
+
+# --------------------------------------------------------------------------------------
+# Rights attestation
+# --------------------------------------------------------------------------------------
+
+#: `engine._ensure_provider_metadata` writes these because the pipeline itself cannot
+#: know the licence position; they mean "not yet attested", never "attested as open".
+PLACEHOLDER_RIGHTS_VERSIONS = frozenset({"", "UNVERIFIED"})
+REVIEW_REQUIRED_STATUS = "REVIEW_REQUIRED"
+
+#: Path to a JSON array of attestation objects.  The environment variable exists so the
+#: existing `market-pipeline apply-db` CLI can satisfy the gate without a code change.
+RIGHTS_ATTESTATIONS_ENV = "MARKET_DATA_RIGHTS_ATTESTATIONS"
+
+_ATTESTATION_FIELDS = (
+    "provider_code",
+    "rights_version",
+    "status",
+    "approved_by",
+    "approved_at",
+    "evidence_uri",
+)
+
+
+class RightsVersionNotAttested(RuntimeError):
+    """A provider's licence rights have not been attested, so the apply is refused.
+
+    Distinct from a contract error: nothing is wrong with the data.  What is missing is
+    external approval evidence, which `db/schema.dbml` requires for
+    `market_data.providers.rights_version` and which no pipeline run can produce.
+    """
+
+
+@dataclass(frozen=True)
+class RightsAttestation:
+    """External approval evidence for one provider's licence rights.
+
+    This is the *only* way `rights_version` reaches PostgreSQL as anything other than a
+    placeholder.  Every field is required: an attestation without an approver, a date
+    and a pointer to the evidence is not evidence.
+    """
+
+    provider_code: str
+    rights_version: str
+    status: str
+    approved_by: str
+    approved_at: str
+    evidence_uri: str
+
+    def __post_init__(self) -> None:
+        for field in _ATTESTATION_FIELDS:
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"rights attestation field {field!r} must be a non-empty string")
+        if self.rights_version in PLACEHOLDER_RIGHTS_VERSIONS:
+            raise ValueError(
+                f"{self.rights_version!r} is a placeholder, not an attested rights "
+                "version; an attestation cannot restate the thing it is meant to resolve"
+            )
+        if self.status == REVIEW_REQUIRED_STATUS:
+            raise ValueError(f"an attestation cannot carry status {REVIEW_REQUIRED_STATUS}")
+        try:
+            datetime.fromisoformat(self.approved_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"approved_at={self.approved_at!r} is not an ISO-8601 timestamp") from exc
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> RightsAttestation:
+        missing = [field for field in _ATTESTATION_FIELDS if field not in payload]
+        if missing:
+            raise ValueError(f"rights attestation is missing {missing}")
+        return cls(**{field: payload[field] for field in _ATTESTATION_FIELDS})
+
+
+def load_rights_attestations(source: Path | None = None) -> dict[str, RightsAttestation]:
+    """Read attestations from `source`, or from `$MARKET_DATA_RIGHTS_ATTESTATIONS`.
+
+    Returns an empty mapping when neither is set.  An empty mapping is not permission:
+    `apply_catalog_to_postgres` still refuses every provider that needs one.
+    """
+
+    path = source or (Path(os.environ[RIGHTS_ATTESTATIONS_ENV]) if os.environ.get(RIGHTS_ATTESTATIONS_ENV) else None)
+    if path is None:
+        return {}
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"rights attestation 파일이 없습니다: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"{path} must contain a JSON array of attestation objects")
+    attestations = [RightsAttestation.from_mapping(item) for item in payload]
+    by_code: dict[str, RightsAttestation] = {}
+    for attestation in attestations:
+        if attestation.provider_code in by_code:
+            raise ValueError(f"duplicate rights attestation for provider {attestation.provider_code}")
+        by_code[attestation.provider_code] = attestation
+    return by_code
+
+
+def rights_review_state(
+    providers: list[dict[str, Any]],
+    attestations: dict[str, RightsAttestation],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Split providers into applied rows, attested codes, and codes still blocked.
+
+    A provider whose `rights_version` is already a real value and whose status is not
+    `REVIEW_REQUIRED` needs nothing; a provider carrying the placeholder is rewritten
+    from its attestation, or reported as blocked.  The placeholder is never written.
+    """
+
+    applied: list[dict[str, Any]] = []
+    attested: list[str] = []
+    blocked: list[str] = []
+    for row in providers:
+        code = str(row.get("code", ""))
+        needs_review = (
+            row.get("rights_version") is None
+            or str(row.get("rights_version")) in PLACEHOLDER_RIGHTS_VERSIONS
+            or row.get("status") == REVIEW_REQUIRED_STATUS
+        )
+        if not needs_review:
+            applied.append(dict(row))
+            continue
+        attestation = attestations.get(code)
+        if attestation is None:
+            blocked.append(code)
+            continue
+        applied.append({**row, "rights_version": attestation.rights_version, "status": attestation.status})
+        attested.append(code)
+    return applied, sorted(attested), sorted(blocked)
 
 
 def _contract_for_manifest(
@@ -32,12 +180,86 @@ def _contract_for_manifest(
     return DATASET_CONTRACTS.get(key)
 
 
+def scoped_validation_incidents(
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    *,
+    detected_at: datetime,
+) -> list[tuple[str | None, QualityIncident]]:
+    """Turn validation findings into scoped `market_data.quality_incidents` rows.
+
+    Every finding this function accepts already carries the shard, the partition
+    boundaries and, where the data knows one, the instrument -- `validate_catalog`
+    attaches them from the `dataset_objects` row the finding came from.  Findings
+    without that scope are *not* silently widened to the manifest: they are dropped
+    here and stay in the report, because a manifest-wide incident with no reason is
+    exactly the useless scope card D10 exists to remove.
+
+    `CONTENT_HASH_MISMATCH` is built through `quality.content_hash_mismatch_incident`,
+    which pins the failing object into `evidence_object_id`.  Previously this finding
+    was skipped entirely -- it carried no `manifest_id`, so the guard dropped it and a
+    checksum failure never reached the table at all.
+    """
+
+    incidents: list[tuple[str | None, QualityIncident]] = []
+    for severity, findings in (("ERROR", errors), ("WARNING", warnings)):
+        for finding in findings:
+            manifest_id = finding.get("manifest_id")
+            if finding["code"] == "CONTENT_HASH_MISMATCH":
+                incidents.append(
+                    (
+                        manifest_id,
+                        content_hash_mismatch_incident(
+                            object_id=finding["object_id"],
+                            object_key=finding["object_key"],
+                            expected_content_hash=finding["expected_content_hash"],
+                            actual_content_hash=finding["actual_content_hash"],
+                            shard_key=finding["shard_key"],
+                            partition_start=date.fromisoformat(finding["partition_start"]),
+                            partition_end=date.fromisoformat(finding["partition_end"]),
+                            period_start=datetime.fromisoformat(
+                                str(finding["period_start"]).replace("Z", "+00:00")
+                            ),
+                            period_end=datetime.fromisoformat(
+                                str(finding["period_end"]).replace("Z", "+00:00")
+                            ),
+                            detected_at=detected_at,
+                        ),
+                    )
+                )
+                continue
+            if not finding.get("shard_key") or not finding.get("partition_start"):
+                continue
+            incidents.append(
+                (
+                    manifest_id,
+                    incident_from_issue(
+                        {**finding, "severity": finding.get("severity", severity)},
+                        detected_at=detected_at,
+                        evidence_object_id=finding.get("object_id"),
+                    ),
+                )
+            )
+    return incidents
+
+
 def validate_catalog(
-    catalog: LocalCatalog,
+    catalog: MarketDataCatalog,
     object_store: LocalObjectStore,
     *,
     write_report: bool = True,
 ) -> dict[str, Any]:
+    """Re-verify every published object and record what is wrong in the catalog.
+
+    `catalog` is the shared `MarketDataCatalog` contract, not `LocalCatalog`.  The
+    annotation used to name one implementation, which is the same coupling as an
+    `isinstance` gate: D07/D08 could not validate a dataset that lived in PostgreSQL.
+
+    Findings are *recorded*, not only reported.  A `CONTENT_HASH_MISMATCH` that exists
+    solely in `validation-report.json` is invisible to every consumer of
+    `market_data.quality_incidents`, which is the D10 defect spec section 1 names.
+    """
+
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     storage = {
@@ -74,6 +296,13 @@ def validate_catalog(
                     }
                 )
                 continue
+            scope = {
+                "shard_key": relation["shard_key"],
+                "partition_start": relation["partition_start"],
+                "partition_end": relation["partition_end"],
+                "object_id": record["id"],
+                "manifest_id": manifest["id"],
+            }
             verification = object_store.verify(
                 record["object_key"],
                 record["content_hash"],
@@ -81,9 +310,14 @@ def validate_catalog(
             if not verification.ok:
                 errors.append(
                     {
+                        **scope,
                         "code": "CONTENT_HASH_MISMATCH",
-                        "object_id": record["id"],
                         "message": verification.message,
+                        "object_key": record["object_key"],
+                        "expected_content_hash": record["content_hash"],
+                        "actual_content_hash": verification.content_hash,
+                        "period_start": relation["period_start"],
+                        "period_end": relation["period_end"],
                     }
                 )
                 continue
@@ -94,8 +328,8 @@ def validate_catalog(
             except Exception as exc:
                 errors.append(
                     {
+                        **scope,
                         "code": "PARQUET_FOOTER_INVALID",
-                        "object_id": record["id"],
                         "message": str(exc),
                     }
                 )
@@ -103,8 +337,12 @@ def validate_catalog(
             if parquet.metadata.num_rows != relation["row_count"]:
                 errors.append(
                     {
+                        **scope,
                         "code": "ROW_COUNT_MISMATCH",
-                        "object_id": record["id"],
+                        "message": (
+                            f"Parquet footer {parquet.metadata.num_rows}행, "
+                            f"dataset_objects {relation['row_count']}행"
+                        ),
                     }
                 )
             for issue in quality_issues(
@@ -114,13 +352,9 @@ def validate_catalog(
                 partition_end=date.fromisoformat(relation["partition_end"]),
             ):
                 target = errors if issue["severity"] == "ERROR" else warnings
-                target.append(
-                    {
-                        **issue,
-                        "object_id": record["id"],
-                        "manifest_id": manifest["id"],
-                    }
-                )
+                # `scope` first: the issue's own instrument/period/breadth win, and the
+                # shard and partition it was found in are added, never overwritten.
+                target.append({**scope, **issue})
             canonical_objects.append(
                 {
                     "content_hash": record["content_hash"],
@@ -170,18 +404,33 @@ def validate_catalog(
                     "manifest_id": manifest["id"],
                 }
             )
+    detected_at = datetime.now(timezone.utc)
+    by_manifest: dict[str | None, list[QualityIncident]] = defaultdict(list)
+    for manifest_id, incident in scoped_validation_incidents(errors, warnings, detected_at=detected_at):
+        by_manifest[manifest_id].append(incident)
+    recorded = sum(
+        record_quality_incidents(catalog, group, dataset_manifest_id=manifest_id)
+        for manifest_id, group in by_manifest.items()
+    )
+
     report = {
         "status": "PASSED" if not errors else "FAILED",
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at": detected_at.isoformat(),
         "manifest_count": len(manifests),
         "object_count": len(storage),
         "error_count": len(errors),
         "warning_count": len(warnings),
         "errors": errors,
         "warnings": warnings,
+        "recorded_incident_count": recorded,
+        "quality_incidents": [
+            incident.to_report_entry(dataset_manifest_id=manifest_id)
+            for manifest_id, group in by_manifest.items()
+            for incident in group
+        ],
     }
     if write_report:
-        path = catalog.root / "validation-report.json"
+        path = catalog.artifact_root / "validation-report.json"
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             temporary.write_text(
@@ -218,7 +467,7 @@ def parse_dbml_columns(path: Path) -> dict[str, set[str]]:
 
 
 def export_db_plan(
-    catalog: LocalCatalog,
+    catalog: MarketDataCatalog,
     destination: Path,
     *,
     dbml_path: Path | None = None,
@@ -265,6 +514,36 @@ def export_db_plan(
     return summary
 
 
+#: Load order for the apply path: parents before children, so the deferrable foreign
+#: keys in `V1__initial_schema.sql` are satisfied without deferring anything.
+APPLY_TABLE_ORDER = (
+    "market_data.providers",
+    "market_data.feeds",
+    "market_data.pipeline_runs",
+    "market_data.dataset_manifests",
+    "storage.objects",
+    "market_data.dataset_objects",
+    "market_data.dataset_lineage",
+    "market_data.dataset_object_lineage",
+    "market_data.quality_incidents",
+)
+
+
+def _referenced_instrument_ids(
+    catalog: MarketDataCatalog,
+    object_store: LocalObjectStore,
+) -> set[str]:
+    """Every `instrument_id` appearing in the catalog's Parquet objects."""
+
+    instrument_ids: set[str] = set()
+    for record in catalog.records("storage.objects"):
+        path = object_store.path_for(record["object_key"])
+        instrument_ids.update(
+            pq.read_table(path, columns=["instrument_id"]).column("instrument_id").to_pylist()
+        )
+    return instrument_ids
+
+
 def apply_catalog_to_postgres(
     catalog: LocalCatalog,
     object_store: LocalObjectStore,
@@ -272,23 +551,33 @@ def apply_catalog_to_postgres(
     dbml_path: Path,
     execute: bool = False,
     database_url: str | None = None,
+    rights_attestations: dict[str, RightsAttestation] | None = None,
+    rights_attestations_path: Path | None = None,
+    storage_objects: StorageObjectsPolicy = StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION,
 ) -> dict[str, Any]:
-    """Validate the DBML contract and optionally apply it in one transaction."""
+    """Validate the DBML contract and optionally apply it in one transaction.
+
+    The apply itself goes through `PostgresCatalog`, the single SQLAlchemy Core writer;
+    this function keeps only what it uniquely contributes -- the DBML column contract
+    check, the global `dataset_hash` uniqueness check, the instrument existence check,
+    and the rights gate.
+
+    Rights
+    ------
+    `market_data.providers.rights_version` requires external approval evidence, and the
+    pipeline stamps the placeholder ``UNVERIFIED`` because it cannot produce that
+    evidence itself.  Rejecting the placeholder without any way to replace it made
+    ``--execute`` unreachable for every plan this repository generates.  The gate is now
+    a policy with a satisfiable input: supply `RightsAttestation`s here, or point
+    ``$MARKET_DATA_RIGHTS_ATTESTATIONS`` at a JSON file.  Attested providers are written
+    with their attested version; unattested ones block the apply by name.  The
+    placeholder itself is never written.
+    """
+
     tables = parse_dbml_columns(dbml_path)
-    errors = []
+    errors: list[str] = []
     operations: list[tuple[str, dict[str, Any]]] = []
-    ordered_tables = (
-        "market_data.providers",
-        "market_data.feeds",
-        "market_data.pipeline_runs",
-        "market_data.dataset_manifests",
-        "storage.objects",
-        "market_data.dataset_objects",
-        "market_data.dataset_lineage",
-        "market_data.dataset_object_lineage",
-        "market_data.quality_incidents",
-    )
-    for table in ordered_tables:
+    for table in APPLY_TABLE_ORDER:
         allowed = tables.get(table)
         if allowed is None:
             errors.append(f"DBML에 테이블이 없습니다: {table}")
@@ -298,106 +587,83 @@ def apply_catalog_to_postgres(
             if extras:
                 errors.append(f"{table} 비-DBML 열: {sorted(extras)}")
             operations.append((table, row))
+
     manifests = catalog.records("market_data.dataset_manifests")
     by_hash: dict[str, list[str]] = defaultdict(list)
     for row in manifests:
         by_hash[row["dataset_hash"]].append(row["id"])
-    duplicate_hashes = {
-        digest: ids for digest, ids in by_hash.items() if len(ids) > 1
-    }
+    duplicate_hashes = {digest: ids for digest, ids in by_hash.items() if len(ids) > 1}
     if duplicate_hashes:
-        errors.append(
-            "dataset_manifests.dataset_hash 전역 UNIQUE 충돌 가능성이 있습니다."
-        )
-    report = {
+        errors.append("dataset_manifests.dataset_hash 전역 UNIQUE 충돌 가능성이 있습니다.")
+
+    attestations = rights_attestations if rights_attestations is not None else load_rights_attestations(
+        rights_attestations_path
+    )
+    resolved_providers, attested, blocked = rights_review_state(
+        catalog.records("market_data.providers"), attestations
+    )
+
+    report: dict[str, Any] = {
         "status": "FAILED" if errors else "PASSED",
         "mode": "execute" if execute else "dry-run",
         "operation_count": len(operations),
         "contract_errors": errors,
         "duplicate_dataset_hashes": duplicate_hashes,
+        "rights_attested_providers": attested,
+        "rights_review_required_providers": blocked,
+        "rights_attestations_env": RIGHTS_ATTESTATIONS_ENV,
     }
     if errors or not execute:
         return report
-    providers = catalog.records("market_data.providers")
-    if any(
-        row.get("rights_version") in {None, "", "UNVERIFIED"}
-        or row.get("status") == "REVIEW_REQUIRED"
-        for row in providers
-    ):
-        raise RuntimeError(
-            "Alpaca 권리 버전이 승인되지 않아 PostgreSQL 반영을 차단합니다."
+
+    if blocked:
+        raise RightsVersionNotAttested(
+            f"provider(s) {blocked} carry a placeholder rights_version. Supply a "
+            f"RightsAttestation for each, or point ${RIGHTS_ATTESTATIONS_ENV} at a JSON "
+            "array of attestations, before applying to PostgreSQL."
         )
     if not database_url:
         raise ValueError("--execute에는 DATABASE_URL이 필요합니다.")
+
+    by_table: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for table, row in operations:
+        by_table[table].append(row)
+    by_table["market_data.providers"] = resolved_providers
+
+    instrument_ids = _referenced_instrument_ids(catalog, object_store)
+    target = PostgresCatalog.connect(
+        database_url,
+        artifact_root=catalog.artifact_root,
+        storage_objects=storage_objects,
+    )
     try:
-        import psycopg
-        from psycopg import sql
-    except ImportError as exc:
-        raise RuntimeError(
-            "PostgreSQL 반영에는 optional dependency psycopg가 필요합니다."
-        ) from exc
-    instrument_ids = set()
-    for record in catalog.records("storage.objects"):
-        path = object_store.path_for(record["object_key"])
-        instrument_ids.update(
-            pq.read_table(path, columns=["instrument_id"])
-            .column("instrument_id")
-            .to_pylist()
-        )
-    with psycopg.connect(database_url) as connection:
-        with connection.transaction():
-            with connection.cursor() as cursor:
-                if instrument_ids:
-                    cursor.execute(
-                        "SELECT id::text FROM market_data.instruments "
-                        "WHERE id = ANY(%s::uuid[])",
-                        (list(instrument_ids),),
-                    )
-                    known = {row[0] for row in cursor.fetchall()}
-                    missing = instrument_ids.difference(known)
-                    if missing:
-                        raise RuntimeError(
-                            f"DB에 없는 instrument_id: {sorted(missing)}"
-                        )
-                for table, row in operations:
-                    schema, name = table.split(".", 1)
-                    columns = list(row)
-                    conflict = (
-                        sql.SQL("ON CONFLICT DO NOTHING")
-                        if "id" not in row
-                        else sql.SQL(
-                            "ON CONFLICT (id) DO UPDATE SET {}"
-                        ).format(
-                            sql.SQL(",").join(
-                                sql.SQL("{}=EXCLUDED.{}").format(
-                                    sql.Identifier(column),
-                                    sql.Identifier(column),
-                                )
-                                for column in columns
-                                if column != "id"
-                            )
-                        )
-                    )
-                    statement = sql.SQL(
-                        "INSERT INTO {}.{} ({}) VALUES ({}) {}"
-                    ).format(
-                        sql.Identifier(schema),
-                        sql.Identifier(name),
-                        sql.SQL(",").join(map(sql.Identifier, columns)),
-                        sql.SQL(",").join(
-                            sql.Placeholder() for _ in columns
-                        ),
-                        conflict,
-                    )
-                    cursor.execute(
-                        statement,
-                        [row[column] for column in columns],
-                    )
-    return {**report, "status": "APPLIED"}
+        target.verify_schema()
+        with target.transaction() as unit:
+            if instrument_ids:
+                _assert_instruments_exist(unit, instrument_ids)
+            for table in APPLY_TABLE_ORDER:
+                rows = by_table.get(table, [])
+                for row in rows:
+                    if table in {"market_data.dataset_lineage", "market_data.dataset_object_lineage"}:
+                        unit.append_unique(table, row, tuple(row))
+                    else:
+                        unit.upsert(table, row)
+    finally:
+        target.close()
+    return {**report, "status": "APPLIED", "applied_table_counts": {k: len(v) for k, v in by_table.items()}}
+
+
+def _assert_instruments_exist(catalog: PostgresCatalog, instrument_ids: set[str]) -> None:
+    """Refuse to apply objects that reference instruments the database does not have."""
+
+    known = catalog.existing_ids("market_data.instruments", instrument_ids)
+    missing = instrument_ids.difference(known)
+    if missing:
+        raise RuntimeError(f"DB에 없는 instrument_id: {sorted(missing)}")
 
 
 def upload_catalog_objects(
-    catalog: LocalCatalog,
+    catalog: MarketDataCatalog,
     local_store: LocalObjectStore,
     remote_store: S3ObjectStore,
     destination_catalog_root: Path,
@@ -469,7 +735,7 @@ def upload_catalog_objects(
 
 
 def benchmark_catalog(
-    catalog: LocalCatalog,
+    catalog: MarketDataCatalog,
     store: LocalObjectStore,
     *,
     year: int | None = None,
