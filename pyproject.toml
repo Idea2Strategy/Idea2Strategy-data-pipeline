@@ -28,6 +28,11 @@ dependencies = [
   "psycopg[binary]>=3.2,<4",
   "pyarrow>=25,<26",
   "python-dotenv>=1,<2",
+  # D90: C's market gateway publishes market events on Redis Streams
+  # (`RedisMarketEventPublisher`), so `market_pipeline_lib.redis_ingest` is the
+  # only transport that can actually receive them.  A runtime dependency, not a
+  # test one: the realtime consumer does not work without it.
+  "redis>=5,<7",
   "SQLAlchemy>=2.0,<3",
 ]
 

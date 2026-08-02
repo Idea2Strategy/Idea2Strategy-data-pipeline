@@ -25,7 +25,16 @@ UUID_NAMESPACE = uuid.UUID("05a27d5a-75d8-4d57-bc9a-31cedf90d791")
 
 PriceType = Literal["raw", "adjusted"]
 DataLayer = Literal["RAW", "ADJUSTED", "DERIVED"]
-Resolution = Literal["30m", "1h", "4h", "1d"]
+#: `1m` exists because C publishes `BAR_1M` (`MarketEventType.java`) and D conforms
+#: to what C already publishes.  Without it a one-minute bar has no dataset contract
+#: to land in, so a realtime object could not carry a canonical `object_key` and
+#: could therefore never enter `MarketPipelineEngine.compact`.
+#:
+#: This is a code-level literal, not canonical DDL: `market_data.dataset_manifests.
+#: resolution` and `market_data.feeds.resolution` are `varchar(30)` in the central
+#: `V1__initial_schema.sql`, with no CHECK constraint and no enum, so adding a
+#: resolution needs no migration and touches no protected contract.
+Resolution = Literal["1m", "30m", "1h", "4h", "1d"]
 Granularity = Literal["DAY", "WEEK", "MONTH", "YEAR"]
 
 
@@ -57,11 +66,33 @@ class DatasetContract:
 RAW_FEED = "ALPACA_SIP_RAW_30M"
 ADJUSTED_FEED = "ALPACA_SIP_ADJUSTED_30M"
 
+#: The feed C's realtime `BAR_1M` stream lands in.  It is a *separate* feed from
+#: `ALPACA_SIP_RAW_30M`, not a second resolution of it: `market_data.feeds` carries
+#: one `resolution` per row, and `market_data.stream_watermarks` is keyed by
+#: `feed_id`, so sharing a feed would make the 30-minute backfill's watermark and
+#: the 1-minute stream's watermark the same row and each would keep clobbering the
+#: other's freshness.
+RAW_1M_FEED = "ALPACA_SIP_RAW_1M"
+
+#: `market_data.feeds` metadata per feed code: `(resolution, feed_version)`.
+#: Stated per feed rather than derived, because the resolution of a feed row is a
+#: published fact about that feed and the previous hardcoded `"30m"` would have
+#: labelled the 1-minute feed as 30-minute.
+FEED_METADATA: dict[str, tuple[str, str]] = {
+    RAW_FEED: ("30m", "alpaca-sip-raw-v1"),
+    ADJUSTED_FEED: ("30m", "alpaca-sip-adjustment-all-v1"),
+    RAW_1M_FEED: ("1m", "alpaca-sip-raw-1m-v1"),
+}
+
 
 def _contracts() -> dict[tuple[str, str, str], DatasetContract]:
     values: list[DatasetContract] = [
         DatasetContract("raw", "RAW", "30m", RAW_FEED),
         DatasetContract("adjusted", "ADJUSTED", "30m", ADJUSTED_FEED),
+        # C's native cadence.  RAW only: an ADJUSTED 1-minute dataset would have to
+        # be produced by the corporate-action path, and C publishes no adjusted
+        # prices, so declaring one would promise a dataset nothing fills.
+        DatasetContract("raw", "RAW", "1m", RAW_1M_FEED),
     ]
     for price_type, feed_code in (
         ("raw", RAW_FEED),

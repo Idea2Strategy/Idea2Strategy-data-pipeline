@@ -158,11 +158,15 @@ C_WIRE_FIELDS = (
 # ----------------------------------------------------------------------------------
 # D's landing zone for that stream.
 #
-# C emits BAR_1M at PT1M; D's canonical `DATASET_CONTRACTS` has no 1-minute RAW
-# contract (RAW is 30m; 1h/4h/1d are DERIVED).  The ingest spec below therefore
-# declares the 30-minute stream, and `test_cs_native_bar_cadence_has_no_landing_
-# zone_and_says_so` pins the fact that binding C's PT1M cadence to D's 30m
-# contract fails closed instead of silently mis-labelling the resolution.
+# C emits BAR_1M at PT1M.  D's `DATASET_CONTRACTS` now carries a 1-minute RAW
+# contract for exactly that (`contracts.RAW_1M_FEED`), and the Redis path that
+# consumes it is covered end to end by `tests/test_d90_redis_source.py`.
+#
+# The specs in *this* file stay on the 30-minute stream on purpose: it is the
+# resolution D's batch backfill publishes, so these tests keep proving that C's
+# envelope is consumed correctly on a dataset C does not itself feed.  Binding C's
+# PT1M cadence to the 30m contract must still fail closed rather than mis-label the
+# resolution -- `test_cs_native_bar_cadence_may_not_be_relabelled_as_thirty_minute`.
 # ----------------------------------------------------------------------------------
 
 RAW_CONTRACT = DATASET_CONTRACTS[("raw", "RAW", "30m")]
@@ -433,8 +437,13 @@ class CEventIngestTests(unittest.TestCase):
         self.assertEqual(ingestor.pending_rows, 0)
         self.assertEqual(ingestor.flush().status, "NO_CHANGE")
 
-    def test_cs_native_bar_cadence_has_no_landing_zone_and_says_so(self) -> None:
-        """C emits BAR_1M at PT1M; D's RAW contract is 30m.  Fail closed, loudly."""
+    def test_cs_native_bar_cadence_may_not_be_relabelled_as_thirty_minute(self) -> None:
+        """C emits BAR_1M at PT1M.  Its home is the 1-minute contract, not this one.
+
+        Adding `("raw", "RAW", "1m")` gave that cadence a real landing zone; it must
+        not also have made it possible to file a one-minute bar under the 30-minute
+        dataset.  Fail closed, loudly.
+        """
 
         with self.assertRaisesRegex(RealtimeIngestError, "PT30M"):
             RealtimeIngestSpec(
@@ -448,10 +457,25 @@ class CEventIngestTests(unittest.TestCase):
             )
 
     def test_an_event_type_this_stream_does_not_ingest_is_reported_not_dropped(self) -> None:
+        """C multiplexes QUOTE, TRADE and BAR_1M onto one stream.
+
+        A quote or a trade is not a bar and has no dataset contract to land in, so
+        this stream reports it under `NON_BAR_EVENT_TYPE` and moves on.  A *bar* of
+        another cadence keeps the distinct `EVENT_TYPE_NOT_INGESTED` code, because
+        that one means the stream is wired to the wrong dataset.
+        """
+
         ingestor = build_ingestor(self.engine)
-        decisions = [ingestor.submit(dict(event, eventType="QUOTE")) for event in session_events()[:2]]
+        decisions = [
+            ingestor.submit(dict(event, eventType=event_type))
+            for event, event_type in zip(session_events()[:2], ("QUOTE", "TRADE"), strict=True)
+        ]
         self.assertEqual([d.accepted for d in decisions], [False, False])
-        self.assertEqual({d.reason for d in decisions}, {"EVENT_TYPE_NOT_INGESTED"})
+        self.assertEqual({d.reason for d in decisions}, {"NON_BAR_EVENT_TYPE"})
+
+        misrouted = ingestor.submit(dict(session_events()[0], eventType="BAR_1M"))
+        self.assertFalse(misrouted.accepted)
+        self.assertEqual(misrouted.reason, "EVENT_TYPE_NOT_INGESTED")
         self.assertEqual(ingestor.pending_rows, 0)
 
     def test_an_exact_redelivery_is_skipped_and_does_not_duplicate_a_bar(self) -> None:

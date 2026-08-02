@@ -25,6 +25,7 @@ from .contracts import (
     CALENDAR_NAME,
     DATASET_CONTRACTS,
     ET,
+    FEED_METADATA,
     PROVIDER_CODE,
     RAW_FEED,
     SCHEMA_VERSION,
@@ -213,6 +214,7 @@ class NewObject:
 
 def _bar_duration(resolution: str) -> timedelta:
     return {
+        "1m": timedelta(minutes=1),
         "30m": timedelta(minutes=30),
         "1h": timedelta(hours=1),
         "4h": timedelta(hours=4),
@@ -283,10 +285,8 @@ class MarketPipelineEngine:
         self.source = source
         self.mappings = load_instrument_map(config.instrument_map_path)
         self.feed_ids = {
-            RAW_FEED: deterministic_uuid("feed", PROVIDER_CODE, RAW_FEED),
-            ADJUSTED_FEED: deterministic_uuid(
-                "feed", PROVIDER_CODE, ADJUSTED_FEED
-            ),
+            code: deterministic_uuid("feed", PROVIDER_CODE, code)
+            for code in FEED_METADATA
         }
         if not config.dry_run:
             self._ensure_provider_metadata()
@@ -304,6 +304,7 @@ class MarketPipelineEngine:
         }
         self.catalog.upsert("market_data.providers", provider)
         for code, feed_id in self.feed_ids.items():
+            resolution, feed_version = FEED_METADATA[code]
             self.catalog.upsert(
                 "market_data.feeds",
                 {
@@ -311,13 +312,9 @@ class MarketPipelineEngine:
                     "provider_id": provider_id,
                     "code": code,
                     "data_kind": "BARS",
-                    "resolution": "30m",
+                    "resolution": resolution,
                     "timezone_name": "America/New_York",
-                    "feed_version": (
-                        "alpaca-sip-raw-v1"
-                        if code == RAW_FEED
-                        else "alpaca-sip-adjustment-all-v1"
-                    ),
+                    "feed_version": feed_version,
                     "created_at": now,
                     "retired_at": None,
                 },

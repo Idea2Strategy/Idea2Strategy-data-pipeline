@@ -266,11 +266,26 @@ class IngestTests(unittest.TestCase):
         self.engine = build_engine(Path(self.root))
 
     def test_an_event_of_another_type_is_not_ingested_as_a_bar(self) -> None:
+        """Two causes, two codes -- see `realtime_ingest.NON_BAR_EVENT_TYPES`.
+
+        A `QUOTE` sharing C's stream is ordinary traffic that this stream does not
+        turn into a row.  A `BAR_1M` on a 30-minute stream is a misrouted feed.
+        Both are reported rather than dropped, under reasons an operator can tell
+        apart.
+        """
+
         ingestor = build_ingestor(self.engine)
-        event = dict(market_events(sessions=(SESSIONS[0],))[0], eventType="QUOTE")
-        decision = ingestor.submit(event)
-        self.assertFalse(decision.accepted)
-        self.assertEqual(decision.reason, "EVENT_TYPE_NOT_INGESTED")
+        base = market_events(sessions=(SESSIONS[0],))[0]
+
+        for event_type, expected in (
+            ("QUOTE", "NON_BAR_EVENT_TYPE"),
+            ("TRADE", "NON_BAR_EVENT_TYPE"),
+            ("BAR_1M", "EVENT_TYPE_NOT_INGESTED"),
+        ):
+            with self.subTest(event_type=event_type):
+                decision = ingestor.submit(dict(base, eventType=event_type))
+                self.assertFalse(decision.accepted)
+                self.assertEqual(decision.reason, expected)
         self.assertEqual(ingestor.pending_rows, 0)
 
     def test_a_malformed_event_is_refused_loudly(self) -> None:
