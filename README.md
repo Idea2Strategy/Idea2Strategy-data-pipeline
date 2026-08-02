@@ -333,3 +333,13 @@ pipeline_run_outputs
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+LocalStack S3 통합 테스트는 고정된 컨테이너와 별도 S3 테스트 의존성을 사용합니다.
+
+```powershell
+python -m pip install -r requirements-s3-test.txt
+docker compose -f docker-compose.localstack.yml up -d --wait
+$env:LOCALSTACK_ENDPOINT_URL = "http://localhost:4566"
+python -m unittest discover -s tests -p "test_storage_adapter_localstack.py" -v
+docker compose -f docker-compose.localstack.yml down -v
+```

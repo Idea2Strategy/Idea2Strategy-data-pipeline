@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from d_storage_testkit import FakeS3Client, write_small_parquet
+from d_storage_testkit import FakeS3Client, FakeS3Error, write_small_parquet
 from market_pipeline_lib.storage import LocalObjectStore, S3ObjectStore
 
 
@@ -60,6 +60,95 @@ class StorageAdapterContractTests(unittest.TestCase):
             store.exists("hidden.parquet")
         with self.assertRaisesRegex(PermissionError, "access denied"):
             store.verify("hidden.parquet", "0" * 64)
+
+    def test_s3_retries_transient_head_failure(self) -> None:
+        class FlakyHeadClient(FakeS3Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self.remaining_failures = 0
+                self.head_calls = 0
+
+            def head_object(self, *, Bucket: str, Key: str):  # type: ignore[no-untyped-def]
+                self.head_calls += 1
+                if self.remaining_failures:
+                    self.remaining_failures -= 1
+                    raise FakeS3Error("ServiceUnavailable", 503, "try again")
+                return super().head_object(Bucket=Bucket, Key=Key)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = FlakyHeadClient()
+            store = S3ObjectStore(
+                "bucket",
+                client=client,
+                max_attempts=3,
+                retry_delay_seconds=0,
+            )
+            store.put(source, "retry/source.parquet")
+            client.remaining_failures = 2
+            client.head_calls = 0
+
+            self.assertTrue(store.exists("retry/source.parquet"))
+            self.assertEqual(client.head_calls, 3)
+
+    def test_s3_recovers_when_upload_succeeds_but_response_fails(self) -> None:
+        class StoreThenFailClient(FakeS3Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_after_first_put = True
+
+            def put_object(self, **kwargs):  # type: ignore[no-untyped-def]
+                result = super().put_object(**kwargs)
+                if self.fail_after_first_put:
+                    self.fail_after_first_put = False
+                    raise FakeS3Error("RequestTimeout", 503, "response lost")
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = StoreThenFailClient()
+            store = S3ObjectStore(
+                "bucket",
+                client=client,
+                max_attempts=3,
+                retry_delay_seconds=0,
+            )
+
+            receipt = store.put(source, "partial/source.parquet")
+
+            self.assertEqual(client.put_calls, 1)
+            verification = store.verify(
+                "partial/source.parquet",
+                receipt.content_hash,
+            )
+            self.assertTrue(verification.ok)
+            self.assertEqual(receipt.content_hash, verification.content_hash)
+
+    def test_s3_stops_after_retry_budget_without_publishing(self) -> None:
+        class AlwaysFailClient(FakeS3Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts = 0
+
+            def put_object(self, **kwargs):  # type: ignore[no-untyped-def]
+                self.attempts += 1
+                raise FakeS3Error("SlowDown", 503, "still unavailable")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = AlwaysFailClient()
+            store = S3ObjectStore(
+                "bucket",
+                client=client,
+                max_attempts=3,
+                retry_delay_seconds=0,
+            )
+
+            with self.assertRaisesRegex(FakeS3Error, "still unavailable"):
+                store.put(source, "failed/source.parquet")
+
+            self.assertEqual(client.attempts, 3)
+            self.assertEqual(client.objects, {})
 
 
 if __name__ == "__main__":
