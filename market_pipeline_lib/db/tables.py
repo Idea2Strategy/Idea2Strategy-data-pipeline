@@ -34,6 +34,28 @@ DBML / DDL agreement
 Every column name, type, nullability and default below was diffed against both sources.
 They agree exactly at column level.  The disagreements are at constraint level and are
 recorded in `SCHEMA_CONTRADICTIONS`.
+
+`char(n)` and `varchar(n)` semantics
+------------------------------------
+Column *types* agree, but two of their behaviours are not expressible in this metadata
+and are therefore not enforced by the catalog boundary.  Verified against the applied
+DDL in a container:
+
+* `char(n)` is **blank-padded**.  ``instruments.primary_exchange_mic = 'XNY'`` is stored
+  and read back as ``'XNY '``, and ``currency_code = 'US'`` as ``'US '``, while
+  `LocalCatalog` returns exactly the string it was handed.  The same write therefore
+  reads back differently from the two implementations.  Affects
+  `instruments.primary_exchange_mic`, `instruments.currency_code`,
+  `instrument_symbols.exchange_mic` and `trading_sessions.exchange_mic`.
+* An over-length value raises `StringDataRightTruncation` on PostgreSQL and is stored
+  intact by `LocalCatalog`.
+
+`db.codec` does not check either, so the widths are enforced in the writers:
+`market_pipeline_lib.reference` refuses both for the four `char` columns above and for
+`instrument_symbols.symbol`, `instruments.provider_reference`,
+`trading_sessions.session_type` and `trading_sessions.calendar_version`.  Moving the
+check into `codec.to_canonical` would cover every table at once and belongs with the
+catalog boundary rather than with one card; it is raised as a separate issue.
 """
 
 from __future__ import annotations

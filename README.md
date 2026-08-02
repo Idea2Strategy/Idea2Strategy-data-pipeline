@@ -287,6 +287,36 @@ pipeline-run-outputs.local.jsonl  # DBML 보완 전 로컬 provenance
 summary.json
 ```
 
+## 종목·심볼이력·세션 카탈로그 등록 (D04)
+
+`market_data.instruments`·`instrument_symbols`·`trading_sessions`는 instrument
+map과 XNYS 캘린더에서 등록합니다. `quality_incidents.instrument_id`는
+`instruments`를 가리키는 FK이므로, 이 등록 전에는 종목 단위 인시던트를 기록할
+수 없습니다.
+
+instrument map은 수집 경로가 쓰는 `provider_symbol,instrument_id` 외에
+`asset_type`, `primary_exchange_mic`, `symbol_effective_from`이 필요하며
+(`examples/instrument_map.example.csv` 참고) 하나라도 없으면 해당 행을
+이름과 함께 거부합니다. 기본값을 추측하지 않습니다.
+
+```powershell
+# 기본은 dry-run: 파싱·검증만 하고 아무것도 쓰지 않습니다.
+python market_pipeline.py register-reference-data `
+  --instrument-map .\examples\instrument_map.example.csv `
+  --local-root .\market_data_store `
+  --calendar-start 2024-01-01 --calendar-end 2024-12-31
+
+# 로컬 카탈로그에 기록
+python market_pipeline.py register-reference-data ... --execute
+
+# PostgreSQL에 직접 기록 (DATABASE_URL 필요, storage 스키마는 read-only)
+python market_pipeline.py register-reference-data ... --target postgres --execute
+```
+
+`calendar_version`은 경계를 생성한 라이브러리 릴리스를 이름에 담습니다
+(`XNYS/mcal-5.4.0`). 다른 릴리스가 설치되어 있으면 `CalendarSourceDrift`로
+거부합니다. 재계산된 캘린더는 새 버전이며 기존 행을 덮어쓰지 않습니다.
+
 DBML 계약 검증 및 별도 export:
 
 ```powershell

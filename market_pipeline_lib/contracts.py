@@ -137,11 +137,24 @@ def bar_schema(derived: bool = False) -> pa.Schema:
 
 @dataclass(frozen=True)
 class InstrumentMapping:
+    """One row of the operator's instrument map.
+
+    Everything after `instrument_id` is optional *here* because the collection path
+    only needs the symbol and the id.  The reference-data registration path
+    (`market_pipeline_lib.reference`) needs the full canonical identity and refuses
+    a mapping that omits it -- the columns are carried verbatim as text so this
+    module stays a plain reader and every validation lives in one place.
+    """
+
     provider_symbol: str
     instrument_id: str
     provider_reference: str | None = None
     asset_type: str | None = None
     primary_exchange_mic: str | None = None
+    currency_code: str | None = None
+    listed_at: str | None = None
+    delisted_at: str | None = None
+    symbol_effective_from: str | None = None
 
 
 def canonical_provider_symbol(value: str) -> str:
@@ -183,6 +196,10 @@ def load_instrument_map(path: Path) -> dict[str, InstrumentMapping]:
                 provider_reference=(row.get("provider_reference") or None),
                 asset_type=(row.get("asset_type") or None),
                 primary_exchange_mic=(row.get("primary_exchange_mic") or None),
+                currency_code=(row.get("currency_code") or None),
+                listed_at=(row.get("listed_at") or None),
+                delisted_at=(row.get("delisted_at") or None),
+                symbol_effective_from=(row.get("symbol_effective_from") or None),
             )
     return mappings
 
