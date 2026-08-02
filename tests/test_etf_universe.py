@@ -8,6 +8,13 @@ from data_collection.etf_universe import (
     load_etf_symbols,
 )
 
+# The curated-universe CSV header, kept on its own so the fixtures below stay
+# inside the 120-column lint limit.
+CSV_HEADER = (
+    "ticker,name,asset_class,category,benchmark,issuer,structure,"
+    "inception_date,leveraged,inverse,enabled,reviewed_at,source_url"
+)
+
 
 class EtfUniverseTests(unittest.TestCase):
     def test_curated_universe_contains_expected_27_etps(self):
@@ -36,7 +43,7 @@ class EtfUniverseTests(unittest.TestCase):
         )
 
     def test_loader_accepts_explicit_alternative_etp_structures(self):
-        content = """ticker,name,asset_class,category,benchmark,issuer,structure,inception_date,leveraged,inverse,enabled,reviewed_at,source_url
+        content = CSV_HEADER + """
 GLD,Gold Trust,alternative_etp,gold,Gold,Issuer,grantor_trust,2004-11-18,false,false,true,2026-07-22,https://example.com/gld
 USO,Oil Pool,alternative_etp,oil,Oil,Issuer,commodity_pool,2006-04-10,false,false,true,2026-07-22,https://example.com/uso
 """
@@ -52,7 +59,7 @@ USO,Oil Pool,alternative_etp,oil,Oil,Issuer,commodity_pool,2006-04-10,false,fals
         self.assertEqual(symbols, ["GLD", "USO"])
 
     def test_loader_excludes_disabled_complex_and_recent_products(self):
-        content = """ticker,name,asset_class,category,benchmark,issuer,structure,inception_date,leveraged,inverse,enabled,reviewed_at,source_url
+        content = CSV_HEADER + """
 SPY,Market ETF,equity,market,Index,Issuer,uit,1993-01-22,false,false,true,2026-07-22,https://example.com/spy
 TQQQ,Leveraged ETF,equity,leveraged,Index,Issuer,open_end,2010-02-09,true,false,true,2026-07-22,https://example.com/tqqq
 SH,Inverse ETF,equity,inverse,Index,Issuer,open_end,2006-06-19,false,true,true,2026-07-22,https://example.com/sh
@@ -71,7 +78,7 @@ OFF,Disabled ETF,equity,disabled,Index,Issuer,open_end,2000-01-01,false,false,fa
         self.assertEqual(symbols, ["SPY"])
 
     def test_loader_rejects_etn_structure(self):
-        content = """ticker,name,asset_class,category,benchmark,issuer,structure,inception_date,leveraged,inverse,enabled,reviewed_at,source_url
+        content = CSV_HEADER + """
 VXX,Volatility Note,alternative,volatility,Index,Issuer,etn,2009-01-30,false,false,true,2026-07-22,https://example.com/vxx
 """
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -85,7 +92,7 @@ VXX,Volatility Note,alternative,volatility,Index,Issuer,etn,2009-01-30,false,fal
                 )
 
     def test_loader_rejects_duplicate_tickers(self):
-        content = """ticker,name,asset_class,category,benchmark,issuer,structure,inception_date,leveraged,inverse,enabled,reviewed_at,source_url
+        content = CSV_HEADER + """
 VXX,Volatility ETF,alternative,volatility,Index,Issuer,open_end,2009-01-30,false,false,true,2026-07-22,https://example.com/vxx
 VXX,Duplicate Note,alternative,volatility,Index,Issuer,etn,2009-01-30,false,false,true,2026-07-22,https://example.com/vxx
 """

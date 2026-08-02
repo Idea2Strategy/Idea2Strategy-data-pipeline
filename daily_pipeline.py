@@ -33,7 +33,10 @@ from data_collection.collect_sip_long_term import (
     update_symbol_data,
 )
 from data_collection.etf_universe import load_etf_symbols
-from data_collection.get_ticker import get_historical_sp500_tickers
+from data_collection.get_ticker import (
+    get_historical_sp500_tickers,
+    SP500UniverseError,
+)
 from data_filtering.filter_regular_session import DEFAULT_CALENDAR, load_market_data
 from data_filtering.resample_sip_5min import BAR_INTERVALS
 from data_validation.audit_regular_session import (
@@ -164,21 +167,33 @@ def load_pipeline_symbols(
     minimum_count: int = MIN_EXPECTED_TICKERS,
     additional_symbols: list[str] | None = None,
 ) -> list[str]:
-    """Build the current and trailing ten-year S&P membership universe."""
-    fetched = get_historical_sp500_tickers(years=TICKER_LOOKBACK_YEARS)
-    if len(fetched) >= minimum_count:
+    """Build the current and trailing ten-year S&P membership universe.
+
+    A fetch that fails or returns a suspiciously small universe never
+    overwrites the ticker file; the previously persisted list is reused, and
+    the run only stops when there is no usable list at all.
+    """
+    fetched: list[str] = []
+    reason = ""
+    try:
+        fetched = get_historical_sp500_tickers(years=TICKER_LOOKBACK_YEARS)
+    except SP500UniverseError as exc:
+        reason = str(exc)
+    else:
+        if len(fetched) < minimum_count:
+            reason = f"티커 갱신 결과가 {len(fetched)}개뿐입니다 (최소 {minimum_count}개)"
+
+    if not reason:
         sp500_symbols = sorted(set(fetched))
         save_ticker_file(sp500_symbols, file_path)
     else:
         cached = read_ticker_file(file_path)
         if len(cached) < minimum_count:
             raise RuntimeError(
-                "S&P 500 티커 목록을 정상적으로 가져오지 못했고 사용할 기존 목록도 없습니다."
+                f"S&P 500 티커 목록을 정상적으로 가져오지 못했고({reason}) "
+                "사용할 기존 목록도 없습니다."
             )
-        print(
-            f"[경고] 티커 갱신 결과가 {len(fetched)}개뿐이어서 "
-            f"기존 {len(cached)}개 목록을 사용합니다."
-        )
+        print(f"[경고] {reason}. 기존 {len(cached)}개 목록을 사용합니다.")
         sp500_symbols = cached
     extras = {
         symbol.strip().upper()

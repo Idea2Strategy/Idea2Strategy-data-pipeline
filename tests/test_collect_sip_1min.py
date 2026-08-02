@@ -10,15 +10,24 @@ from alpaca.trading.enums import AssetStatus
 from data_collection.collect_sip_1min import (
     alpaca_symbol,
     collection_window,
+    CollectionResult,
     earliest_changed_timestamp,
     fetch_chunk,
     InactiveSymbolCache,
     merge_frames,
+    MIN_EXPECTED_TICKERS,
+    process_symbol,
+    resolve_symbol_universe,
     save_local_data,
     should_skip_inactive_symbol,
     storage_path,
     update_symbol_data,
 )
+from data_collection.get_ticker import (
+    get_historical_sp500_tickers,
+    SP500UniverseError,
+)
+from daily_pipeline import run_collection
 
 
 class CollectSipOneMinuteTests(unittest.TestCase):
@@ -287,7 +296,176 @@ class CollectSipOneMinuteTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(result.inactive)
         self.assertEqual(result.added_rows, 0)
+        self.assertEqual(result.outcome, "INACTIVE")
         mock_fetch.assert_not_called()
+
+
+class EmptyCollectionOutcomeTests(unittest.TestCase):
+    """A symbol that yields zero bars must not be reported as a success."""
+
+    def test_update_with_zero_rows_is_not_success_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            path = storage_path("ZZZZ", "adjusted", "csv", root)
+            with patch(
+                "data_collection.collect_sip_1min.fetch_range",
+                return_value=[],
+            ):
+                result = update_symbol_data(
+                    Mock(),
+                    "ZZZZ",
+                    "adjusted",
+                    "csv",
+                    root,
+                    datetime(2025, 1, 1, tzinfo=timezone.utc),
+                    datetime(2025, 1, 2, tzinfo=timezone.utc),
+                    7,
+                    0,
+                )
+
+            self.assertFalse(path.exists())
+
+        self.assertFalse(result.success)
+        self.assertFalse(bool(result))
+        self.assertTrue(result.empty)
+        self.assertEqual(result.outcome, "EMPTY")
+        self.assertEqual(result.added_rows, 0)
+
+    def test_empty_outcome_is_distinct_from_a_fetch_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with patch(
+                "data_collection.collect_sip_1min.fetch_range",
+                return_value=None,
+            ):
+                failure = update_symbol_data(
+                    Mock(),
+                    "ZZZZ",
+                    "adjusted",
+                    "csv",
+                    root,
+                    datetime(2025, 1, 1, tzinfo=timezone.utc),
+                    datetime(2025, 1, 2, tzinfo=timezone.utc),
+                    7,
+                    0,
+                )
+
+        self.assertFalse(failure.success)
+        self.assertFalse(failure.empty)
+        self.assertEqual(failure.outcome, "FAILED")
+
+    def test_collection_result_cannot_be_both_empty_and_successful(self):
+        with self.assertRaises(ValueError):
+            CollectionResult(True, empty=True)
+
+    def test_process_symbol_with_zero_rows_is_not_success(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            path = storage_path("ZZZZ", "adjusted", "csv", root)
+            with patch(
+                "data_collection.collect_sip_1min.fetch_range",
+                return_value=[],
+            ):
+                succeeded = process_symbol(
+                    Mock(),
+                    "ZZZZ",
+                    "adjusted",
+                    "csv",
+                    root,
+                    datetime(2025, 1, 1, tzinfo=timezone.utc),
+                    datetime(2025, 1, 2, tzinfo=timezone.utc),
+                    7,
+                    0,
+                )
+
+            self.assertFalse(path.exists())
+
+        self.assertFalse(succeeded)
+
+    def test_empty_result_is_not_checkpointed_as_complete(self):
+        state = Mock()
+        with patch(
+            "daily_pipeline.update_symbol_data",
+            return_value=CollectionResult(False, empty=True),
+        ), patch("daily_pipeline._checkpoint_complete", return_value=False):
+            failures, added_rows = run_collection(
+                Mock(),
+                ["ZZZZ"],
+                "csv",
+                datetime(2025, 1, 1, tzinfo=timezone.utc),
+                datetime(2025, 1, 2, tzinfo=timezone.utc),
+                state,
+                "2025-01-02T21:00:00+00:00",
+                None,
+                "adjusted",
+                Mock(),
+                Mock(),
+                retry_delay=0,
+            )
+
+        self.assertEqual(added_rows, 0)
+        self.assertEqual(len(failures), 1)
+        recorded_statuses = {call.args[3] for call in state.mark_stage.call_args_list}
+        self.assertEqual(recorded_statuses, {"failed"})
+        self.assertNotIn("success", recorded_statuses)
+
+
+class TickerUniverseFailureTests(unittest.TestCase):
+    """A failed universe fetch must never silently shrink the ticker file."""
+
+    def test_fetch_failure_raises_typed_error(self):
+        with patch(
+            "data_collection.get_ticker.urllib.request.urlopen",
+            side_effect=OSError("wikipedia unreachable"),
+        ):
+            with self.assertRaises(SP500UniverseError):
+                get_historical_sp500_tickers(years=10)
+
+    def test_fetch_failure_does_not_write_the_ticker_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ticker_file = Path(temporary_directory) / "sp500_tickers_10years.txt"
+            with patch(
+                "data_collection.collect_sip_1min.get_historical_sp500_tickers",
+                side_effect=SP500UniverseError("wikipedia unreachable"),
+            ), patch(
+                "data_collection.collect_sip_1min.TICKER_FILE",
+                ticker_file,
+            ):
+                with self.assertRaises(SP500UniverseError):
+                    resolve_symbol_universe(None, ticker_file=ticker_file)
+
+            self.assertFalse(ticker_file.exists())
+
+    def test_suspiciously_small_universe_is_rejected_and_not_written(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ticker_file = Path(temporary_directory) / "sp500_tickers_10years.txt"
+            ticker_file.write_text("AAA\nBBB\nCCC\n", encoding="utf-8")
+            with patch(
+                "data_collection.collect_sip_1min.get_historical_sp500_tickers",
+                return_value=["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA"],
+            ):
+                with self.assertRaises(SP500UniverseError):
+                    resolve_symbol_universe(None, ticker_file=ticker_file)
+
+            self.assertEqual(
+                ticker_file.read_text(encoding="utf-8"), "AAA\nBBB\nCCC\n"
+            )
+
+    def test_full_universe_is_written(self):
+        universe = [f"SYM{index:03d}" for index in range(MIN_EXPECTED_TICKERS)]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ticker_file = Path(temporary_directory) / "sp500_tickers_10years.txt"
+            with patch(
+                "data_collection.collect_sip_1min.get_historical_sp500_tickers",
+                return_value=universe,
+            ):
+                symbols = resolve_symbol_universe(None, ticker_file=ticker_file)
+
+            self.assertEqual(symbols, universe)
+            self.assertEqual(
+                ticker_file.read_text(encoding="utf-8").split(),
+                universe,
+            )
 
 
 if __name__ == "__main__":
