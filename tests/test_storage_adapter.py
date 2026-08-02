@@ -75,7 +75,20 @@ class LocalObjectStoreTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, "저장소 루트"):
                     store.path_for(key)
 
-    def test_drive_absolute_key_cannot_redirect_the_write(self) -> None:
+    def test_an_absolute_key_cannot_redirect_the_write_outside_the_root(self) -> None:
+        """An absolute or drive-qualified key must never resolve outside the root.
+
+        The two platforms uphold that guarantee by different mechanisms. On
+        Windows a drive-qualified key makes ``root / key`` discard the root, so
+        containment fails and the key is rejected. On POSIX ``lstrip("/")``
+        strips the leading separator first, so the key is neutralised into a
+        relative one and is contained rather than refused.
+
+        Asserting ValueError pinned only the Windows mechanism, so this test
+        passed on a Windows developer machine and failed on the Linux runner
+        that actually deploys this code. Assert the invariant instead: either
+        the key is refused, or it lands inside the root - never elsewhere.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "objects"
             store = LocalObjectStore(root)
@@ -83,8 +96,19 @@ class LocalObjectStoreTests(unittest.TestCase):
             other.mkdir()
             escaping = f"{other.drive}{other.as_posix()[len(other.drive):]}/pwned.parquet"
 
-            with self.assertRaisesRegex(ValueError, "저장소 루트"):
-                store.path_for(escaping)
+            try:
+                resolved = store.path_for(escaping)
+            except ValueError as exc:
+                self.assertIn("저장소 루트", str(exc))
+            else:
+                # `long_path` may return the Windows extended-length form.
+                plain = Path(str(resolved).replace("\\\\?\\", "")).resolve()
+                self.assertTrue(
+                    plain.is_relative_to(root.resolve()),
+                    f"absolute key escaped the store root: {plain}",
+                )
+
+            self.assertFalse((other / "pwned.parquet").exists())
 
     def test_every_entry_point_enforces_the_traversal_guard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

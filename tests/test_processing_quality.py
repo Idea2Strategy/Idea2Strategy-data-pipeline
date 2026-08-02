@@ -117,7 +117,7 @@ def full_session(instrument_id: str, day: str, **overrides: object) -> list[dict
 
 
 def codes(findings: list[object]) -> list[str]:
-    return [getattr(item, "code") for item in findings]
+    return [item.code for item in findings]
 
 
 def only(findings: list, code: str) -> list:
