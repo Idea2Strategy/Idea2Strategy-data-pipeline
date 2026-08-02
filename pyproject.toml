@@ -187,6 +187,10 @@ files = [
   "apps",
   "lambdas",
   "db/migration-contributions/validate_contribution.py",
+  # D04. The rest of `market_pipeline_lib` is still under the legacy override
+  # below; this package is type-clean from the start and is checked as such so
+  # the exemption list keeps shrinking rather than growing with each new module.
+  "market_pipeline_lib/reference",
 ]
 strict = true
 warn_unreachable = true

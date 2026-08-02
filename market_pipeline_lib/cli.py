@@ -15,14 +15,20 @@ import pandas as pd
 import pandas_market_calendars as mcal
 from dotenv import load_dotenv
 
-from .catalog import LocalCatalog
-from .contracts import DATASET_CONTRACTS, ET
+from .catalog import LocalCatalog, PostgresCatalog, StorageObjectsPolicy
+from .contracts import DATASET_CONTRACTS, ET, load_instrument_map
 from .engine import AlpacaBarSource, MarketPipelineEngine, PipelineConfig
 from .operations import (
     benchmark_catalog,
     export_db_plan,
     upload_catalog_objects,
     validate_catalog,
+)
+from .reference import (
+    instrument_registration,
+    load_reference_data,
+    symbol_assignment,
+    xnys_sessions,
 )
 from .storage import LocalObjectStore, S3ObjectStore
 
@@ -170,6 +176,21 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--endpoint-url")
     upload.add_argument("--execute", action="store_true")
     upload.add_argument("--resume", action="store_true")
+    reference = subparsers.add_parser(
+        "register-reference-data",
+        help="instrument map과 XNYS 캘린더를 종목·심볼이력·세션 테이블에 등록",
+    )
+    reference.add_argument("--instrument-map", type=Path, required=True)
+    reference.add_argument("--local-root", type=Path, required=True)
+    reference.add_argument(
+        "--target",
+        choices=("local", "postgres"),
+        default="local",
+        help="postgres는 DATABASE_URL이 필요합니다.",
+    )
+    reference.add_argument("--calendar-start")
+    reference.add_argument("--calendar-end")
+    reference.add_argument("--execute", action="store_true")
     cleanup = subparsers.add_parser(
         "cleanup-staging",
         help="성공 완료된 실행 staging만 명시적으로 정리",
@@ -269,7 +290,74 @@ def _completed_sessions(
     ]
 
 
+def _register_reference_data(args: argparse.Namespace) -> dict[str, Any]:
+    """D04: load the instrument map and the XNYS calendar into the catalog.
+
+    Without ``--execute`` nothing is written: the map is parsed and validated and
+    the counts are reported, so a malformed row is found before any row lands.
+    """
+
+    mappings = load_instrument_map(args.instrument_map.expanduser().resolve())
+    calendar_start = date.fromisoformat(args.calendar_start) if args.calendar_start else None
+    calendar_end = date.fromisoformat(args.calendar_end) if args.calendar_end else None
+    if (calendar_start is None) != (calendar_end is None):
+        raise ValueError("--calendar-start와 --calendar-end는 함께 지정해야 합니다.")
+    # Validated whether or not anything is written, so a dry run is a real check.
+    registrations = [instrument_registration(mapping) for mapping in mappings.values()]
+    assignments = [symbol_assignment(mapping) for mapping in mappings.values()]
+    session_count = (
+        len(xnys_sessions(calendar_start, calendar_end))
+        if calendar_start is not None and calendar_end is not None
+        else 0
+    )
+    if not args.execute:
+        return {
+            "status": "DRY_RUN",
+            "target": args.target,
+            "instrument_count": len(registrations),
+            "symbol_count": len(assignments),
+            "trading_session_count": session_count,
+        }
+    local_root = args.local_root.expanduser().resolve()
+    if args.target == "local":
+        catalog: Any = LocalCatalog(local_root / "catalog-export")
+        return {
+            **load_reference_data(
+                catalog,
+                mappings,
+                calendar_start=calendar_start,
+                calendar_end=calendar_end,
+            ),
+            "target": "local",
+        }
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("--target postgres에는 DATABASE_URL이 필요합니다.")
+    target = PostgresCatalog.connect(
+        database_url,
+        artifact_root=local_root / "catalog-export",
+        # Reference data never touches `storage.objects`; taking the read-only side
+        # of the ownership contradiction keeps this command unable to write it.
+        storage_objects=StorageObjectsPolicy.READ_ONLY,
+    )
+    try:
+        target.verify_schema()
+        return {
+            **load_reference_data(
+                target,
+                mappings,
+                calendar_start=calendar_start,
+                calendar_end=calendar_end,
+            ),
+            "target": "postgres",
+        }
+    finally:
+        target.close()
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "register-reference-data":
+        return _register_reference_data(args)
     if args.command in {
         "benchmark",
         "validate",
