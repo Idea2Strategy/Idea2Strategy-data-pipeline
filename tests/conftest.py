@@ -110,7 +110,24 @@ def superproject_root() -> Path | None:
 
 
 def _is_superproject(candidate: Path) -> bool:
-    return (candidate / "db" / "schema.dbml").is_file() and (candidate / _CENTRAL_MIGRATION_RELATIVE).is_dir()
+    """Whether `candidate` looks like the superproject checkout.
+
+    Probing has to tolerate a directory we are not allowed to stat. The sibling
+    scan above walks ancestors up to and including `/home`, and a CI runner has
+    unreadable home directories beside our own - GitHub's Ubuntu image ships
+    `/home/packer`, which raised PermissionError here and errored every
+    database test in the suite. `parent.iterdir()` was guarded; this call was
+    not, so the failure escaped through the inner loop.
+    """
+
+    try:
+        return (
+            (candidate / "db" / "schema.dbml").is_file()
+            and (candidate / _CENTRAL_MIGRATION_RELATIVE).is_dir()
+        )
+    except OSError:
+        # Unreadable or otherwise unstattable: not our superproject.
+        return False
 
 
 def recorded_digests() -> dict[str, str]:

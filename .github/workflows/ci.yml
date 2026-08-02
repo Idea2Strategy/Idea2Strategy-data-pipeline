@@ -384,13 +384,25 @@ jobs:
           suites = root.findall("testsuite") or [root]
           total = sum(int(s.get("tests", 0)) for s in suites)
           skipped = sum(int(s.get("skipped", 0)) for s in suites)
-          print(f"integration tests: {total}, skipped: {skipped}")
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          print(
+              f"integration tests: {total}, skipped: {skipped}, "
+              f"failures: {failures}, errors: {errors}"
+          )
           if total == 0:
               sys.exit("gate8: no integration test executed")
+          # Report failures and errors too. An earlier version printed only the
+          # skip count, so a run with 17 skips and 65 collection errors reported
+          # the skips and said nothing about the errors.
+          if errors:
+              sys.exit(f"gate8: {errors} integration test(s) errored")
+          if failures:
+              sys.exit(f"gate8: {failures} integration test(s) failed")
           if skipped:
               sys.exit(
-                  f"gate8: {skipped} integration test(s) skipped - Docker or the "
-                  "central migration bundle was unavailable, so the DB gate proved nothing"
+                  f"gate8: {skipped} integration test(s) skipped - Docker, LocalStack or "
+                  "the central migration bundle was unavailable, so the DB gate proved nothing"
               )
           PY
 
