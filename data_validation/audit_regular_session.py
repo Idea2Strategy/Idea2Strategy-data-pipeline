@@ -20,6 +20,11 @@ from data_filtering.filter_regular_session import (
     choose_storage_format,
     load_market_data,
 )
+from market_pipeline_lib.quality import (
+    count_missing_bar_intervals,
+    expected_session_bar_starts,
+    missing_bar_intervals,
+)
 
 
 BAR_FREQUENCY = pd.Timedelta(minutes=5)
@@ -41,36 +46,17 @@ def expected_regular_timestamps(
     calendar_name: str = DEFAULT_CALENDAR,
     bar_frequency: pd.Timedelta = BAR_FREQUENCY,
 ) -> pd.DatetimeIndex:
-    """Return expected bar starts within the observed boundaries."""
-    calendar = mcal.get_calendar(calendar_name)
-    first_timestamp = pd.Timestamp(first_timestamp).tz_convert("UTC")
-    last_timestamp = pd.Timestamp(last_timestamp).tz_convert("UTC")
-    local_dates = pd.DatetimeIndex([first_timestamp, last_timestamp]).tz_convert(
-        calendar.tz
-    )
-    schedule = calendar.schedule(
-        start_date=local_dates.min().date(),
-        end_date=local_dates.max().date(),
-        tz="UTC",
-    )
+    """Return expected bar starts within the observed boundaries.
 
-    expected_values = [
-        timestamp
-        for market_open, market_close in schedule[
-            ["market_open", "market_close"]
-        ].itertuples(index=False, name=None)
-        for timestamp in pd.date_range(
-            market_open,
-            market_close,
-            freq=bar_frequency,
-            inclusive="left",
-        )
-    ]
-    if not expected_values:
-        return pd.DatetimeIndex([], tz="UTC")
-
-    expected = pd.DatetimeIndex(expected_values)
-    return expected[(expected >= first_timestamp) & (expected <= last_timestamp)]
+    Thin adapter: the logic now lives in ``market_pipeline_lib.quality`` so the
+    pipeline's own missing-bar check and this CSV audit cannot drift apart.
+    """
+    return expected_session_bar_starts(
+        first_timestamp,
+        last_timestamp,
+        bar_frequency=bar_frequency,
+        calendar_name=calendar_name,
+    )
 
 
 def build_missing_intervals(
@@ -81,58 +67,39 @@ def build_missing_intervals(
     calendar_name: str,
     bar_frequency: pd.Timedelta = BAR_FREQUENCY,
 ) -> list[dict[str, object]]:
-    """Group adjacent missing timestamps without joining separate sessions."""
-    if missing.empty:
-        return []
+    """Group adjacent missing timestamps without joining separate sessions.
 
-    calendar = mcal.get_calendar(calendar_name)
-    missing_local_dates = missing.tz_convert(calendar.tz).normalize()
-    intervals: list[tuple[int, int]] = []
-    interval_start = 0
-
-    for position in range(1, len(missing)):
-        same_session = missing_local_dates[position] == missing_local_dates[position - 1]
-        consecutive = missing[position] - missing[position - 1] == bar_frequency
-        if not (same_session and consecutive):
-            intervals.append((interval_start, position - 1))
-            interval_start = position
-    intervals.append((interval_start, len(missing) - 1))
-
-    expected_set = set(expected)
-    observed_set = set(observed)
-    rows: list[dict[str, object]] = []
-    for start_position, end_position in intervals:
-        missing_start = missing[start_position]
-        missing_end = missing[end_position]
-        previous_timestamp = missing_start - bar_frequency
-        next_timestamp = missing_end + bar_frequency
-        missing_bars = end_position - start_position + 1
-        missing_minutes = int(
-            missing_bars * bar_frequency / pd.Timedelta(minutes=1)
+    Thin adapter over ``market_pipeline_lib.quality.missing_bar_intervals``;
+    only the CSV row shape is built here.
+    """
+    minutes_per_bar = bar_frequency / pd.Timedelta(minutes=1)
+    return [
+        {
+            "symbol": symbol,
+            "session_date": interval.session_date.isoformat(),
+            "missing_start_utc": interval.start.isoformat(),
+            "missing_end_utc": interval.last_start.isoformat(),
+            "missing_bars": interval.bar_count,
+            "missing_minutes": int(interval.bar_count * minutes_per_bar),
+            "previous_bar_utc": (
+                interval.previous_observed.isoformat()
+                if interval.previous_observed is not None
+                else ""
+            ),
+            "next_bar_utc": (
+                interval.next_observed.isoformat()
+                if interval.next_observed is not None
+                else ""
+            ),
+        }
+        for interval in missing_bar_intervals(
+            missing,
+            expected,
+            observed,
+            bar_frequency=bar_frequency,
+            calendar_name=calendar_name,
         )
-
-        rows.append(
-            {
-                "symbol": symbol,
-                "session_date": missing_start.tz_convert(calendar.tz).date().isoformat(),
-                "missing_start_utc": missing_start.isoformat(),
-                "missing_end_utc": missing_end.isoformat(),
-                "missing_bars": missing_bars,
-                "missing_minutes": missing_minutes,
-                "previous_bar_utc": (
-                    previous_timestamp.isoformat()
-                    if previous_timestamp in expected_set
-                    and previous_timestamp in observed_set
-                    else ""
-                ),
-                "next_bar_utc": (
-                    next_timestamp.isoformat()
-                    if next_timestamp in expected_set and next_timestamp in observed_set
-                    else ""
-                ),
-            }
-        )
-    return rows
+    ]
 
 
 def count_missing_intervals(
@@ -141,15 +108,11 @@ def count_missing_intervals(
     bar_frequency: pd.Timedelta,
 ) -> int:
     """Count contiguous gaps without materializing the detailed report rows."""
-    if missing.empty:
-        return 0
-
-    calendar = mcal.get_calendar(calendar_name)
-    local_dates = missing.tz_convert(calendar.tz).normalize()
-    breaks = (local_dates[1:] != local_dates[:-1]) | (
-        missing[1:] - missing[:-1] != bar_frequency
+    return count_missing_bar_intervals(
+        missing,
+        bar_frequency=bar_frequency,
+        calendar_name=calendar_name,
     )
-    return 1 + int(breaks.sum())
 
 
 def audit_dataframe(
@@ -374,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[오류] 지원하지 않는 캘린더입니다: {args.calendar}\n{exc}", file=sys.stderr)
         return 2
     processed_files = 0
+    failed_files = 0
     for selected_type, selected_format, source_dir in selected_sources(
         PROJECT_ROOT, data_type, storage_format, args.dataset
     ):
@@ -394,12 +358,25 @@ def main(argv: list[str] | None = None) -> int:
         save_report(summary, summary_path)
         save_report(intervals, intervals_path)
         processed_files += len(summary)
+        # `audit_source` degrades a per-file failure to an `error: ...` status
+        # row so one bad file cannot abort the whole sweep.  The report is still
+        # written, but the run did not audit what it was asked to, so it must
+        # not exit 0 -- a scheduled caller has no other signal.
+        failed_files += int((summary["status"] != "ok").sum())
         print(f"요약 보고서: {summary_path}")
         print(f"누락 구간 보고서: {intervals_path}")
 
     if processed_files == 0:
         print("[오류] 검사할 정규장 데이터 파일이 없습니다.", file=sys.stderr)
         return 1
+
+    if failed_files:
+        print(
+            f"[오류] {processed_files}개 중 {failed_files}개 파일을 검사하지 "
+            "못했습니다. 보고서의 status 열을 확인하세요.",
+            file=sys.stderr,
+        )
+        return 3
 
     print(f"완료: 총 {processed_files}개 파일 검사")
     return 0

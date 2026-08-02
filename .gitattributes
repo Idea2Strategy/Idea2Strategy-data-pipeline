@@ -1,0 +1,18 @@
+# Byte-preserving paths.
+#
+# `core.autocrlf=true` is common on Windows checkouts, which rewrites LF to CRLF
+# on the way out of the object store. For ordinary source that is harmless. For a
+# file whose *bytes* are hashed it is not: the digest recorded in git no longer
+# matches the digest computed from the working copy, and the failure surfaces as
+# a checksum mismatch that looks like corruption rather than a checkout setting.
+#
+# The superproject already carries this rule for its assembled Flyway bundle
+# ("Preserve assembler-produced CI migration bytes so manifest hashes are
+# portable"). These are the same class of file in this repository.
+
+# CI gate 8 runs `sha256sum -c` over this directory against the recorded
+# digests in central-migration.sha256, and tests/conftest.py applies these exact
+# bytes to the PostgreSQL container. Both must be byte-identical to what the
+# central assembler applied.
+db/migration-contributions/fixtures/central-migration/* -text
+db/migration-contributions/fixtures/*.sha256 -text

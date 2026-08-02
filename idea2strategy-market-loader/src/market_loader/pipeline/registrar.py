@@ -15,7 +15,6 @@ def register_manifest(
     quality_status: str,
     published: list[PublishedObject],
     source_manifest_id: UUID | None,
-    run_id: UUID,
     warning_codes: tuple[str, ...] = (),
 ) -> None:
     repository.finalize_manifest(
@@ -34,6 +33,5 @@ def register_manifest(
             for item in published
         ],
         source_manifest_id=source_manifest_id,
-        run_id=run_id,
         warning_codes=warning_codes,
     )

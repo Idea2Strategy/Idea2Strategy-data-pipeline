@@ -25,7 +25,6 @@ class MarketRepository:
             "instrument_symbols",
             "trading_sessions",
             "pipeline_runs",
-            "pipeline_partitions",
             "dataset_manifests",
             "dataset_objects",
             "dataset_lineage",
@@ -42,7 +41,7 @@ class MarketRepository:
             found = {row[0] for row in cursor.fetchall()}
         missing = required - found
         if missing:
-            raise RuntimeError(f"required Flyway schema is missing tables: {sorted(missing)}")
+            raise RuntimeError(f"market_data schema is missing tables: {sorted(missing)}")
 
     def create_run(
         self,
@@ -50,7 +49,6 @@ class MarketRepository:
         idempotency_key: str,
         processing_version: str,
         input_config: dict[str, Any],
-        partition_keys: list[str],
     ) -> tuple[UUID, bool]:
         with self.connection.cursor() as cursor:
             cursor.execute(
@@ -78,14 +76,6 @@ class MarketRepository:
                     json.dumps(input_config, separators=(",", ":")),
                 ),
             )
-            cursor.executemany(
-                """
-                INSERT INTO market_data.pipeline_partitions
-                  (id, pipeline_run_id, partition_key, status, created_at, updated_at)
-                VALUES (%s, %s, %s, 'PENDING', %s, %s)
-                """,
-                [(uuid4(), run_id, key, now, now) for key in partition_keys],
-            )
             return run_id, False
 
     def has_successful_sample_run(self) -> bool:
@@ -103,25 +93,6 @@ class MarketRepository:
                 """
             )
             return bool(cursor.fetchone()[0])
-
-    def successful_manifest_for_partitions(
-        self, run_id: UUID, partition_keys: list[str]
-    ) -> UUID | None:
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT array_agg(DISTINCT result_manifest_id), count(*)
-                FROM market_data.pipeline_partitions
-                WHERE pipeline_run_id = %s
-                  AND partition_key = ANY(%s)
-                  AND status = 'SUCCEEDED'
-                """,
-                (run_id, partition_keys),
-            )
-            row = cursor.fetchone()
-            if row is None or row[1] != len(partition_keys) or len(row[0] or []) != 1:
-                return None
-            return UUID(str(row[0][0]))
 
     def seed_instrument(self, item: UniverseInstrument) -> UUID:
         with self.connection.cursor() as cursor:
@@ -400,7 +371,6 @@ class MarketRepository:
             tuple[S3ObjectIdentity, ManifestObject, datetime | None, datetime | None, str]
         ],
         source_manifest_id: UUID | None,
-        run_id: UUID,
         warning_codes: tuple[str, ...] = (),
     ) -> None:
         with self.connection.cursor() as cursor:
@@ -440,14 +410,6 @@ class MarketRepository:
                         minimum,
                         maximum,
                     ),
-                )
-                cursor.execute(
-                    """
-                    UPDATE market_data.pipeline_partitions
-                    SET status = 'SUCCEEDED', result_manifest_id = %s, updated_at = now()
-                    WHERE pipeline_run_id = %s AND partition_key = %s
-                    """,
-                    (manifest_id, run_id, partition),
                 )
             if source_manifest_id is not None:
                 cursor.execute(
@@ -517,30 +479,27 @@ class MarketRepository:
             )
 
     def status(self, run_id: UUID | None = None) -> list[dict[str, Any]]:
+        # Per-partition counters used to come from `market_data.pipeline_partitions`,
+        # a table that does not exist in the canonical `db/schema.dbml`. Until a
+        # canonical progress source is agreed, only the run row itself is reported.
         query = """
-            SELECT pr.id, pr.status,
-                   count(pp.id) AS total,
-                   count(*) FILTER (WHERE pp.status = 'SUCCEEDED') AS succeeded,
-                   count(*) FILTER (WHERE pp.status = 'FAILED') AS failed,
-                   count(*) FILTER (WHERE pp.status = 'RUNNING') AS running
+            SELECT pr.id, pr.status, pr.requested_at, pr.completed_at, pr.summary_result
             FROM market_data.pipeline_runs pr
-            LEFT JOIN market_data.pipeline_partitions pp ON pp.pipeline_run_id = pr.id
         """
         parameters: tuple[Any, ...] = ()
         if run_id is not None:
             query += " WHERE pr.id = %s"
             parameters = (run_id,)
-        query += " GROUP BY pr.id, pr.status ORDER BY pr.requested_at DESC"
+        query += " ORDER BY pr.requested_at DESC"
         with self.connection.cursor() as cursor:
             cursor.execute(query, parameters)
             return [
                 {
                     "run_id": str(row[0]),
                     "status": row[1],
-                    "total": row[2],
-                    "succeeded": row[3],
-                    "failed": row[4],
-                    "running": row[5],
+                    "requested_at": row[2].isoformat() if row[2] is not None else None,
+                    "completed_at": row[3].isoformat() if row[3] is not None else None,
+                    "summary": dict(row[4]) if row[4] is not None else None,
                 }
                 for row in cursor.fetchall()
             ]
@@ -556,11 +515,10 @@ class MarketRepository:
                 raise RuntimeError(f"pipeline run not found: {run_id}")
             return dict(row[0])
 
-    def validation_objects(
-        self, *, run_id: UUID | None = None, manifest_id: UUID | None = None
-    ) -> list[dict[str, Any]]:
-        if (run_id is None) == (manifest_id is None):
-            raise ValueError("provide exactly one of run_id or manifest_id")
+    def validation_objects(self, *, manifest_id: UUID) -> list[dict[str, Any]]:
+        # A run -> manifest link only existed through `market_data.pipeline_partitions`,
+        # which is not part of the canonical schema, so validation is addressed by
+        # manifest id only.
         query = """
             SELECT dm.id, dm.resolution, dm.status, dm.row_count, dm.manifest_hash,
                    so.object_key, so.provider_version_id, so.content_sha256,
@@ -568,21 +526,11 @@ class MarketRepository:
             FROM market_data.dataset_manifests dm
             JOIN market_data.dataset_objects dmo ON dmo.dataset_manifest_id = dm.id
             JOIN storage.objects so ON so.id = dmo.object_id
+            WHERE dm.id = %s
+            ORDER BY dm.id, so.object_key
         """
-        parameters: tuple[Any, ...]
-        if manifest_id is not None:
-            query += " WHERE dm.id = %s"
-            parameters = (manifest_id,)
-        else:
-            query += """
-                JOIN market_data.pipeline_partitions pp
-                  ON pp.result_manifest_id = dm.id
-                WHERE pp.pipeline_run_id = %s
-            """
-            parameters = (run_id,)
-        query += " ORDER BY dm.id, so.object_key"
         with self.connection.cursor() as cursor:
-            cursor.execute(query, parameters)
+            cursor.execute(query, (manifest_id,))
             return [
                 {
                     "manifest_id": str(row[0]),

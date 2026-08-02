@@ -22,6 +22,7 @@ report/history/
 *.parquet
 *.csv
 *.txt
+!requirements.txt
 !requirements-s3-test.txt
 !ticker_info/etf_universe.csv
 !examples/*.csv
@@ -36,9 +37,25 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .conda/
 .venv/
 venv/
+
+# === 빌드 산출물 및 커버리지 리포트 제외 ===
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# === 로컬 실행 산출물 제외 ===
+# pipeline-worker 의 PIPELINE_WORKER_HEALTH_FILE 기본 위치
+.run/
 
 # === 시스템 및 에디터 파일 제외 ===
 .DS_Store

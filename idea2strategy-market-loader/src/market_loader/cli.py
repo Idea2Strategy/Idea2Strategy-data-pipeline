@@ -418,7 +418,7 @@ def resume(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path("config.yaml"),
     execute: Annotated[bool, typer.Option()] = False,
 ) -> None:
-    """Resume only incomplete partitions from an existing run."""
+    """Re-run an existing run under its original idempotency key."""
     database: Database | None = None
     try:
         if not execute:
@@ -465,27 +465,22 @@ def resume(
 
 
 def _validation_rows(
-    settings: EnvironmentSettings, run_id: UUID | None, manifest_id: UUID | None
+    settings: EnvironmentSettings, manifest_id: UUID
 ) -> list[dict[str, Any]]:
     database = _database(settings)
     try:
         with database.transaction() as connection:
-            return MarketRepository(connection).validation_objects(
-                run_id=run_id, manifest_id=manifest_id
-            )
+            return MarketRepository(connection).validation_objects(manifest_id=manifest_id)
     finally:
         database.close()
 
 
 @app.command()
-def validate(
-    run_id: Annotated[UUID | None, typer.Option()] = None,
-    manifest_id: Annotated[UUID | None, typer.Option()] = None,
-) -> None:
-    """Re-read S3 versions and Parquet footers for a run or manifest."""
+def validate(manifest_id: Annotated[UUID, typer.Option()]) -> None:
+    """Re-read S3 versions and Parquet footers for one dataset manifest."""
     try:
         settings = EnvironmentSettings()
-        rows = _validation_rows(settings, run_id, manifest_id)
+        rows = _validation_rows(settings, manifest_id)
         s3 = _aws_session(settings).client("s3")
         checked = []
         with tempfile.TemporaryDirectory(prefix="market-loader-validate-") as temporary:
@@ -515,7 +510,7 @@ def validate(
 
 @app.command()
 def reconcile(
-    run_id: UUID,
+    manifest_id: UUID,
     repair: Annotated[bool, typer.Option()] = False,
     execute: Annotated[bool, typer.Option()] = False,
 ) -> None:
@@ -524,7 +519,7 @@ def reconcile(
         if execute and not repair:
             raise RuntimeError("--execute requires --repair")
         settings = EnvironmentSettings()
-        rows = _validation_rows(settings, run_id, None)
+        rows = _validation_rows(settings, manifest_id)
         s3 = _aws_session(settings).client("s3")
         findings = []
         for row in rows:
@@ -565,7 +560,7 @@ def reconcile(
 
 @app.command()
 def status(run_id: Annotated[UUID | None, typer.Option()] = None) -> None:
-    """Show pipeline and partition status."""
+    """Show pipeline run status."""
     database: Database | None = None
     try:
         database = _database(EnvironmentSettings())

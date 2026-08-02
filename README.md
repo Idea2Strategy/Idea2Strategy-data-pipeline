@@ -8,6 +8,32 @@ Alpaca SIP의 미국 주식·ETF 30분봉을 RAW와 ADJUSTED로 보존하고, XN
 동일한 DAY 증분 엔진을 사용합니다. 기존 종목별 10년 파일 갱신은
 `--legacy-long-term`을 명시한 경우에만 실행됩니다.
 
+## 저장소 구성
+
+정본 코드는 `market_pipeline_lib/` + `market_pipeline.py` 하나입니다.
+
+| 경로 | 상태 |
+|---|---|
+| `market_pipeline_lib/`, `market_pipeline.py` | **정본** |
+| `daily_pipeline.py`, `pipeline_state.py`, `pipeline_reporting.py` | 정본을 감싸는 운영 래퍼 |
+| `data_collection/`, `data_filtering/`, `data_validation/` | legacy. 아직 참조되는 부분만 유지 |
+| `idea2strategy-market-loader/` | 별도 uv 프로젝트. **정본 아님.** Alpaca 클라이언트와 S3 어댑터를 `market_pipeline_lib`로 이관하기 위해 보존 중 |
+
+DP1에서 제거한 것:
+
+- `market_data_backfill/` + `market_data_backfill.py` — `market_pipeline_lib`를
+  공유 코드 없이 통째로 중복 구현한 약 2,600줄. `apply-db --execute`가
+  rights-version 교착으로 도달 불가였고, 이 저장소의 어떤 생산자도 쓰지 않는
+  입력 경로를 전제했으며, CLI가 결과와 무관하게 항상 `0`을 반환했습니다.
+  이 중 유일하게 정본에 없던 로직(해시 검증 resume)은
+  `market_pipeline_lib/resume_verification.py`로 살려 두었습니다.
+  아직 `engine.py`에 연결하지 않았습니다.
+- `idea2strategy-market-loader/db/` (개인 Flyway `V001` 이력, `test-init`
+  role 부트스트랩)와 `docker-compose.test.yaml` — COM07 위반. 스키마 변경은
+  중앙 `backend/db-migration` 모듈에 `db/migration-contributions/`로 기여합니다.
+- `data_collection/script.py`, `data_validation/check_data.py`,
+  `data_validation/data_report.py` — 저장소 전체에서 참조 0건.
+
 ## 데이터 계약
 
 연도마다 가격 유형을 섞지 않는 다음 8개 논리 데이터셋을 사용합니다.
@@ -181,8 +207,7 @@ python market_pipeline.py migrate `
 ```
 
 기존 종목별 파일은 staging 입력으로만 읽으며 삭제하거나 덮어쓰지 않습니다.
-`market_data_backfill.py`는 이전 구현과 출력 검토를 위한 legacy 도구이고,
-새 작업에는 `market_pipeline.py migrate`를 사용합니다.
+마이그레이션 경로는 `market_pipeline.py migrate` 하나뿐입니다.
 
 ## 객체 키
 
@@ -211,6 +236,16 @@ first_unsigned_64_bits(SHA256(canonical instrument UUID UTF-8)) % shard_count
 
 객체는 임시 파일 완성·Footer 검사·SHA-256 검사 후 원자적으로 publish됩니다.
 같은 키에 다른 바이트가 있으면 덮어쓰지 않고 실패합니다.
+
+정본 객체 키는 디렉터리를 열 단계 중첩하므로 사용자 프로필 아래에서는
+파일명을 붙이기 전에 이미 Windows `MAX_PATH`(260자)를 넘습니다. 키는
+정본이라 줄일 수 없으므로 다음 두 가지로 대응합니다
+(`market_pipeline_lib/fs_paths.py`).
+
+- 원자적 쓰기의 임시 파일 이름은 대상 파일명을 포함하지 않는 고정 길이
+  토큰(`.<16 hex>.tmp`, 21자)을 사용합니다.
+- 로컬 객체 저장소는 OS 호출 시 Windows 확장 길이 경로(`\\?\`)를 사용합니다.
+  경로 봉쇄(root 이탈) 검사는 확장 이전의 일반 경로에서 수행합니다.
 
 ## 검증과 benchmark
 
@@ -290,6 +325,11 @@ orphan으로 보존합니다.
 
 `--resume`은 완료된 staging fragment와 검증된 불변 객체를 재사용합니다.
 정리는 기본 실행에 포함되지 않으며 성공한 pipeline run만 대상으로 합니다.
+
+**미완료**: staging fragment 재사용은 아직 파일 존재 여부만 확인합니다.
+중간에 종료된 프로세스가 남긴 잘린 fragment를 그대로 받아들일 수 있습니다.
+해시·크기 검증 헬퍼는 `market_pipeline_lib/resume_verification.py`에
+단위 테스트와 함께 준비되어 있으나 `engine.py`에 아직 연결하지 않았습니다.
 
 ```powershell
 python market_pipeline.py cleanup-staging `

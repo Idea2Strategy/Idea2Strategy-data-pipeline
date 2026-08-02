@@ -1,7 +1,17 @@
-# 프로젝트에서 직접 사용하는 런타임 의존성
-alpaca-py==0.43.5
-lxml==6.1.1
-python-dotenv==1.0.1
-pandas==3.0.3
-pandas-market-calendars==5.4.0
-pyarrow==25.0.0
+# 런타임 의존성 — 정본은 pyproject.toml 이다.
+#
+# Runtime dependencies for the Idea2Strategy data pipeline.
+# THE SOURCE OF TRUTH IS pyproject.toml `[project].dependencies`.  This file
+# exists only for tooling that cannot read PEP 621 metadata, and it installs the
+# project itself so the two can never drift:
+#
+#     pip install -r requirements.txt        # runtime only
+#     pip install -e ".[dev]"                # runtime + lint / type / test
+#
+# Requires Python 3.12.13 (COM02).  Installed editable so the console entry
+# points (pipeline-worker, market-pipeline, daily-pipeline) are on PATH.
+#
+# Note for anyone tempted to pin here instead: psycopg and SQLAlchemy were
+# missing from this file, which is why every PostgreSQL code path was dead on a
+# default install.  Add dependencies to pyproject.toml, not here.
+-e .

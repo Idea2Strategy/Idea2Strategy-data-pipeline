@@ -15,4 +15,11 @@
 
 보고서는 `report/latest/{format}/`과 `report/history/{session}/{format}/`에 함께 저장됩니다.
 
-`quality_control.py`, `check_data.py`, `data_report.py`, `audit_regular_session.py`의 독립 CLI는 기존 데이터셋을 점검할 때 사용할 수 있도록 유지합니다.
+`quality_control.py`와 `audit_regular_session.py`의 독립 CLI는 기존 데이터셋을 점검할 때 사용할 수 있도록 유지합니다.
+
+DP1에서 삭제한 파일:
+
+- `check_data.py` — 참조하는 코드가 없었고, 읽을 수 없는 파일과 빈 파일에 대해 동일한
+  `{"rows": 0, "start": "N/A", "regular_market_pct": 0.0}` 를 돌려주어 두 상황을 구분할 수 없었습니다.
+- `data_report.py` — 참조하는 코드가 없었고, "생성된" 리포트 안에 특정 종목(ABNB)을 지목하는
+  하드코딩 한국어 산문 약 30줄이 들어 있었습니다.

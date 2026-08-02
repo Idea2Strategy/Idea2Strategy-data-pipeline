@@ -4,7 +4,12 @@ services:
     ports:
       - "4566:4566"
     environment:
-      SERVICES: s3
+      # Both services, not just s3. The realtime ingest (D12/D90) and the
+      # pipeline-worker smoke tests drive SQS through the *same*
+      # LOCALSTACK_ENDPOINT_URL, so an s3-only container makes them error with
+      # "Service 'sqs' is not enabled" rather than skip - a red suite that looks
+      # like a code fault but is a compose fault.
+      SERVICES: s3,sqs
       AWS_DEFAULT_REGION: us-east-1
       EAGER_SERVICE_LOADING: "1"
     healthcheck:

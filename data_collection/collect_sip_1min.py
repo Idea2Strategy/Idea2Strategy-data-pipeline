@@ -24,7 +24,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data_collection.get_ticker import get_historical_sp500_tickers
+from data_collection.get_ticker import (
+    get_historical_sp500_tickers,
+    SP500UniverseError,
+)
 
 
 YEARS_TO_COLLECT = 3
@@ -33,6 +36,10 @@ END_DELAY_MINUTES = 15
 DEFAULT_CHUNK_DAYS = 7
 DEFAULT_REQUEST_DELAY_SECONDS = 0.35
 TICKER_FILE = PROJECT_ROOT / "ticker_info" / "sp500_tickers_10years.txt"
+# The ten-year S&P 500 membership universe is always well above 500 symbols.
+# Anything near or below this floor means the fetch degraded, and overwriting
+# the ticker file with it would destroy the real universe.
+MIN_EXPECTED_TICKERS = 400
 INACTIVE_SYMBOL_CACHE_PATH = PROJECT_ROOT / "pipeline_state" / "inactive_symbols.json"
 STALE_SYMBOL_DAYS = 30
 INACTIVE_CACHE_TTL_DAYS = 30
@@ -48,9 +55,24 @@ class CollectionResult:
     adjustment_revision: bool = False
     added_rows: int = 0
     inactive: bool = False
+    empty: bool = False
+
+    def __post_init__(self) -> None:
+        if self.empty and self.success:
+            raise ValueError(
+                "0행 결과는 성공으로 표시할 수 없습니다. "
+                "체크포인트가 해당 종목을 완료로 기록해 버립니다."
+            )
 
     def __bool__(self) -> bool:
         return self.success
+
+    @property
+    def outcome(self) -> str:
+        """Distinguish an empty collection from a real success or a failure."""
+        if self.success:
+            return "INACTIVE" if self.inactive else "SUCCESS"
+        return "EMPTY" if self.empty else "FAILED"
 
 
 class InactiveSymbolCache:
@@ -524,8 +546,10 @@ def process_symbol(
 
     combined = merge_frames(existing, new_frames, start_time, end_time)
     if combined.empty:
-        print(f"[{symbol}] 저장할 데이터가 없습니다.")
-        return True
+        print(
+            f"[{symbol}] 수집 결과가 0행입니다. 성공으로 처리하지 않습니다."
+        )
+        return False
 
     save_local_data(combined, file_path, storage_format)
     added_rows = sum(len(frame) for frame in new_frames)
@@ -624,7 +648,12 @@ def update_symbol_data(
 
     combined = merge_frames(existing, new_frames, start_time, end_time)
     if combined.empty:
-        return CollectionResult(True)
+        # Zero rows is not a success: reporting it as one lets the caller
+        # checkpoint the symbol as complete and never retry it.
+        print(
+            f"[{symbol}] 수집 결과가 0행입니다. 성공으로 처리하지 않습니다."
+        )
+        return CollectionResult(False, empty=True)
 
     save_local_data(combined, file_path, storage_format)
     added_rows = len(refreshed.index.difference(existing.index))
@@ -655,6 +684,43 @@ def update_symbol_data(
         adjustment_revision=adjustment_revision,
         added_rows=added_rows,
     )
+
+
+def resolve_symbol_universe(
+    requested: str | None,
+    *,
+    ticker_file: Path | None = None,
+    minimum_count: int = MIN_EXPECTED_TICKERS,
+) -> list[str]:
+    """Return the symbols to collect, refreshing the ticker file only when safe.
+
+    An explicit ``--symbols`` list is used as given and never written to disk.
+    Otherwise the S&P 500 universe is fetched; a fetch failure propagates as
+    ``SP500UniverseError`` and a suspiciously small result is rejected. In both
+    cases the ticker file is left untouched, so a degraded fetch can never
+    shrink the persisted universe.
+    """
+    if requested:
+        return sorted(
+            {symbol.strip().upper() for symbol in requested.split(",") if symbol.strip()}
+        )
+
+    target = TICKER_FILE if ticker_file is None else ticker_file
+    print("Wikipedia에서 최근 10년 S&P 500 관련 티커를 확인합니다...")
+    symbols = sorted(set(get_historical_sp500_tickers(years=TICKER_LOOKBACK_YEARS)))
+    if len(symbols) < minimum_count:
+        raise SP500UniverseError(
+            f"S&P 500 유니버스가 {len(symbols)}개뿐입니다 (최소 {minimum_count}개). "
+            f"{target}를 덮어쓰지 않고 중단합니다."
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        temporary.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return symbols
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -716,15 +782,11 @@ def main(argv: list[str] | None = None) -> int:
     output_root = args.output_dir.expanduser().resolve()
     start_time, end_time = collection_window()
 
-    if args.symbols:
-        symbols = sorted(
-            {symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()}
-        )
-    else:
-        print("Wikipedia에서 최근 10년 S&P 500 관련 티커를 확인합니다...")
-        symbols = get_historical_sp500_tickers(years=TICKER_LOOKBACK_YEARS)
-        TICKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TICKER_FILE.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+    try:
+        symbols = resolve_symbol_universe(args.symbols)
+    except SP500UniverseError as exc:
+        print(f"[오류] {exc}", file=sys.stderr)
+        return 1
 
     print("=" * 70)
     print("피드       : SIP")

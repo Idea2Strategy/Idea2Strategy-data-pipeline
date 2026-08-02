@@ -1,14 +1,40 @@
-"""Deterministic D90 publication of C market events for startup warm-up."""
+"""Deterministic D90 publication of C market events for startup warm-up.
+
+Two D12/D90 defects are corrected here.
+
+**No assumed resolution or field.**  This module used to reject any resolution
+but ``PT1M`` and any feature but ``close``, and to recognise only ``BAR_1M``
+events; the feature extractor read ``values["close"]`` literally.  A provider
+publishing 30-minute bars, or a strategy warming up on ``vwap``, was unbuildable.
+Now :class:`WarmupPublicationSpec` names the dataset contract, the event type and
+the partition granularity, and each :class:`FeatureRequirement` names its own
+resolution and the exact ``values`` key it reads.  None of them has a default.
+
+**Canonical object keys.**  The market-events object used to land under
+``warmup/session_date_et=…/market-events-….parquet``, which is not the key
+:func:`market_pipeline_lib.contracts.object_key` defines, so the object could
+never be found by ``MarketPipelineEngine.compact``.  It now lands under the
+canonical key, at its full nested path inside the bundle, and the bundle's own
+sidecars (the manifest and the warm-up feature document) stay namespaced under
+``warmup/`` so they are never mistaken for market-data objects.
+
+**A consumer.**  :func:`warmup_bundle_from_source` drains a
+:class:`~market_pipeline_lib.realtime_ingest.RealtimeEventSource` -- in
+production the LocalStack/SQS adapter -- and builds the bundle from what it
+received, instead of from a JSON file someone placed on disk.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -18,7 +44,18 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .contracts import canonical_dataset_hash, deterministic_uuid
+from .contracts import (
+    DatasetContract,
+    Granularity,
+    canonical_dataset_hash,
+    deterministic_uuid,
+    logical_dataset_id,
+    object_key,
+    partition_bounds,
+    stable_shard_key,
+)
+from .fs_paths import long_path
+from .realtime_ingest import PARTITION_GRANULARITIES, RealtimeEventSource
 
 
 UTC = timezone.utc
@@ -28,28 +65,68 @@ MANIFEST_SCHEMA_VERSION = 1
 BAR_OBJECT_SCHEMA_VERSION = "warmup-bars-v1"
 FEATURE_OBJECT_SCHEMA_VERSION = "feature-object-v1"
 
+_ISO_DURATION = re.compile(r"^P(?!$)(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?$")
+
 
 class RealtimeWarmupError(ValueError):
     """Raised when a daily warm-up bundle cannot be safely published."""
 
 
 @dataclass(frozen=True)
+class WarmupPublicationSpec:
+    """Which dataset, which event, which partition -- all stated, none assumed.
+
+    ``revision`` and ``shard_count`` describe how the bundle's own market-events
+    object is addressed.  A warm-up bundle carries one session for one consumer,
+    so a single shard and revision 1 are the normal case; both are here so that a
+    caller republishing a corrected bundle can say so rather than overwrite.
+    """
+
+    contract: DatasetContract
+    event_type: str
+    granularity: Granularity
+    revision: int = 1
+    shard_count: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.event_type.strip():
+            raise RealtimeWarmupError("event_type must name the event carrying a bar")
+        if self.granularity not in PARTITION_GRANULARITIES:
+            raise RealtimeWarmupError(
+                f"granularity must be one of {list(PARTITION_GRANULARITIES)}, got {self.granularity!r}"
+            )
+        if self.revision < 1:
+            raise RealtimeWarmupError("revision must be at least 1")
+        if self.shard_count < 1:
+            raise RealtimeWarmupError("shard_count must be at least 1")
+
+
+@dataclass(frozen=True)
 class FeatureRequirement:
+    """One warm-up series a consumer needs before it can start.
+
+    ``value_field`` is the key inside the event's ``values`` object that supplies
+    the observation.  It is separate from ``feature_id`` on purpose: the feature a
+    strategy names and the field a provider publishes are not the same vocabulary,
+    and collapsing them is how ``close`` became hardcoded.
+    """
+
     requirement_id: str
     feature_id: str
     feature_version: str
     resolution: str
+    value_field: str
     instruments: tuple[str, ...]
     required_observations: int
 
     def __post_init__(self) -> None:
-        for field in ("requirement_id", "feature_id", "feature_version", "resolution"):
+        for field in ("requirement_id", "feature_id", "feature_version", "resolution", "value_field"):
             if not getattr(self, field):
                 raise RealtimeWarmupError(f"{field} must not be empty")
-        if self.resolution != "PT1M":
-            raise RealtimeWarmupError("only PT1M warm-up requirements are supported")
-        if self.feature_id != "close":
-            raise RealtimeWarmupError("only the close feature is currently supported")
+        if not _ISO_DURATION.match(self.resolution):
+            raise RealtimeWarmupError(
+                f"resolution must be an ISO-8601 duration, got {self.resolution!r}"
+            )
         if not self.instruments or len(set(self.instruments)) != len(self.instruments):
             raise RealtimeWarmupError("instruments must be unique and non-empty")
         if self.required_observations < 1:
@@ -90,7 +167,9 @@ def _canonical_json(document: Mapping[str, Any]) -> bytes:
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    # Canonical keys nest ten `key=value` directories, so a bundle under a normal
+    # user profile is already past the Windows MAX_PATH limit before the file name.
+    with open(long_path(path), "rb") as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
@@ -108,7 +187,7 @@ def _decimal_text(value: object, label: str) -> str:
     return format(parsed.normalize(), "f")
 
 
-def _validated_bars(document: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _validated_bars(document: Mapping[str, Any], wanted_event_type: str) -> list[dict[str, Any]]:
     if document.get("schemaVersion") != EVENT_SCHEMA_VERSION:
         raise RealtimeWarmupError("document schema is incompatible")
     events = document.get("events")
@@ -157,9 +236,9 @@ def _validated_bars(document: Mapping[str, Any]) -> list[dict[str, Any]]:
         elif revision == previous["revision"] and event != previous:
             raise RealtimeWarmupError(f"{label} conflicts with a duplicate revision")
 
-    bars = [event for event in selected.values() if event["eventType"] == "BAR_1M"]
+    bars = [event for event in selected.values() if event["eventType"] == wanted_event_type]
     if not bars:
-        raise RealtimeWarmupError("required BAR_1M coverage is missing")
+        raise RealtimeWarmupError(f"required {wanted_event_type} coverage is missing")
     bars.sort(key=lambda event: (
         event["_occurred_at"], event["instrumentId"], event["providerEventId"], event["revision"], event["eventId"]
     ))
@@ -176,7 +255,7 @@ def _bar_table(bars: Sequence[Mapping[str, Any]]) -> pa.Table:
         required = ("open", "high", "low", "close", "volume")
         missing = [field for field in required if field not in values]
         if missing:
-            raise RealtimeWarmupError(f"BAR_1M values missing {missing[0]}")
+            raise RealtimeWarmupError(f"{event['eventType']} values missing {missing[0]}")
         prices = {field: float(_decimal_text(values[field], f"bars[{index}].{field}")) for field in required[:-1]}
         volume = values["volume"]
         if isinstance(volume, bool) or not isinstance(volume, int) or volume < 0:
@@ -219,23 +298,35 @@ def _bar_table(bars: Sequence[Mapping[str, Any]]) -> pa.Table:
     return pa.Table.from_pylist(rows, schema=schema)
 
 
-def _object_metadata(path: Path, *, object_key: str, session_date: str, row_count: int, schema_version: str, role: str) -> dict[str, Any]:
-    start = datetime.fromisoformat(session_date).replace(tzinfo=ET).astimezone(UTC)
-    end = (datetime.fromisoformat(session_date) + timedelta(days=1)).replace(tzinfo=ET).astimezone(UTC)
+def _object_metadata(
+    path: Path,
+    *,
+    key: str,
+    partition_start: date_type,
+    partition_end: date_type,
+    granularity: Granularity,
+    shard_key: str,
+    part_number: int,
+    row_count: int,
+    schema_version: str,
+    role: str,
+) -> dict[str, Any]:
+    start = datetime.combine(partition_start, datetime.min.time(), ET).astimezone(UTC)
+    end = datetime.combine(partition_end, datetime.min.time(), ET).astimezone(UTC)
     content_hash = _sha256(path)
     return {
-        "storage_object_id": deterministic_uuid("d90-object", object_key, content_hash),
-        "object_key": object_key,
+        "storage_object_id": deterministic_uuid("d90-object", key, content_hash),
+        "object_key": key,
         "content_hash": content_hash,
         "object_kind": "PARQUET" if path.suffix == ".parquet" else "JSON",
         "object_role": role,
-        "partition_granularity": "DAY",
-        "partition_start": session_date,
-        "partition_end": (datetime.fromisoformat(session_date) + timedelta(days=1)).date().isoformat(),
+        "partition_granularity": granularity,
+        "partition_start": partition_start.isoformat(),
+        "partition_end": partition_end.isoformat(),
         "period_start": start.isoformat().replace("+00:00", "Z"),
         "period_end": end.isoformat().replace("+00:00", "Z"),
-        "shard_key": "s00-of-01",
-        "part_number": 1,
+        "shard_key": shard_key,
+        "part_number": part_number,
         "row_count": row_count,
         "schema_version": schema_version,
     }
@@ -263,15 +354,16 @@ def verify_realtime_warmup_bundle(root: Path) -> dict[str, Any]:
     for index, item in enumerate(objects):
         if not isinstance(item, Mapping):
             raise RealtimeWarmupError(f"manifest object {index} is invalid")
-        object_key = _required_text(item, "object_key", f"objects[{index}]")
-        filename = Path(object_key).name
-        path = (root / filename).resolve()
+        key = _required_text(item, "object_key", f"objects[{index}]")
+        # Objects live at their full key path inside the bundle, so the canonical
+        # key is the layout rather than a label attached to a flat file name.
+        path = Path(os.path.normpath(root / key))
         try:
             path.relative_to(root)
         except ValueError as exc:
             raise RealtimeWarmupError("manifest object path escapes the bundle") from exc
-        if not path.is_file() or _sha256(path) != item.get("content_hash"):
-            raise RealtimeWarmupError(f"object hash mismatch: {object_key}")
+        if not os.path.isfile(long_path(path)) or _sha256(path) != item.get("content_hash"):
+            raise RealtimeWarmupError(f"object hash mismatch: {key}")
         if item.get("object_role") == "MARKET_EVENTS":
             source_objects.append(dict(item))
         elif item.get("object_role") == "WARMUP_FEATURES":
@@ -294,35 +386,74 @@ def verify_realtime_warmup_bundle(root: Path) -> dict[str, Any]:
 
 
 def publish_realtime_warmup_bundle(
-    document: Mapping[str, Any], output: Path, requirements: Sequence[FeatureRequirement]
+    document: Mapping[str, Any],
+    output: Path,
+    requirements: Sequence[FeatureRequirement],
+    *,
+    spec: WarmupPublicationSpec,
 ) -> RealtimeWarmupBundle:
-    """Validate, materialize, and atomically publish one ET daily bundle."""
+    """Validate, materialize, and atomically publish one ET session bundle.
+
+    The market-events object is written at its canonical key
+    (:func:`market_pipeline_lib.contracts.object_key`), so the bundle's layout is
+    the object identity rather than a flat file name with a key glued on.
+    """
+
     if not requirements:
         raise RealtimeWarmupError("at least one feature requirement is required")
     if len({item.requirement_id for item in requirements}) != len(requirements):
         raise RealtimeWarmupError("requirement_id values must be unique")
-    bars = _validated_bars(document)
+    bars = _validated_bars(document, spec.event_type)
     table = _bar_table(bars)
-    session_date = bars[0]["_occurred_at"].astimezone(ET).date().isoformat()
+    session = bars[0]["_occurred_at"].astimezone(ET).date()
+    session_date = session.isoformat()
+    partition_start, partition_end = partition_bounds(session, spec.granularity)
+
+    instruments = {event["instrumentId"] for event in bars}
+    shard_keys = {stable_shard_key(value, spec.shard_count) for value in instruments}
+    if len(shard_keys) != 1:
+        raise RealtimeWarmupError(
+            f"a warm-up bundle publishes one object, but these instruments span "
+            f"{sorted(shard_keys)}; raise shard_count or split the bundle"
+        )
+    shard_key = shard_keys.pop()
+    dataset_id = logical_dataset_id(spec.contract, partition_start.year)
+    events_key = object_key(
+        spec.contract,
+        dataset_id,
+        spec.revision,
+        spec.granularity,
+        partition_start,
+        partition_end,
+        shard_key,
+        1,
+    )
+    feature_key = f"warmup/session_date_et={session_date}/warmup-features.json"
+    manifest_name = "manifest.json"
 
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise RealtimeWarmupError("output must be absent or an empty directory")
-    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.d90-", dir=output.parent))
-    daily_name = f"market-events-{session_date}.parquet"
-    feature_name = f"warmup-features-{session_date}.json"
-    manifest_name = "manifest.json"
+    staging = Path(tempfile.mkdtemp(prefix=".d90-", dir=output.parent))
     try:
-        daily_path = staging / daily_name
+        daily_path = staging / events_key
+        os.makedirs(long_path(daily_path.parent), exist_ok=True)
         pq.write_table(
-            table, daily_path, compression="zstd", version="2.6", data_page_version="2.0",
+            table, long_path(daily_path), compression="zstd", version="2.6", data_page_version="2.0",
             use_dictionary=False, write_statistics=True,
         )
         daily = _object_metadata(
-            daily_path, object_key=f"warmup/session_date_et={session_date}/{daily_name}",
-            session_date=session_date, row_count=table.num_rows,
-            schema_version=BAR_OBJECT_SCHEMA_VERSION, role="MARKET_EVENTS",
+            daily_path,
+            key=events_key,
+            partition_start=partition_start,
+            partition_end=partition_end,
+            granularity=spec.granularity,
+            shard_key=shard_key,
+            part_number=1,
+            row_count=table.num_rows,
+            schema_version=BAR_OBJECT_SCHEMA_VERSION,
+            role="MARKET_EVENTS",
         )
         dataset_hash = canonical_dataset_hash((daily,))
         requirements_key = json.dumps([
@@ -331,13 +462,13 @@ def publish_realtime_warmup_bundle(
                 "feature_id": item.feature_id,
                 "feature_version": item.feature_version,
                 "resolution": item.resolution,
+                "value_field": item.value_field,
                 "instruments": sorted(item.instruments),
                 "required_observations": item.required_observations,
             }
             for item in sorted(requirements, key=lambda value: value.requirement_id)
         ], sort_keys=True, separators=(",", ":"))
         manifest_id = deterministic_uuid("d90-manifest", session_date, dataset_hash, requirements_key)
-        dataset_id = deterministic_uuid("d90-dataset", session_date, dataset_hash)
 
         series = []
         for requirement in sorted(requirements, key=lambda value: value.requirement_id):
@@ -345,11 +476,14 @@ def publish_realtime_warmup_bundle(
                 {
                     "instrument": event["instrumentId"],
                     "observed_at": event["_occurred_at"].isoformat().replace("+00:00", "Z"),
-                    "value": _decimal_text(event["values"]["close"], "close"),
+                    "value": _decimal_text(
+                        _required_value(event["values"], requirement.value_field, event["eventId"]),
+                        requirement.value_field,
+                    ),
                 }
                 for event in bars if event["instrumentId"] in requirement.instruments
             ]
-            counts = {instrument: 0 for instrument in requirement.instruments}
+            counts = dict.fromkeys(requirement.instruments, 0)
             for observation in observations:
                 counts[observation["instrument"]] += 1
             missing = [instrument for instrument, count in counts.items() if count < requirement.required_observations]
@@ -360,6 +494,7 @@ def publish_realtime_warmup_bundle(
                 "feature_id": requirement.feature_id,
                 "feature_version": requirement.feature_version,
                 "resolution": requirement.resolution,
+                "value_field": requirement.value_field,
                 "manifest_id": manifest_id,
                 "dataset_hash": dataset_hash,
                 "observations": observations,
@@ -372,20 +507,27 @@ def publish_realtime_warmup_bundle(
             "dataset_hash": dataset_hash,
             "series": series,
         }
-        feature_path = staging / feature_name
+        feature_path = staging / feature_key
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
         feature_path.write_bytes(_canonical_json(feature_document))
         feature = _object_metadata(
-            feature_path, object_key=f"warmup/session_date_et={session_date}/{feature_name}",
-            session_date=session_date,
+            feature_path,
+            key=feature_key,
+            partition_start=partition_start,
+            partition_end=partition_end,
+            granularity=spec.granularity,
+            shard_key=shard_key,
+            part_number=1,
             row_count=sum(len(item["observations"]) for item in series),
-            schema_version=FEATURE_OBJECT_SCHEMA_VERSION, role="WARMUP_FEATURES",
+            schema_version=FEATURE_OBJECT_SCHEMA_VERSION,
+            role="WARMUP_FEATURES",
         )
         manifest = {
             "contract_id": "d90.realtime-warmup-manifest",
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "manifest_id": manifest_id,
             "dataset_id": dataset_id,
-            "revision": 1,
+            "revision": spec.revision,
             "status": "AVAILABLE",
             "session_date_et": session_date,
             "dataset_hash": dataset_hash,
@@ -395,7 +537,7 @@ def publish_realtime_warmup_bundle(
         manifest_path = staging / manifest_name
         manifest_path.write_bytes(_canonical_json(manifest))
 
-        if pq.read_table(daily_path).num_rows != table.num_rows:
+        if pq.read_table(long_path(daily_path)).num_rows != table.num_rows:
             raise RealtimeWarmupError("published Parquet row count is invalid")
         verify_realtime_warmup_bundle(staging)
         if output.exists():
@@ -404,9 +546,65 @@ def publish_realtime_warmup_bundle(
         return RealtimeWarmupBundle(
             manifest=manifest,
             manifest_path=output / manifest_name,
-            daily_object_path=output / daily_name,
-            feature_object_path=output / feature_name,
+            daily_object_path=output / events_key,
+            feature_object_path=output / feature_key,
         )
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(long_path(staging), ignore_errors=True)
         raise
+
+
+def _required_value(values: Mapping[str, Any], field: str, event_id: str) -> object:
+    if field not in values:
+        raise RealtimeWarmupError(
+            f"event {event_id} has no values.{field}; the requirement names a field this "
+            "stream does not publish"
+        )
+    return values[field]
+
+
+def warmup_bundle_from_source(
+    source: RealtimeEventSource,
+    output: Path,
+    requirements: Sequence[FeatureRequirement],
+    *,
+    spec: WarmupPublicationSpec,
+    max_empty_cycles: int = 2,
+    wait_seconds: float = 1.0,
+    max_messages_per_poll: int = 10,
+) -> RealtimeWarmupBundle:
+    """Drain `source`, then publish the bundle the drained events describe.
+
+    This is the consumer the module never had.  A drain that yields nothing
+    raises rather than publishing an empty bundle: "no events" and "a warm-up
+    bundle containing no observations" are different facts, and a consumer that
+    started from the second would trade on nothing.
+    """
+
+    events: list[Mapping[str, Any]] = []
+    empty = 0
+    while empty < max_empty_cycles:
+        deliveries = source.poll(max_messages=max_messages_per_poll, wait_seconds=wait_seconds)
+        if not deliveries:
+            empty += 1
+            continue
+        empty = 0
+        for delivery in deliveries:
+            body = delivery.body
+            batch = body.get("events") if isinstance(body, Mapping) else None
+            if not isinstance(batch, list) or not batch:
+                raise RealtimeWarmupError(
+                    f"message {delivery.message_id} does not carry a non-empty 'events' array"
+                )
+            events.extend(batch)
+            source.acknowledge(delivery)
+    if not events:
+        raise RealtimeWarmupError(
+            "the event source yielded no events; refusing to publish an empty warm-up bundle"
+        )
+    return publish_realtime_warmup_bundle(
+        {"schemaVersion": EVENT_SCHEMA_VERSION, "events": events},
+        output,
+        requirements,
+        spec=spec,
+    )

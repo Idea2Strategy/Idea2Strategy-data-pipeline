@@ -1,5 +1,22 @@
 name: CI
 
+# COM09 quality gates for the data-pipeline repository.
+#
+# One job per gate, each named `gate<N>-...`, so a red check names the gate that
+# failed without opening the log.  No job uses `continue-on-error`: a gate that
+# cannot be fully satisfied yet is scoped down *visibly*, in a comment here and
+# with a `::warning` annotation in the run, never silenced.
+#
+#   gate1  lint                        ruff
+#   gate2  types                       mypy
+#   gate3  unit tests + coverage       pytest (data-pipeline)
+#   gate4  market-loader suite         pytest (idea2strategy-market-loader) - was never run in CI
+#   gate5  app boot smoke              pipeline-worker really starts, reports ready and drains
+#   gate6  migration contribution      COM07 contribution-root contract
+#   gate7  dependency + secret scan    pip-audit + TruffleHog
+#   gate8  DB integration              PostgreSQL 16 service   [SCOPED DOWN - see the job]
+#   gate9  object-store integration    LocalStack S3
+
 on:
   pull_request:
     branches: [develop]
@@ -13,42 +30,453 @@ concurrency:
   group: pipeline-ci-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
+env:
+  # COM02 pins the runtime to CPython 3.12.13.  Do not relax this to "3.12":
+  # the README previously said 3.11 and the drift went unnoticed for months.
+  PYTHON_VERSION: "3.12.13"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-  localstack-s3:
+jobs:
+  # ---------------------------------------------------------------- gate 1
+  gate1-lint:
+    name: gate1-lint (ruff)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Install S3 integration dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements-s3-test.txt
-      - name: Start LocalStack S3
+      - name: Install lint tooling
+        # Same pin as the dev extra, so this gate and a developer machine
+        # enforce the same rule set.
+        run: python -m pip install "ruff==0.16.1"
+      - name: ruff check
+        # The rule set is in pyproject.toml. Legacy files carry an explicit
+        # per-file/per-code ignore ledger; nothing is disabled repo-wide, so a
+        # new violation anywhere fails here.
+        run: python -m ruff check . --output-format=github
+
+  # ---------------------------------------------------------------- gate 2
+  gate2-types:
+    name: gate2-types (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and type tooling
+        run: |
+          python -m pip install -e ".[dev]"
+      - name: mypy
+        # `files` in pyproject.toml scopes this to apps/, lambdas/ and the
+        # migration-contribution validator in strict mode. The legacy packages
+        # are relaxed per-module (not globally) and join as they are rewritten.
+        run: python -m mypy
+
+  # ---------------------------------------------------------------- gate 3
+  gate3-unit-tests:
+    name: gate3-unit-tests (pytest + coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and test tooling
+        run: python -m pip install -e ".[dev]"
+      - name: pytest
+        run: |
+          python -m pytest tests \
+            -m "not integration" \
+            -p no:cacheprovider \
+            --cov=apps --cov=lambdas \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=88
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-pipeline
+          path: coverage.xml
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- gate 4
+  gate4-market-loader-tests:
+    name: gate4-market-loader-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # `idea2strategy-market-loader/` is an independent uv project with its own
+    # dependency set (typer, pydantic-settings, tenacity, exchange-calendars,
+    # hypothesis) that is NOT in the data-pipeline environment, so it needs its
+    # own install step. CI never ran this suite before: the old workflow only
+    # discovered `tests/`, leaving the whole loader unguarded.
+    defaults:
+      run:
+        working-directory: idea2strategy-market-loader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install market-loader and its test tooling
+        run: |
+          python -m pip install -e .
+          python -m pip install "pytest>=8.4" "pytest-cov>=6.2" "hypothesis>=6.138" "respx>=0.22"
+      - name: pytest (market-loader unit + contract)
+        run: python -m pytest tests -p no:cacheprovider -q
+
+  # ---------------------------------------------------------------- gate 5
+  gate5-app-smoke:
+    name: gate5-app-smoke (pipeline-worker boots)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project (validates packaging and console entry points)
+        run: python -m pip install -e .
+      - name: Console entry points are installed
+        run: |
+          command -v pipeline-worker
+          command -v market-pipeline
+          command -v daily-pipeline
+      - name: Refuses to start without configuration
+        run: |
+          set +e
+          env -i PATH="$PATH" HOME="$HOME" pipeline-worker --check-config
+          code=$?
+          set -e
+          echo "exit code without configuration: $code"
+          test "$code" -eq 2
+      # The SQS port is implemented now, so the old assertion here - that
+      # selecting it exits 3 as unimplemented - no longer describes the worker.
+      # What is worth guarding instead is the requirement that replaced it: a
+      # queue without a dead-letter queue is refused, because a poison message
+      # could then only be retried forever or dropped in silence.
+      - name: Refuses an SQS queue with no dead-letter queue
+        env:
+          PIPELINE_WORKER_ENVIRONMENT: ci
+          PIPELINE_WORKER_MESSAGE_SOURCE: sqs
+          PIPELINE_WORKER_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/pipeline
+          PIPELINE_WORKER_CATALOG_ROOT: ${{ github.workspace }}/.run/catalog
+          PIPELINE_WORKER_OBJECT_STORE_ROOT: ${{ github.workspace }}/.run/objects
+        run: |
+          set +e
+          output=$(pipeline-worker 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          echo "exit code without a dead-letter queue: $code"
+          test "$code" -eq 2
+          # Assert the message names the missing variable, so the gate cannot be
+          # satisfied by an unrelated configuration error that also exits 2.
+          echo "$output" | grep -q 'PIPELINE_WORKER_DEAD_LETTER_QUEUE_URL'
+      - name: Boots, reports ready, processes a command and drains on SIGTERM
+        env:
+          PIPELINE_WORKER_ENVIRONMENT: ci
+          PIPELINE_WORKER_MESSAGE_SOURCE: inprocess
+          PIPELINE_WORKER_CATALOG_ROOT: ${{ github.workspace }}/.run/catalog
+          PIPELINE_WORKER_OBJECT_STORE_ROOT: ${{ github.workspace }}/.run/objects
+          PIPELINE_WORKER_HEALTH_FILE: ${{ github.workspace }}/.run/health.json
+          PIPELINE_WORKER_POLL_INTERVAL_SECONDS: "0.1"
+          PIPELINE_WORKER_LOG_LEVEL: INFO
+        run: |
+          set -euo pipefail
+          pipeline-worker &
+          worker_pid=$!
+          for _ in $(seq 1 100); do
+            if [ -f "$PIPELINE_WORKER_HEALTH_FILE" ]; then break; fi
+            sleep 0.2
+          done
+          test -f "$PIPELINE_WORKER_HEALTH_FILE"
+          cat "$PIPELINE_WORKER_HEALTH_FILE"
+          grep -q '"status":"READY"' "$PIPELINE_WORKER_HEALTH_FILE"
+          kill -TERM "$worker_pid"
+          wait "$worker_pid"
+          echo "worker exited cleanly"
+          test ! -f "$PIPELINE_WORKER_HEALTH_FILE"
+      - name: Lambda handlers import and reject a malformed event
+        run: |
+          python - <<'PY'
+          from lambdas.corporate_action_research import handler as car
+          from lambdas.lightweight_validation import handler as lv
+          from lambdas.pipeline_trigger import handler as pt
+          from apps.common.errors import MalformedEventError
+
+          for name, entry in (("pipeline_trigger", pt), ("lightweight_validation", lv),
+                              ("corporate_action_research", car)):
+              try:
+                  entry({"nope": True}, None)
+              except MalformedEventError:
+                  print(f"{name}: malformed event rejected")
+              else:
+                  raise SystemExit(f"{name} accepted a malformed event")
+          PY
+
+  # ---------------------------------------------------------------- gate 6
+  gate6-migration-contribution:
+    name: gate6-migration-contribution (COM07)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and test tooling
+        run: python -m pip install -e ".[dev]"
+      - name: Validate the contribution root
+        run: python db/migration-contributions/validate_contribution.py
+      - name: Contribution contract tests
+        run: python -m pytest tests/test_migration_contribution.py -p no:cacheprovider -q
+      - name: No repository-local Flyway execution
+        # COM07: owner repositories contribute SQL; only backend/db-migration
+        # assembles and applies it. A local Flyway config or a `V001__` file
+        # means someone reintroduced a private migration path.
+        run: |
+          set -euo pipefail
+          if find . -path ./.git -prune -o \
+               \( -name 'flyway.conf' -o -name 'flyway.toml' \) -print | grep -q .; then
+            echo "::error title=gate6::A Flyway configuration exists in this repository"
+            exit 1
+          fi
+          if find . -path ./.git -prune -o -name 'V[0-9][0-9][0-9]__*.sql' -print | grep -q .; then
+            echo "::error title=gate6::Legacy V001-style migration filenames are rejected centrally"
+            exit 1
+          fi
+          echo "no repository-local migration execution found"
+
+  # ---------------------------------------------------------------- gate 7
+  gate7-dependency-and-secret-scan:
+    name: gate7-dependency-and-secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # TruffleHog needs history to scan every commit on the branch.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and audit tooling
+        run: |
+          python -m pip install -e .
+          python -m pip install pip-audit
+      - name: pip-audit (data-pipeline)
+        # Fails when any installed dependency has a known advisory. `--strict`
+        # is deliberately omitted: the editable local project is not on PyPI and
+        # would be reported as unauditable, which is noise, not a finding.
+        run: pip-audit --progress-spinner off --desc
+      - name: pip-audit (market-loader dependency set)
+        working-directory: idea2strategy-market-loader
+        run: |
+          python -m pip install -e .
+          pip-audit --progress-spinner off --desc
+      - name: Secret scan (TruffleHog, verified findings only)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ""
+          head: HEAD
+          # No `--fail` here: the action already passes it, and trufflehog
+          # rejects the repeated flag with
+          # "flag 'fail' cannot be repeated", which fails the gate on argument
+          # parsing before it scans anything.
+          extra_args: --results=verified
+      - name: No committed .env or credential files
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$'; then
+            echo "::error title=gate7::A .env file is tracked in git"
+            exit 1
+          fi
+          if git ls-files | grep -E '\.(pem|p12|pfx|keystore)$'; then
+            echo "::error title=gate7::A key material file is tracked in git"
+            exit 1
+          fi
+          echo "no credential files tracked"
+
+  # ---------------------------------------------------------------- gate 8
+  gate8-db-integration:
+    name: gate8-db-integration (PostgreSQL 16 + LocalStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # PostgreSQL is NOT a service here: `tests/conftest.py` starts its own
+    # container through Testcontainers and applies the CENTRAL Flyway bundle to
+    # it, and a second, differently-migrated server would only invite tests to
+    # point at the wrong one.
+    #
+    # LocalStack IS a service, because `-m integration` is a single set that
+    # spans both: the realtime-ingest, worker-smoke and storage-adapter tests
+    # need a queue and an object store. Without it 17 of them skipped here.
+    #
+    # That harness *skips* when Docker is unavailable or when the central bundle
+    # cannot be located, and a skip is a silent pass. The last step therefore
+    # asserts, from the JUnit report, that integration tests actually executed
+    # and that none of them skipped. If Docker or the vendored bundle ever
+    # disappears, this gate goes red rather than green-and-empty.
+    services:
+      localstack:
+        image: localstack/localstack:4.7.0
+        env:
+          SERVICES: s3,sqs
+          EAGER_SERVICE_LOADING: "1"
+          AWS_DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 10s --health-timeout 5s --health-retries 12
+    env:
+      # The vendored bundle under db/migration-contributions/fixtures is the
+      # only source available to a bare checkout; leaving this unset would make
+      # conftest search for a superproject that CI does not check out.
+      PIPELINE_TEST_POSTGRES_IMAGE: postgres:16-alpine
+      LOCALSTACK_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and test tooling
+        run: python -m pip install -e ".[dev]"
+      - name: Docker is available
+        run: docker version
+      - name: Vendored central bundle matches its recorded digests
+        run: |
+          set -euo pipefail
+          cd db/migration-contributions/fixtures/central-migration
+          sha256sum -c ../central-migration.sha256
+      - name: Integration tests (PostgreSQL 16 via Testcontainers)
+        run: |
+          python -m pytest tests \
+            -m integration \
+            -p no:cacheprovider \
+            -rs \
+            --junitxml=integration-results.xml
+      - name: Integration tests actually ran (a skip is not a pass)
+        if: always()
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("integration-results.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          print(
+              f"integration tests: {total}, skipped: {skipped}, "
+              f"failures: {failures}, errors: {errors}"
+          )
+          if total == 0:
+              sys.exit("gate8: no integration test executed")
+          # Report failures and errors too. An earlier version printed only the
+          # skip count, so a run with 17 skips and 65 collection errors reported
+          # the skips and said nothing about the errors.
+          if errors:
+              sys.exit(f"gate8: {errors} integration test(s) errored")
+          if failures:
+              sys.exit(f"gate8: {failures} integration test(s) failed")
+          if skipped:
+              sys.exit(
+                  f"gate8: {skipped} integration test(s) skipped - Docker, LocalStack or "
+                  "the central migration bundle was unavailable, so the DB gate proved nothing"
+              )
+          PY
+
+  # ---------------------------------------------------------------- gate 9
+  gate9-localstack-storage:
+    name: gate9-localstack-storage (S3 object store + SQS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Covers BOTH LocalStack-backed surfaces, because they share one endpoint
+    # variable. Previously this gate ran only the storage file, so the realtime
+    # ingest (D12/D90) and pipeline-worker SQS tests were written, passed
+    # locally, and were never executed by CI at all.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project and test tooling
+        run: python -m pip install -e ".[dev]"
+      - name: Start LocalStack (s3 + sqs)
         run: docker compose -f docker-compose.localstack.yml up -d --wait
-      - name: Run LocalStack storage integration
+      - name: Both services are actually enabled
+        # An s3-only container makes every SQS test error with
+        # "Service 'sqs' is not enabled", which reads as a code fault. Fail here
+        # instead, where the message names the real cause.
+        run: |
+          set -euo pipefail
+          health=$(curl -sf http://localhost:4566/_localstack/health)
+          echo "$health"
+          for svc in s3 sqs; do
+            echo "$health" | python -c "
+          import json, sys
+          name = '$svc'
+          services = json.load(sys.stdin).get('services', {})
+          state = services.get(name)
+          if state not in {'available', 'running'}:
+              sys.exit(f\"gate9: LocalStack service {name!r} is {state!r}; check SERVICES in docker-compose.localstack.yml\")
+          print(f'{name}: {state}')
+          "
+          done
+      - name: LocalStack integration (storage + realtime SQS + worker smoke)
         env:
           LOCALSTACK_ENDPOINT_URL: http://localhost:4566
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
-        run: python -m unittest discover -s tests -p "test_storage_adapter_localstack.py" -v
-      - name: Show LocalStack logs after failure
+        run: >-
+          python -m pytest
+          tests/test_storage_adapter_localstack.py
+          tests/test_realtime_ingest.py
+          tests/test_app_smoke.py
+          -p no:cacheprovider -rs --junitxml=localstack-results.xml
+      - name: The LocalStack legs actually ran (a skip is not a pass)
+        if: always()
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("localstack-results.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"localstack tests: {total}, skipped: {skipped}")
+          if total == 0:
+              sys.exit("gate9: no LocalStack test executed")
+          if skipped:
+              sys.exit(
+                  f"gate9: {skipped} LocalStack test(s) skipped - the endpoint was "
+                  "unset or unreachable, so this gate proved nothing"
+              )
+          PY
+      - name: LocalStack logs after failure
         if: failure()
         run: docker compose -f docker-compose.localstack.yml logs --no-color
       - name: Stop LocalStack

@@ -19,7 +19,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from .catalog import LocalCatalog, MarketDataCatalog
+from .catalog import CatalogCapability, LocalCatalog, MarketDataCatalog
 from .contracts import (
     ADJUSTED_FEED,
     CALENDAR_NAME,
@@ -42,6 +42,7 @@ from .contracts import (
     sha256_file,
     stable_shard_key,
 )
+from .fs_paths import short_temp_path
 from .processing import (
     derive_regular_bars,
     estimate_rows_for_size,
@@ -54,7 +55,26 @@ from .processing import (
     split_table_by_time,
     write_parquet,
 )
+from .quality import (
+    ImpactScope,
+    QualityIncident,
+    record_issue_incidents,
+    record_quality_incidents,
+)
 from .storage import LocalObjectStore, ObjectStore
+
+
+def legacy_staging_filename(source_path: Path, batch_number: int) -> str:
+    """Name one legacy migration staging fragment.
+
+    Deterministic, so `--resume` can recognise an already written fragment,
+    and short: the fragment lives under
+    ``<staging_root>/<run_id>/legacy/contract=…/year=…/shard=…/instrument=<uuid>/``
+    which is already ~200 characters, so a 65-character name plus an atomic
+    temp suffix used to overflow the Windows MAX_PATH limit.
+    """
+    token = deterministic_uuid("legacy-source", str(source_path)).replace("-", "")[:12]
+    return f"s{token}-b{batch_number:06d}.parquet"
 
 
 class BarSource(Protocol):
@@ -214,6 +234,25 @@ def _table_period_end(
     return maximum.to_pydatetime() + timedelta(minutes=minutes)
 
 
+#: Why a collection failure cannot be scoped to a shard: the fetch never returned, so
+#: no object, partition or shard exists to attach the incident to.  The recorded period
+#: is still the failed request window, not the manifest's.
+_COLLECTION_FAILURE_REASON = (
+    "수집 단계 실패는 객체가 생성되기 전에 발생하므로 shard/partition으로 "
+    "좁힐 수 없습니다. 기록된 period는 실패한 요청 구간입니다."
+)
+
+
+def _parse_iso(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _iso_or(value: Any, fallback: str | datetime) -> datetime:
+    return _parse_iso(value) if value else _parse_iso(fallback)
+
+
 def _overlaps(
     left_start: str,
     left_end: str,
@@ -263,27 +302,26 @@ class MarketPipelineEngine:
             "status": "REVIEW_REQUIRED",
             "created_at": now,
         }
-        if isinstance(self.catalog, LocalCatalog):
-            self.catalog.upsert("market_data.providers", provider)
-            for code, feed_id in self.feed_ids.items():
-                self.catalog.upsert(
-                    "market_data.feeds",
-                    {
-                        "id": feed_id,
-                        "provider_id": provider_id,
-                        "code": code,
-                        "data_kind": "BARS",
-                        "resolution": "30m",
-                        "timezone_name": "America/New_York",
-                        "feed_version": (
-                            "alpaca-sip-raw-v1"
-                            if code == RAW_FEED
-                            else "alpaca-sip-adjustment-all-v1"
-                        ),
-                        "created_at": now,
-                        "retired_at": None,
-                    },
-                )
+        self.catalog.upsert("market_data.providers", provider)
+        for code, feed_id in self.feed_ids.items():
+            self.catalog.upsert(
+                "market_data.feeds",
+                {
+                    "id": feed_id,
+                    "provider_id": provider_id,
+                    "code": code,
+                    "data_kind": "BARS",
+                    "resolution": "30m",
+                    "timezone_name": "America/New_York",
+                    "feed_version": (
+                        "alpaca-sip-raw-v1"
+                        if code == RAW_FEED
+                        else "alpaca-sip-adjustment-all-v1"
+                    ),
+                    "created_at": now,
+                    "retired_at": None,
+                },
+            )
 
     def _materialize_object(
         self,
@@ -304,9 +342,7 @@ class MarketPipelineEngine:
         ):
             return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(
-            f".{destination.name}.{os.getpid()}.tmp"
-        )
+        temporary = short_temp_path(destination)
         try:
             with self.object_store.open(object_key_value) as source:
                 with temporary.open("wb") as output:
@@ -323,19 +359,9 @@ class MarketPipelineEngine:
     def _run_record(self, code: str, idempotency_key: str) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
         run_id = deterministic_uuid("pipeline-run", code, idempotency_key)
-        if isinstance(self.catalog, LocalCatalog):
-            existing = next(
-                (
-                    row
-                    for row in self.catalog.records(
-                        "market_data.pipeline_runs"
-                    )
-                    if row["id"] == run_id
-                ),
-                None,
-            )
-            if existing and existing["status"] == "SUCCEEDED":
-                return {**existing, "_reused": True}
+        existing = self.catalog.pipeline_run(run_id)
+        if existing and existing["status"] == "SUCCEEDED":
+            return {**existing, "_reused": True}
         record = {
             "id": run_id,
             "pipeline_code": code,
@@ -356,14 +382,12 @@ class MarketPipelineEngine:
         contract: DatasetContract,
         year: int,
     ) -> tuple[int, dict[str, Any] | None]:
-        latest = None
-        if isinstance(self.catalog, LocalCatalog):
-            latest = self.catalog.latest_available_manifest(
-                feed_id=self.feed_ids[contract.feed_code],
-                data_layer=contract.data_layer,
-                resolution=contract.resolution,
-                year=year,
-            )
+        latest = self.catalog.latest_available_manifest(
+            feed_id=self.feed_ids[contract.feed_code],
+            data_layer=contract.data_layer,
+            resolution=contract.resolution,
+            year=year,
+        )
         if self.config.revision is not None:
             revision = self.config.revision
             if latest and revision < int(latest["revision_number"]):
@@ -434,7 +458,10 @@ class MarketPipelineEngine:
             table,
             source_ids,
         ) in groups:
-            table = sort_bar_table(table)
+            # Validate first, then sort.  `sort_bar_table` repairs out-of-order input
+            # and destroys the evidence in the same step, so running it before
+            # `quality_issues` made `OUT_OF_ORDER_BARS` unreachable in production --
+            # the D10 ordering defect spec section 1 records.
             issues = quality_issues(
                 table,
                 contract,
@@ -442,6 +469,7 @@ class MarketPipelineEngine:
                 partition_end=partition_end,
                 calendar_name=self.config.calendar,
             )
+            table = sort_bar_table(table)
             incidents.extend(
                 {
                     **issue,
@@ -566,6 +594,41 @@ class MarketPipelineEngine:
         return new_objects, incidents
 
     @staticmethod
+    def _collection_failure_incident(
+        issue: dict[str, Any],
+        manifest: dict[str, Any],
+        detected_at: datetime,
+    ) -> QualityIncident:
+        """A failure that happened before any object existed, scoped as narrowly as it can be.
+
+        A provider fetch that never returned, or a derived contract with no source
+        manifest, produces no `dataset_objects` row, so there is no shard or partition
+        to attach.  `ImpactScope.manifest_wide` is the declared escape hatch and
+        requires a written reason; the recorded period is still the failed window the
+        caller reports, clamped to the manifest, not the manifest period itself.
+        """
+
+        reason = issue.get("manifest_wide_reason")
+        if not reason:
+            raise ValueError(
+                f"{issue['code']} has no shard_key, so recording it needs an explicit "
+                "manifest_wide_reason; widening an incident silently is the D10 defect"
+            )
+        lower = _iso_or(issue.get("period_start"), manifest["period_start"])
+        upper = _iso_or(issue.get("period_end"), manifest["period_end"])
+        return QualityIncident(
+            incident_code=issue["code"],
+            severity=issue["severity"],
+            scope=ImpactScope.manifest_wide(
+                period_start=max(lower, _parse_iso(manifest["period_start"])),
+                period_end=min(upper, _parse_iso(manifest["period_end"])),
+                reason=str(reason),
+            ),
+            detected_at=detected_at,
+            message=str(issue.get("message", "")),
+        )
+
+    @staticmethod
     def _canonical_object(relation: dict[str, Any], storage: dict[str, Any]) -> dict[str, Any]:
         return {
             "content_hash": storage["content_hash"],
@@ -594,6 +657,17 @@ class MarketPipelineEngine:
         relation_type: str = "RESAMPLED_FROM",
         additional_incidents: Iterable[dict[str, Any]] = (),
     ) -> dict[str, Any]:
+        """Publish one dataset revision: objects to the store, rows to the catalog.
+
+        The object-store writes happen first and are not transactional -- objects are
+        immutable and content-addressed, so an orphan costs storage and nothing else.
+        Every catalog write then happens inside a single `catalog.transaction()`: the
+        BUILDING manifest, the staged objects, the lineage, the incidents, the final
+        manifest and the supersede of the previous revision either all commit or none
+        do.  Without that, a crash between the last two writes leaves two AVAILABLE
+        manifests for one period, or a permanently BUILDING manifest owning objects.
+        """
+
         revision, previous = self._next_revision(contract, year)
         manifest_id = deterministic_uuid(
             "manifest",
@@ -619,7 +693,6 @@ class MarketPipelineEngine:
             "created_at": now,
             "available_at": None,
         }
-        self.catalog.publish_manifest(building)
         new_objects, incidents = self._write_new_objects(
             contract,
             year,
@@ -630,7 +703,12 @@ class MarketPipelineEngine:
         incidents.extend(dict(value) for value in additional_incidents)
         retained: list[NewObject] = []
         replace_periods = replace_periods or []
-        if previous and isinstance(self.catalog, LocalCatalog):
+        if previous:
+            # Carry every object the new revision does not replace forward.  This loop
+            # used to be gated on the catalog's concrete type, so against any catalog
+            # other than the local one a revision silently published *only* the
+            # replaced partitions and dropped the rest of the dataset -- the latent
+            # data-loss bug spec section 1 records.
             for old in self.catalog.objects_for_manifest(previous["id"]):
                 relation = {
                     key: value for key, value in old.items() if key != "storage"
@@ -677,62 +755,67 @@ class MarketPipelineEngine:
             "dataset_hash": canonical_dataset_hash(canonical),
             "available_at": now if status == "AVAILABLE" else None,
         }
-        for item in all_objects:
-            self.catalog.stage_object(item.storage, item.relation)
-            if isinstance(self.catalog, LocalCatalog) and item in new_objects:
-                self.catalog.record_pipeline_output(
-                    pipeline_run_id=self._active_run_id,
-                    dataset_manifest_id=manifest_id,
-                    dataset_object_id=item.relation["id"],
-                )
-            for source_id in item.source_dataset_object_ids:
-                self.catalog.record_object_lineage(
+        records_outputs = self.catalog.supports(CatalogCapability.PIPELINE_RUN_OUTPUTS)
+        with self.catalog.transaction():
+            self.catalog.publish_manifest(building)
+            for item in all_objects:
+                self.catalog.stage_object(item.storage, item.relation)
+                if records_outputs and item in new_objects:
+                    self.catalog.record_pipeline_output(
+                        pipeline_run_id=self.active_run_id,
+                        dataset_manifest_id=manifest_id,
+                        dataset_object_id=item.relation["id"],
+                    )
+                for source_id in item.source_dataset_object_ids:
+                    self.catalog.record_object_lineage(
+                        {
+                            "derived_dataset_object_id": item.relation["id"],
+                            "source_dataset_object_id": source_id,
+                            "pipeline_run_id": self.active_run_id,
+                            "relation_type": relation_type,
+                            "created_at": now,
+                        }
+                    )
+            # Data-derived findings already carry their own instrument, period and
+            # affected bar count from `quality_issues`; `record_issue_incidents` keeps
+            # that scope instead of the previous hand-built row, which flattened every
+            # finding to `instrument_id=None` plus the manifest's whole period.
+            detected_at = datetime.fromisoformat(now)
+            record_issue_incidents(
+                self.catalog,
+                [issue for issue in incidents if issue.get("shard_key")],
+                dataset_manifest_id=manifest_id,
+                detected_at=detected_at,
+            )
+            # Collection-time failures produced no object, so there is no shard to
+            # scope them to.  They are widened deliberately, with the reason and the
+            # failed window written down, never by omission.
+            record_quality_incidents(
+                self.catalog,
+                [
+                    self._collection_failure_incident(issue, building, detected_at)
+                    for issue in incidents
+                    if not issue.get("shard_key")
+                ],
+                dataset_manifest_id=manifest_id,
+            )
+            self.catalog.publish_manifest(manifest)
+            if status == "AVAILABLE" and previous:
+                self.catalog.publish_manifest(
                     {
-                        "derived_dataset_object_id": item.relation["id"],
-                        "source_dataset_object_id": source_id,
-                        "pipeline_run_id": self._active_run_id,
-                        "relation_type": relation_type,
-                        "created_at": now,
+                        **previous,
+                        "status": "SUPERSEDED",
+                        "available_at": previous.get("available_at"),
                     }
                 )
-        for incident in incidents:
-            self.catalog.record_quality_incident(
-                {
-                    "id": deterministic_uuid(
-                        manifest_id,
-                        incident.get("shard_key"),
-                        incident["code"],
-                        incident.get("partition_start"),
-                    ),
-                    "dataset_manifest_id": manifest_id,
-                    "instrument_id": None,
-                    "severity": incident["severity"],
-                    "incident_code": incident["code"],
-                    "period_start": manifest["period_start"],
-                    "period_end": manifest["period_end"],
-                    "status": "ACTIVE",
-                    "evidence_object_id": None,
-                    "detected_at": now,
-                    "resolved_at": None,
-                }
-            )
-        self.catalog.publish_manifest(manifest)
-        if status == "AVAILABLE" and previous:
-            self.catalog.publish_manifest(
-                {
-                    **previous,
-                    "status": "SUPERSEDED",
-                    "available_at": previous.get("available_at"),
-                }
-            )
-        if dataset_source_manifest_id:
-            self.catalog.record_dataset_lineage(
-                {
-                    "derived_manifest_id": manifest_id,
-                    "source_manifest_id": dataset_source_manifest_id,
-                    "relation_type": relation_type,
-                }
-            )
+            if dataset_source_manifest_id:
+                self.catalog.record_dataset_lineage(
+                    {
+                        "derived_manifest_id": manifest_id,
+                        "source_manifest_id": dataset_source_manifest_id,
+                        "relation_type": relation_type,
+                    }
+                )
         return {
             "manifest": manifest,
             "new_object_count": len(new_objects),
@@ -740,12 +823,46 @@ class MarketPipelineEngine:
             "incident_count": len(incidents),
         }
 
+    def start_run(self, code: str, idempotency_key: str) -> dict[str, Any]:
+        """Begin -- or reuse -- one `market_data.pipeline_runs` row, and make it active.
+
+        The public entry point every caller that publishes datasets goes through,
+        including `backfill`, `migrate_legacy`, `incremental`, `derive`, `compact` and
+        the realtime ingest path.  The run id is derived from `code` and
+        `idempotency_key`, so re-running the same job finds the same row; when that row
+        already reached SUCCEEDED the returned mapping carries ``_reused: True`` and the
+        caller should stop rather than redo the work.
+
+        `publish_dataset` needs an active run for `dataset_object_lineage`, so the
+        active run is set here rather than left to each caller to remember.
+        """
+
+        run = self._run_record(code, idempotency_key)
+        self._active_run_id = run["id"]
+        return run
+
     @property
-    def _active_run_id(self) -> str:
+    def active_run_id(self) -> str:
+        """The run `publish_dataset` will attribute lineage to.
+
+        Raises rather than defaulting: lineage attributed to a run that was never
+        started is worse than no lineage, because it looks like provenance.
+        """
+
         value = getattr(self, "_current_run_id", None)
         if value is None:
             raise RuntimeError("pipeline run이 시작되지 않았습니다.")
-        return value
+        return str(value)
+
+    @property
+    def _active_run_id(self) -> str:
+        """Deprecated alias for `active_run_id`; `start_run` is the way in.
+
+        Kept because tests and callers that predate `start_run` set it directly to
+        attribute a hand-built `publish_dataset` call to a run they created themselves.
+        """
+
+        return self.active_run_id
 
     @_active_run_id.setter
     def _active_run_id(self, value: str) -> None:
@@ -968,8 +1085,6 @@ class MarketPipelineEngine:
         price_type: str,
         year: int,
     ) -> datetime | None:
-        if not isinstance(self.catalog, LocalCatalog):
-            return None
         native_layer = "RAW" if price_type == "raw" else "ADJUSTED"
         feed_code = RAW_FEED if price_type == "raw" else ADJUSTED_FEED
         latest_value: pd.Timestamp | None = None
@@ -1068,7 +1183,7 @@ class MarketPipelineEngine:
             return
         source_objects = (
             self.catalog.objects_for_manifest(source_manifest_id)
-            if source_manifest_id and isinstance(self.catalog, LocalCatalog)
+            if source_manifest_id
             else []
         )
         year_start, year_end = partition_bounds(date(year, 1, 1), "YEAR")
@@ -1141,7 +1256,7 @@ class MarketPipelineEngine:
             f"{start_year}:{end_year}:{','.join(price_types)}:"
             f"{','.join(resolutions)}"
         )
-        run = self._run_record("LEGACY_MARKET_DATA_MIGRATION", key)
+        run = self.start_run("LEGACY_MARKET_DATA_MIGRATION", key)
         if run.get("_reused"):
             return {
                 "status": "SUCCEEDED",
@@ -1149,7 +1264,6 @@ class MarketPipelineEngine:
                 "reused": True,
                 "inventory": inventory,
             }
-        self._active_run_id = run["id"]
         failures = []
         for contract in contracts:
             root, marker = self._legacy_source_root(input_root, contract)
@@ -1204,10 +1318,9 @@ class MarketPipelineEngine:
                                 / f"year={year}"
                                 / f"shard={shard}"
                                 / f"instrument={mapping.instrument_id}"
-                                / (
-                                    "source="
-                                    + deterministic_uuid(path.resolve())
-                                    + f"-batch={batch_number:06d}.parquet"
+                                / legacy_staging_filename(
+                                    path.resolve(),
+                                    batch_number,
                                 )
                             )
                             if not (
@@ -1238,11 +1351,7 @@ class MarketPipelineEngine:
                 source_manifest_id = native_manifests.get(
                     (contract.price_type, year)
                 )
-                if (
-                    contract.data_layer == "DERIVED"
-                    and source_manifest_id is None
-                    and isinstance(self.catalog, LocalCatalog)
-                ):
+                if contract.data_layer == "DERIVED" and source_manifest_id is None:
                     source_layer = (
                         "RAW"
                         if contract.price_type == "raw"
@@ -1289,6 +1398,10 @@ class MarketPipelineEngine:
                                 "partition_start": f"{year}-01-01",
                                 "partition_end": f"{year + 1}-01-01",
                                 "shard_key": None,
+                                "manifest_wide_reason": (
+                                    "원본 manifest 자체가 없으므로 shard나 "
+                                    "instrument 단위로 좁힐 근거가 존재하지 않습니다."
+                                ),
                             }
                         ]
                         if contract.data_layer == "DERIVED"
@@ -1381,7 +1494,7 @@ class MarketPipelineEngine:
             return
         source_objects = (
             self.catalog.objects_for_manifest(source_manifest_id)
-            if source_manifest_id and isinstance(self.catalog, LocalCatalog)
+            if source_manifest_id
             else []
         )
         for shard_root in sorted(base.glob("shard=*")):
@@ -1442,14 +1555,13 @@ class MarketPipelineEngine:
             f"{end.isoformat()}:{','.join(price_types)}:"
             f"{','.join(resolutions)}"
         )
-        run = self._run_record("ALPACA_SIP_BACKFILL", key)
+        run = self.start_run("ALPACA_SIP_BACKFILL", key)
         if run.get("_reused"):
             return {
                 "status": "SUCCEEDED",
                 "pipeline_run_id": run["id"],
                 "reused": True,
             }
-        self._active_run_id = run["id"]
         staging = self.collect_staging(
             run_code=run["id"],
             start=start,
@@ -1486,6 +1598,9 @@ class MarketPipelineEngine:
                             "partition_start": f"{year}-01-01",
                             "partition_end": f"{year + 1}-01-01",
                             "shard_key": None,
+                            "period_start": failure["start"],
+                            "period_end": failure["end"],
+                            "manifest_wide_reason": _COLLECTION_FAILURE_REASON,
                         }
                         for failure in staging["failures"]
                         if failure["price_type"] == price_type
@@ -1531,6 +1646,9 @@ class MarketPipelineEngine:
                                 "partition_start": f"{year}-01-01",
                                 "partition_end": f"{year + 1}-01-01",
                                 "shard_key": None,
+                                "period_start": failure["start"],
+                                "period_end": failure["end"],
+                                "manifest_wide_reason": _COLLECTION_FAILURE_REASON,
                             }
                             for failure in staging["failures"]
                             if failure["price_type"] == price_type
@@ -1568,8 +1686,7 @@ class MarketPipelineEngine:
             ),
             "results": results,
         }
-        if isinstance(self.catalog, LocalCatalog):
-            self.catalog.write_summary(summary)
+        self.catalog.write_summary(summary)
         return summary
 
     def derive(
@@ -1580,8 +1697,6 @@ class MarketPipelineEngine:
         resolutions: Iterable[str] = ("1h", "4h", "1d"),
     ) -> dict[str, Any]:
         """Rebuild derived annual objects from published native 30m manifests."""
-        if not isinstance(self.catalog, LocalCatalog):
-            raise RuntimeError("derive 조회에는 LocalCatalog가 필요합니다.")
         years = tuple(sorted(set(years)))
         price_types = tuple(price_types)
         resolutions = tuple(resolutions)
@@ -1611,14 +1726,13 @@ class MarketPipelineEngine:
             f"{self.config.fingerprint}:derive:{','.join(map(str, years))}:"
             f"{','.join(price_types)}:{','.join(resolutions)}"
         )
-        run = self._run_record("MARKET_DATA_DERIVE", key)
+        run = self.start_run("MARKET_DATA_DERIVE", key)
         if run.get("_reused"):
             return {
                 "status": "SUCCEEDED",
                 "pipeline_run_id": run["id"],
                 "reused": True,
             }
-        self._active_run_id = run["id"]
         results = []
         for price_type in price_types:
             native_layer = "RAW" if price_type == "raw" else "ADJUSTED"
@@ -1841,7 +1955,7 @@ class MarketPipelineEngine:
             f"{sessions[0]}:{sessions[-1]}:{','.join(price_types)}:"
             f"{','.join(resolutions)}"
         )
-        run = self._run_record("ALPACA_SIP_INCREMENTAL", key)
+        run = self.start_run("ALPACA_SIP_INCREMENTAL", key)
         if run.get("_reused"):
             return {
                 "status": "SUCCEEDED",
@@ -1849,7 +1963,6 @@ class MarketPipelineEngine:
                 "reused": True,
                 "sessions": [value.isoformat() for value in sessions],
             }
-        self._active_run_id = run["id"]
         staging = self.collect_staging(
             run_code=run["id"],
             start=start,
@@ -1877,9 +1990,7 @@ class MarketPipelineEngine:
                     ]
                     native_latest = None
                     native_source_objects: list[dict[str, Any]] = []
-                    if contract.data_layer == "DERIVED" and isinstance(
-                        self.catalog, LocalCatalog
-                    ):
+                    if contract.data_layer == "DERIVED":
                         native_latest = self.catalog.latest_available_manifest(
                             feed_id=self.feed_ids[contract.feed_code],
                             data_layer=native_layer,
@@ -1979,6 +2090,11 @@ class MarketPipelineEngine:
                                         + timedelta(days=1)
                                     ).isoformat(),
                                     "shard_key": None,
+                                    "period_start": failure["start"],
+                                    "period_end": failure["end"],
+                                    "manifest_wide_reason": (
+                                        _COLLECTION_FAILURE_REASON
+                                    ),
                                 }
                                 for failure in staging["failures"]
                                 if failure["price_type"] == price_type
@@ -2013,8 +2129,7 @@ class MarketPipelineEngine:
             "adjustment_revision_backfill": adjustment_revision_backfill,
             "results": results,
         }
-        if isinstance(self.catalog, LocalCatalog):
-            self.catalog.write_summary(summary)
+        self.catalog.write_summary(summary)
         return summary
 
     def _detect_adjusted_revision(
@@ -2025,11 +2140,7 @@ class MarketPipelineEngine:
         overlap_sessions: int = 10,
     ) -> bool:
         """Compare recent overlapping adjusted prices before daily publish."""
-        if (
-            self.source is None
-            or not isinstance(self.catalog, LocalCatalog)
-            or overlap_sessions <= 0
-        ):
+        if self.source is None or overlap_sessions <= 0:
             return False
         calendar = mcal.get_calendar(self.config.calendar)
         schedule = calendar.schedule(
@@ -2157,8 +2268,6 @@ class MarketPipelineEngine:
                 "partition_start": start.isoformat(),
                 "partition_end": end.isoformat(),
             }
-        if not isinstance(self.catalog, LocalCatalog):
-            raise RuntimeError("Compaction 조회에는 조회 가능한 Catalog가 필요합니다.")
         latest = self.catalog.latest_available_manifest(
             feed_id=self.feed_ids[contract.feed_code],
             data_layer=contract.data_layer,
@@ -2215,30 +2324,35 @@ class MarketPipelineEngine:
         missing = expected_sessions.difference(covered)
         if missing:
             if not self.config.dry_run:
-                now = datetime.now(timezone.utc).isoformat()
-                self.catalog.record_quality_incident(
-                    {
-                        "id": deterministic_uuid(
-                            latest["id"],
-                            "COMPACTION_INPUT_INCOMPLETE",
-                            start,
-                            end,
-                        ),
-                        "dataset_manifest_id": latest["id"],
-                        "instrument_id": None,
-                        "severity": "ERROR",
-                        "incident_code": "COMPACTION_INPUT_INCOMPLETE",
-                        "period_start": iso_utc(
-                            partition_utc_bounds(start, granularity)[0]
-                        ),
-                        "period_end": iso_utc(
-                            partition_utc_bounds(start, granularity)[1]
-                        ),
-                        "status": "ACTIVE",
-                        "evidence_object_id": None,
-                        "detected_at": now,
-                        "resolved_at": None,
-                    }
+                window_start, window_end = partition_utc_bounds(start, granularity)
+                missing_sessions = sorted(value.isoformat() for value in missing)
+                # Manifest breadth with a written reason, not by omission: the gap is
+                # every shard of the partition at once, so no single shard_key or
+                # instrument_id honestly describes it.  The recorded *period* is still
+                # the compacted partition, never the manifest's whole year, and the
+                # missing sessions are named in the message.
+                record_quality_incidents(
+                    self.catalog,
+                    [
+                        QualityIncident(
+                            incident_code="COMPACTION_INPUT_INCOMPLETE",
+                            severity="ERROR",
+                            scope=ImpactScope.manifest_wide(
+                                period_start=window_start,
+                                period_end=window_end,
+                                reason=(
+                                    "compaction 입력 누락은 파티션의 모든 shard에 걸쳐 "
+                                    "판정되므로 단일 shard/instrument로 좁힐 수 없습니다."
+                                ),
+                            ),
+                            detected_at=datetime.now(timezone.utc),
+                            message=(
+                                f"{granularity} {start.isoformat()}~{end.isoformat()} "
+                                f"compaction 입력에 없는 세션: {', '.join(missing_sessions)}"
+                            ),
+                        )
+                    ],
+                    dataset_manifest_id=latest["id"],
                 )
             incident = {
                 "status": "QUARANTINED",
@@ -2258,14 +2372,13 @@ class MarketPipelineEngine:
             f"{self.config.fingerprint}:compact:{contract.logical_code}:"
             f"{granularity}:{start}:{end}"
         )
-        run = self._run_record("MARKET_DATA_COMPACTION", key)
+        run = self.start_run("MARKET_DATA_COMPACTION", key)
         if run.get("_reused"):
             return {
                 "status": "SUCCEEDED",
                 "pipeline_run_id": run["id"],
                 "reused": True,
             }
-        self._active_run_id = run["id"]
         groups = []
         for shard in sorted({item["shard_key"] for item in inputs}):
             shard_inputs = [item for item in inputs if item["shard_key"] == shard]

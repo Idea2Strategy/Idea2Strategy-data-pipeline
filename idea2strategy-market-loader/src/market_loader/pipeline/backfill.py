@@ -104,13 +104,6 @@ class BackfillEngine:
             "processing_version": self.config.project.processing_version,
             "shard_count": self.config.data.shard_count,
         }
-        partitions = [
-            partition_key(adjustment, resolution, period.start.year, shard)
-            for period in year_ranges(start, end)
-            for adjustment in adjustments
-            for resolution in resolutions
-            for shard in range(self.config.data.shard_count)
-        ]
         with self.database.transaction() as connection:
             run_id, reused = MarketRepository(connection).create_run(
                 idempotency_key=idempotency_key(payload),
@@ -129,7 +122,6 @@ class BackfillEngine:
                         for item in selected
                     ],
                 },
-                partition_keys=partitions,
             )
         if reused:
             return BackfillResult(run_id, True, 0, 0, 0)
@@ -146,18 +138,6 @@ class BackfillEngine:
                     )
                     source_manifest: UUID | None = None
                     for resolution in [value for value in RESOLUTION_ORDER if value in resolutions]:
-                        resolution_partitions = [
-                            partition_key(adjustment, resolution, period.start.year, shard)
-                            for shard in range(self.config.data.shard_count)
-                        ]
-                        with self.database.transaction() as connection:
-                            completed_manifest = MarketRepository(
-                                connection
-                            ).successful_manifest_for_partitions(run_id, resolution_partitions)
-                        if completed_manifest is not None:
-                            if resolution == "30m":
-                                source_manifest = completed_manifest
-                            continue
                         bars = (
                             source
                             if resolution == "30m"
@@ -227,7 +207,6 @@ class BackfillEngine:
                                 quality_status=validation.status,
                                 published=published,
                                 source_manifest_id=source_manifest if resolution != "30m" else None,
-                                run_id=run_id,
                                 warning_codes=validation.warnings,
                             )
                         if resolution == "30m":

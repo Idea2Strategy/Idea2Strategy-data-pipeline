@@ -1,0 +1,259 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idea2strategy-data-pipeline"
+version = "0.1.0"
+description = "Idea2Strategy market-data and corporate-action pipeline (D bundle)"
+readme = "README.md"
+# COM02 pins the runtime to CPython 3.12.13.  The upper bound keeps CI, the
+# Lambda runtime and developer machines on the same minor release.
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Idea2Strategy D bundle" }]
+
+# Runtime dependencies mirror what the shipped packages actually import.
+# `market_pipeline_lib.catalog` imports psycopg directly and DP2 moves that
+# path onto SQLAlchemy Core, so both are declared here: without them every
+# PostgreSQL code path is dead on a default install.
+dependencies = [
+  "alpaca-py>=0.43,<1",
+  "boto3>=1.40,<2",
+  "jsonschema>=4.23,<5",
+  "lxml>=6,<7",
+  "numpy>=2,<3",
+  "pandas>=3,<4",
+  "pandas-market-calendars>=5.4,<6",
+  "psycopg[binary]>=3.2,<4",
+  "pyarrow>=25,<26",
+  "python-dotenv>=1,<2",
+  "SQLAlchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "freezegun>=1.5,<2",
+  "httpx>=0.28,<1",
+  "mypy>=1.17",
+  "pytest>=8.4",
+  "pytest-cov>=6.2",
+  # Pinned, not floating. An unpinned linter means CI and a developer machine
+  # can enforce different rule sets, so a clean local run does not predict CI.
+  "ruff==0.16.1",
+  "testcontainers[postgres]>=4.8,<5",
+  # Stubs, not a runtime dependency: without this mypy reports the pandas import
+  # itself as an error and the module's real type errors stay hidden behind it.
+  "pandas-stubs>=2.2,<3",
+]
+# Alias so `pip install -e .[test]` and `-e .[dev]` never drift apart.
+test = [
+  "idea2strategy-data-pipeline[dev]",
+]
+
+[project.scripts]
+# Execution apps named by docs/backend-implementation-master-checklist.md (D01).
+pipeline-worker = "apps.pipeline_worker.main:main"
+market-pipeline = "market_pipeline_lib.cli:main"
+daily-pipeline = "daily_pipeline:main"
+
+[tool.setuptools]
+# `market_data_backfill` is intentionally absent: it is a duplicate of
+# `market_pipeline_lib` and is removed by DP1.
+py-modules = [
+  "daily_pipeline",
+  "market_pipeline",
+  "pipeline_reporting",
+  "pipeline_state",
+]
+
+[tool.setuptools.packages.find]
+include = [
+  "apps*",
+  "data_collection*",
+  "data_filtering*",
+  "data_validation*",
+  "lambdas*",
+  "market_pipeline_lib*",
+]
+exclude = ["tests*", "idea2strategy-market-loader*", "examples*", "docs*"]
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [
+  ".venv",
+  "__pycache__",
+  # Independent uv project with its own pinned ruff configuration and its own
+  # lint gate; linting it from here would apply the wrong rule set.
+  "idea2strategy-market-loader",
+]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "UP",  # pyupgrade
+]
+
+[tool.ruff.lint.per-file-ignores]
+# FROZEN LINT DEBT LEDGER.
+#
+# No rule is disabled repository-wide: every entry below is scoped to one file
+# and to the exact codes that file violates today.  Any new file, and any new
+# violation of a code not listed for a file, fails the gate.  Entries are
+# removed as DP2..DP8 rewrite each module; the list must only ever shrink.
+#
+# These files are not fixed in DP1 because DP1 does not own them: the modules
+# are either rewritten wholesale in a later stage or open in a concurrent
+# edit.  A mechanical sweep now would collide with that work.
+#
+#   UP017 datetime.timezone.utc -> datetime.UTC     (mechanical, 127 sites)
+#   UP035 typing.Iterable etc.  -> collections.abc  (mechanical)
+#   I001  import block ordering                     (mechanical)
+#   F401  unused import                             (needs a read of each site)
+#   B905  zip() without explicit strict=            (behavioural)
+#   C414/C420 redundant comprehension shapes        (behavioural)
+#   E402  import not at top of file                 (sys.path bootstrap)
+#   E501  line > 120                                (long literal strings)
+#   W291/W293 trailing / blank-line whitespace      (mechanical)
+"daily_pipeline.py" = ["F401", "I001", "UP017"]
+"data_collection/collect_sip_1min.py" = ["E402", "I001", "UP017"]
+"data_collection/collect_sip_long_term.py" = ["F401", "I001"]
+"data_collection/etf_universe.py" = ["B905", "I001", "UP017"]
+"data_collection/get_ticker.py" = ["C414", "E501", "I001", "W293"]
+"data_filtering/filter_regular_session.py" = ["B905", "I001"]
+"data_filtering/resample_sip_5min.py" = ["E402", "I001"]
+"data_validation/audit_regular_session.py" = ["E402", "I001"]
+"data_validation/quality_control.py" = ["I001"]
+"market_pipeline.py" = ["I001"]
+"market_pipeline_lib/catalog.py" = ["I001", "UP017", "UP035", "UP037"]
+"market_pipeline_lib/cli.py" = ["UP017"]
+"market_pipeline_lib/compatibility.py" = ["I001"]
+"market_pipeline_lib/contracts.py" = ["I001", "UP017", "UP035"]
+"market_pipeline_lib/corporate_action_research.py" = ["I001", "UP017", "UP035", "UP037"]
+"market_pipeline_lib/dataset_fixtures.py" = ["I001"]
+"market_pipeline_lib/engine.py" = ["I001", "UP017", "UP034", "UP035"]
+"market_pipeline_lib/operations.py" = ["B905", "F401", "UP017"]
+"market_pipeline_lib/processing.py" = ["F401", "I001", "UP035"]
+"market_pipeline_lib/realtime_warmup.py" = ["C420", "E501", "I001", "UP017"]
+"market_pipeline_lib/storage.py" = ["I001", "UP035"]
+"pipeline_reporting.py" = ["I001"]
+"pipeline_state.py" = ["I001", "UP017"]
+"tests/d_storage_testkit.py" = ["UP017"]
+"tests/test_collect_sip_1min.py" = ["I001", "UP017"]
+"tests/test_collect_sip_long_term.py" = ["UP017"]
+"tests/test_compatibility_contracts.py" = ["I001"]
+"tests/test_corporate_action_research.py" = ["UP017"]
+"tests/test_daily_pipeline.py" = ["F401", "I001", "UP017"]
+"tests/test_dataset_contract_fixtures.py" = ["I001"]
+"tests/test_etf_universe.py" = ["UP017"]
+"tests/test_filter_regular_session.py" = ["I001"]
+"tests/test_market_pipeline_lib.py" = ["F401", "I001", "UP017"]
+"tests/test_quality_control.py" = ["UP017"]
+"tests/test_realtime_warmup_bundle.py" = ["I001"]
+"tests/test_storage_adapter.py" = ["I001"]
+"tests/test_storage_adapter_localstack.py" = ["I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "apps",
+  "daily_pipeline",
+  "data_collection",
+  "data_filtering",
+  "data_validation",
+  "lambdas",
+  "market_pipeline_lib",
+  "pipeline_reporting",
+  "pipeline_state",
+]
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+# `files` is what a bare `mypy` checks.  It deliberately starts with the code
+# this bundle owns end to end; the legacy packages are added as they are
+# rewritten by DP2..DP8 rather than being globally silenced.
+files = [
+  "apps",
+  "lambdas",
+  "db/migration-contributions/validate_contribution.py",
+]
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = false
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+# Third-party packages without bundled type information.
+module = [
+  "alpaca.*",
+  "boto3",
+  "boto3.*",
+  "botocore",
+  "botocore.*",
+  "pandas_market_calendars",
+  "pandas_market_calendars.*",
+  "pyarrow",
+  "pyarrow.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Legacy packages are not yet type-clean.  They are not in `files`, so they are
+# only reached through imports; following them would report their errors under
+# this bundle's gate before they are rewritten.
+#   market_pipeline_lib : rewritten in DP2 (SQLAlchemy Core catalog)
+#   data_collection     : rewritten in DP3 (Alpaca client replacement)
+#   data_filtering      : folded into DP4 compaction
+#   data_validation     : folded into DP4 quality incidents
+#   daily_pipeline / pipeline_state / pipeline_reporting : legacy support
+module = [
+  "daily_pipeline",
+  "data_collection.*",
+  "data_filtering.*",
+  "data_validation.*",
+  "market_pipeline_lib.*",
+  "pipeline_reporting",
+  "pipeline_state",
+]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+pythonpath = ["."]
+markers = [
+  "integration: requires Docker (PostgreSQL 16 via Testcontainers) or LocalStack",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["apps", "lambdas", "market_pipeline_lib"]
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@overload",
+]
