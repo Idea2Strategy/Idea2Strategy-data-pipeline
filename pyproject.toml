@@ -38,7 +38,9 @@ dev = [
   "mypy>=1.17",
   "pytest>=8.4",
   "pytest-cov>=6.2",
-  "ruff>=0.12",
+  # Pinned, not floating. An unpinned linter means CI and a developer machine
+  # can enforce different rule sets, so a clean local run does not predict CI.
+  "ruff==0.16.1",
   "testcontainers[postgres]>=4.8,<5",
   # Stubs, not a runtime dependency: without this mypy reports the pandas import
   # itself as an error and the module's real type errors stay hidden behind it.

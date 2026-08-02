@@ -49,7 +49,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - name: Install lint tooling
-        run: python -m pip install "ruff>=0.12"
+        # Same pin as the dev extra, so this gate and a developer machine
+        # enforce the same rule set.
+        run: python -m pip install "ruff==0.16.1"
       - name: ruff check
         # The rule set is in pyproject.toml. Legacy files carry an explicit
         # per-file/per-code ignore ledger; nothing is disabled repo-wide, so a
@@ -158,7 +160,12 @@ jobs:
           set -e
           echo "exit code without configuration: $code"
           test "$code" -eq 2
-      - name: Fails loudly when the SQS port is selected but not implemented
+      # The SQS port is implemented now, so the old assertion here - that
+      # selecting it exits 3 as unimplemented - no longer describes the worker.
+      # What is worth guarding instead is the requirement that replaced it: a
+      # queue without a dead-letter queue is refused, because a poison message
+      # could then only be retried forever or dropped in silence.
+      - name: Refuses an SQS queue with no dead-letter queue
         env:
           PIPELINE_WORKER_ENVIRONMENT: ci
           PIPELINE_WORKER_MESSAGE_SOURCE: sqs
@@ -167,11 +174,15 @@ jobs:
           PIPELINE_WORKER_OBJECT_STORE_ROOT: ${{ github.workspace }}/.run/objects
         run: |
           set +e
-          pipeline-worker
+          output=$(pipeline-worker 2>&1)
           code=$?
           set -e
-          echo "exit code with an unimplemented port: $code"
-          test "$code" -eq 3
+          echo "$output"
+          echo "exit code without a dead-letter queue: $code"
+          test "$code" -eq 2
+          # Assert the message names the missing variable, so the gate cannot be
+          # satisfied by an unrelated configuration error that also exits 2.
+          echo "$output" | grep -q 'PIPELINE_WORKER_DEAD_LETTER_QUEUE_URL'
       - name: Boots, reports ready, processes a command and drains on SIGTERM
         env:
           PIPELINE_WORKER_ENVIRONMENT: ci
@@ -282,7 +293,11 @@ jobs:
           path: ./
           base: ""
           head: HEAD
-          extra_args: --results=verified --fail
+          # No `--fail` here: the action already passes it, and trufflehog
+          # rejects the repeated flag with
+          # "flag 'fail' cannot be repeated", which fails the gate on argument
+          # parsing before it scans anything.
+          extra_args: --results=verified
       - name: No committed .env or credential files
         run: |
           set -euo pipefail
@@ -298,24 +313,44 @@ jobs:
 
   # ---------------------------------------------------------------- gate 8
   gate8-db-integration:
-    name: gate8-db-integration (PostgreSQL 16, Testcontainers)
+    name: gate8-db-integration (PostgreSQL 16 + LocalStack)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # `tests/conftest.py` starts its own PostgreSQL 16 container through
-    # Testcontainers and applies the CENTRAL Flyway bundle to it, so there is no
-    # `services:` block here: a second, differently-migrated server would only
-    # invite tests to point at the wrong one.
+    # PostgreSQL is NOT a service here: `tests/conftest.py` starts its own
+    # container through Testcontainers and applies the CENTRAL Flyway bundle to
+    # it, and a second, differently-migrated server would only invite tests to
+    # point at the wrong one.
+    #
+    # LocalStack IS a service, because `-m integration` is a single set that
+    # spans both: the realtime-ingest, worker-smoke and storage-adapter tests
+    # need a queue and an object store. Without it 17 of them skipped here.
     #
     # That harness *skips* when Docker is unavailable or when the central bundle
     # cannot be located, and a skip is a silent pass. The last step therefore
     # asserts, from the JUnit report, that integration tests actually executed
     # and that none of them skipped. If Docker or the vendored bundle ever
     # disappears, this gate goes red rather than green-and-empty.
+    services:
+      localstack:
+        image: localstack/localstack:4.7.0
+        env:
+          SERVICES: s3,sqs
+          EAGER_SERVICE_LOADING: "1"
+          AWS_DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 10s --health-timeout 5s --health-retries 12
     env:
       # The vendored bundle under db/migration-contributions/fixtures is the
       # only source available to a bare checkout; leaving this unset would make
       # conftest search for a superproject that CI does not check out.
       PIPELINE_TEST_POSTGRES_IMAGE: postgres:16-alpine
+      LOCALSTACK_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
