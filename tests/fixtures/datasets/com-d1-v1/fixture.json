@@ -1,0 +1,120 @@
+{
+  "fixture_set_id": "com-d1.dataset-objects",
+  "fixture_set_version": 1,
+  "fixture_root": ".",
+  "manifests": [
+    {
+      "name": "raw-v1",
+      "contract_id": "com06.dataset-manifest",
+      "schema_version": 1,
+      "manifest_id": "10000000-0000-4000-8000-000000000001",
+      "dataset_id": "20000000-0000-4000-8000-000000000001",
+      "revision": 1,
+      "status": "AVAILABLE",
+      "data_layer": "RAW",
+      "dataset_hash": "80ef4705cafe6236c7a3f00db89d34344ac474e616668cfda18538c0b271bd23",
+      "schema_id": "market-bars-v2",
+      "period_start": "2024-01-02T14:30:00Z",
+      "period_end": "2024-01-02T15:00:00Z",
+      "available_at": "2024-01-03T01:00:00Z",
+      "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+      "objects": [
+        {
+          "storage_object_id": "30000000-0000-4000-8000-000000000001",
+          "object_key": "market-data/provider=ALPACA/feed=ALPACA_SIP_RAW_30M/dataset=20000000-0000-4000-8000-000000000001/revision=1/layer=RAW/resolution=30m/granularity=DAY/partition_start=2024-01-02/partition_end=2024-01-03/shard=s00-of-01/part-00001.parquet",
+          "object_path": "objects/raw.parquet",
+          "content_hash": "6fe7a88a960a75e3f31cb69cb599a3c081003dc927ec151611e11f5650d9a33b",
+          "object_kind": "PARQUET",
+          "partition_granularity": "DAY",
+          "partition_start": "2024-01-02",
+          "partition_end": "2024-01-03",
+          "period_start": "2024-01-02T14:30:00Z",
+          "period_end": "2024-01-02T15:00:00Z",
+          "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+          "shard_key": "s00-of-01",
+          "part_number": 1,
+          "row_count": 2,
+          "schema_version": "market-bars-v2"
+        }
+      ]
+    },
+    {
+      "name": "adjusted-v1",
+      "contract_id": "com06.dataset-manifest",
+      "schema_version": 1,
+      "manifest_id": "10000000-0000-4000-8000-000000000002",
+      "dataset_id": "20000000-0000-4000-8000-000000000002",
+      "revision": 1,
+      "status": "AVAILABLE",
+      "data_layer": "ADJUSTED",
+      "dataset_hash": "36ac12ea6fa3060f476a46d03e4b2c420b87c62c18da6fbb6da7ad1533c87f05",
+      "schema_id": "market-bars-v2",
+      "period_start": "2024-01-02T14:30:00Z",
+      "period_end": "2024-01-02T15:00:00Z",
+      "available_at": "2024-01-03T01:01:00Z",
+      "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+      "objects": [
+        {
+          "storage_object_id": "30000000-0000-4000-8000-000000000002",
+          "object_key": "market-data/provider=ALPACA/feed=ALPACA_SIP_ADJUSTED_30M/dataset=20000000-0000-4000-8000-000000000002/revision=1/layer=ADJUSTED/resolution=30m/granularity=DAY/partition_start=2024-01-02/partition_end=2024-01-03/shard=s00-of-01/part-00001.parquet",
+          "object_path": "objects/adjusted-v1.parquet",
+          "content_hash": "023eb3a2f08118ad3ed4161daa2fad051c4b1f97464c17e4396e0f5e8149adcf",
+          "object_kind": "PARQUET",
+          "partition_granularity": "DAY",
+          "partition_start": "2024-01-02",
+          "partition_end": "2024-01-03",
+          "period_start": "2024-01-02T14:30:00Z",
+          "period_end": "2024-01-02T15:00:00Z",
+          "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+          "shard_key": "s00-of-01",
+          "part_number": 1,
+          "row_count": 2,
+          "schema_version": "market-bars-v2"
+        }
+      ]
+    },
+    {
+      "name": "adjusted-v2",
+      "contract_id": "com06.dataset-manifest",
+      "schema_version": 1,
+      "manifest_id": "10000000-0000-4000-8000-000000000003",
+      "dataset_id": "20000000-0000-4000-8000-000000000002",
+      "revision": 2,
+      "status": "AVAILABLE",
+      "data_layer": "ADJUSTED",
+      "supersedes_manifest_id": "10000000-0000-4000-8000-000000000002",
+      "dataset_hash": "f88653a4a8289167c3a1b789864dc9629361bc35c6820979dd30fb4840ffce57",
+      "schema_id": "market-bars-v2",
+      "period_start": "2024-01-02T14:30:00Z",
+      "period_end": "2024-01-02T15:00:00Z",
+      "available_at": "2024-01-03T02:00:00Z",
+      "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+      "objects": [
+        {
+          "storage_object_id": "30000000-0000-4000-8000-000000000003",
+          "object_key": "market-data/provider=ALPACA/feed=ALPACA_SIP_ADJUSTED_30M/dataset=20000000-0000-4000-8000-000000000002/revision=2/layer=ADJUSTED/resolution=30m/granularity=DAY/partition_start=2024-01-02/partition_end=2024-01-03/shard=s00-of-01/part-00001.parquet",
+          "object_path": "objects/adjusted-v2.parquet",
+          "content_hash": "198cfd7d0bcbaa28f2ed8a96a01b4eab9860bed3000a157436ad0152118ba43d",
+          "object_kind": "PARQUET",
+          "partition_granularity": "DAY",
+          "partition_start": "2024-01-02",
+          "partition_end": "2024-01-03",
+          "period_start": "2024-01-02T14:30:00Z",
+          "period_end": "2024-01-02T15:00:00Z",
+          "instrument_ids": ["11111111-1111-4111-8111-111111111111"],
+          "shard_key": "s00-of-01",
+          "part_number": 1,
+          "row_count": 2,
+          "schema_version": "market-bars-v2"
+        }
+      ]
+    }
+  ],
+  "lineage": [
+    {
+      "derived_manifest_id": "10000000-0000-4000-8000-000000000003",
+      "source_manifest_id": "10000000-0000-4000-8000-000000000002",
+      "relation_type": "SUPERSEDES"
+    }
+  ]
+}
