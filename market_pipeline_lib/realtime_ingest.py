@@ -46,9 +46,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, localcontext
 from typing import Any, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -64,11 +65,13 @@ from .contracts import (
     stable_shard_key,
 )
 from .engine import MarketPipelineEngine
+from .features.calculators import quantize
 from .watermarks import StreamPosition, WatermarkLedger, WatermarkOutcome
 
 __all__ = [
     "DEDUP_SESSION_RETENTION",
     "MARKET_EVENT_SCHEMA_VERSION",
+    "NON_BAR_EVENT_TYPES",
     "BarFieldMap",
     "ConsumerCycle",
     "DrainReport",
@@ -97,6 +100,9 @@ REALTIME_RUN_CODE = "MARKET_DATA_REALTIME_INGEST"
 #: How the contract's own resolution reads as an ISO-8601 duration, so a spec
 #: cannot silently declare `PT1M` for a 30-minute dataset.
 _RESOLUTION_DURATIONS: dict[str, str] = {
+    # C's native cadence (`MarketEventType.BAR_1M`).  Present so `BAR_1M` has a
+    # dataset contract to land in; see `contracts.RAW_1M_FEED`.
+    "1m": "PT1M",
     "30m": "PT30M",
     "1h": "PT1H",
     "4h": "PT4H",
@@ -142,6 +148,28 @@ MARKET_EVENT_FIELDS: tuple[str, ...] = (
 #: whenever its partition is still buffered, and is otherwise republished as the same
 #: row under the same canonical object key.
 DEDUP_SESSION_RETENTION = 2
+
+#: Working precision for the one quantization step in :func:`_number`.  Wide enough
+#: that ``quantize`` is the only rounding a value ever sees, even for a
+#: ``BigDecimal`` C sent with twenty significant digits.
+_DECIMAL_WORKING_PRECISION = 50
+
+#: The two members of C's ``MarketEventType`` that are not bars
+#: (``MarketEventType.java``: ``{QUOTE, TRADE, BAR_1M}``).
+#:
+#: C multiplexes all three types onto one stream, so a bar ingest sees quotes and
+#: trades constantly.  They get their own decision reason, ``NON_BAR_EVENT_TYPE``,
+#: rather than sharing ``EVENT_TYPE_NOT_INGESTED`` with a misrouted bar:
+#:
+#: * a ``QUOTE`` on a bar stream is **normal traffic** -- it carries bid/ask, has no
+#:   OHLCV, and there is no dataset contract in which a quote is a row.  It is
+#:   reported, counted and acknowledged.  Never parked: parking normal traffic would
+#:   fill the dead-letter stream within a second of the opening bell.  Never silently
+#:   dropped either, or an operator could not distinguish "40k quotes correctly
+#:   ignored" from "the feed is dead";
+#: * a ``BAR_30M`` arriving on the 1-minute stream is a **routing mistake**, and
+#:   collapsing the two into one code would hide it.
+NON_BAR_EVENT_TYPES: frozenset[str] = frozenset({"QUOTE", "TRADE"})
 
 
 class RealtimeIngestError(ValueError):
@@ -319,18 +347,48 @@ def _utc(document: Mapping[str, Any], key: str, label: str) -> datetime:
 
 
 def _number(values: Mapping[str, Any], key: str, label: str) -> float:
+    """One bar column, as the parquet schema's `float64`.
+
+    A `Decimal` gets here when the event came off C's Redis stream, where `values`
+    is a `Map<String, BigDecimal>` serialized as JSON number text.  It is quantized
+    *once*, here, through the project's single `precision:1.0.0` quantum -- eight
+    places, ``ROUND_HALF_EVEN`` -- and only then narrowed to `float`.  Going
+    `text -> float -> Decimal` instead would bake a binary-float approximation in
+    before the rounding rule ever ran, which is exactly the precision loss the
+    ``BigDecimal`` on C's side exists to avoid.
+    """
+
     if key not in values:
         raise RealtimeIngestError(f"{label}.values is missing the mapped field {key!r}")
     value = values[key]
+    if isinstance(value, Decimal):
+        with localcontext() as context:
+            context.prec = _DECIMAL_WORKING_PRECISION
+            return float(quantize(value))
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RealtimeIngestError(f"{label}.values.{key} must be numeric, got {type(value).__name__}")
     return float(value)
 
 
 def _integer(values: Mapping[str, Any], key: str, label: str) -> int:
+    """One bar column, as the parquet schema's `int64`.
+
+    A `Decimal` is accepted only when it is a whole number.  `volume` and
+    `trade_count` are counts, so there is no eighth decimal place to round to and
+    a fractional one means the mapping points at the wrong `values` field --
+    truncating it would turn that mistake into a plausible-looking bar.
+    """
+
     if key not in values:
         raise RealtimeIngestError(f"{label}.values is missing the mapped field {key!r}")
     value = values[key]
+    if isinstance(value, Decimal):
+        if value != value.to_integral_value():
+            raise RealtimeIngestError(
+                f"{label}.values.{key} must be a whole number, got {value}; a count "
+                "cannot be fractional and rounding one would invent volume"
+            )
+        return int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         raise RealtimeIngestError(f"{label}.values.{key} must be an integer, got {type(value).__name__}")
     return value
@@ -606,8 +664,23 @@ class RealtimeIngestor:
 
         if parsed.event_type != spec.event_type:
             # A different event type on the same stream is not an error -- this
-            # stream simply does not turn it into a bar.  It is still reported.
-            return _PreparedEvent(parsed, shard_key, rejection="EVENT_TYPE_NOT_INGESTED")
+            # stream simply does not turn it into a bar.  It is still reported, and
+            # the two causes get two codes; see `NON_BAR_EVENT_TYPES`.
+            rejection = (
+                "NON_BAR_EVENT_TYPE"
+                if parsed.event_type in NON_BAR_EVENT_TYPES
+                else "EVENT_TYPE_NOT_INGESTED"
+            )
+            LOGGER.debug(
+                "realtime.event.not_ingested",
+                extra={
+                    "event_id": parsed.event_id,
+                    "event_type": parsed.event_type,
+                    "ingested_event_type": spec.event_type,
+                    "reason": rejection,
+                },
+            )
+            return _PreparedEvent(parsed, shard_key, rejection=rejection)
 
         if parsed.event_id in self._seen_event_ids or parsed.event_id in overlay.event_ids:
             return _PreparedEvent(parsed, shard_key, rejection="DUPLICATE_EVENT")
@@ -1136,6 +1209,47 @@ class RealtimeIngestConsumer:
             report.add(cycle)
             empty = empty + 1 if cycle.received == 0 else 0
         return report
+
+    def shutdown(self) -> RealtimeFlushResult:
+        """Publish everything the loop acknowledged but has not yet written.
+
+        The loop acknowledges a message the moment the ingestor *accepts* it, and an
+        accepted bar sits in the ingestor's buffer until a flush.  Between those two
+        points the queue believes the work is done and nothing durable exists -- so a
+        process that stopped there would lose exactly the rows it had promised to
+        keep.  Closing that window is the whole job of this method, which is why a
+        graceful stop calls it and a crash is what the unflushed-buffer risk is
+        measured against.
+
+        Returns the flush result rather than a boolean: ``NO_CHANGE`` on an idle
+        consumer is a real, reportable outcome and must not read as a success.
+        """
+
+        result: RealtimeFlushResult = self.ingestor.flush()
+        self._since_flush = 0
+        return result
+
+    def run_until_stopped(
+        self,
+        should_stop: Callable[[], bool],
+        *,
+        wait_seconds: float = 1.0,
+    ) -> tuple[DrainReport, RealtimeFlushResult]:
+        """Poll until `should_stop()` answers true, then flush and return.
+
+        `should_stop` is a predicate rather than a flag on this object so the signal
+        can come from wherever the host already keeps it -- ``threading.Event.is_set``
+        satisfies it directly, and so does a supervisor's own shutdown check.
+
+        The check happens *between* cycles, never inside one: a cycle that has already
+        received messages finishes handling them, so a stop can never strand a message
+        that was taken from the queue but neither acknowledged nor made visible again.
+        """
+
+        report = DrainReport()
+        while not should_stop():
+            report.add(self.run_once(wait_seconds=wait_seconds))
+        return report, self.shutdown()
 
 
 def _events_of(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:

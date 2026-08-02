@@ -18,6 +18,7 @@ from market_pipeline_lib.cli import build_parser, execute
 from market_pipeline_lib.contracts import (
     ADJUSTED_FEED,
     DATASET_CONTRACTS,
+    RAW_1M_FEED,
     RAW_FEED,
     InstrumentMapping,
     bar_schema,
@@ -134,10 +135,23 @@ class RevisedAdjustedSource(FakeSource):
 
 
 class MarketPipelineContractTests(unittest.TestCase):
-    def test_all_eight_required_dataset_contracts_are_separate(self):
-        self.assertEqual(len(DATASET_CONTRACTS), 8)
+    def test_all_nine_required_dataset_contracts_are_separate(self):
+        """Two native 30m, six derived, and the 1-minute RAW landing zone for C.
+
+        The ninth is `("raw", "RAW", "1m")`: C's market gateway publishes `BAR_1M`
+        (`MarketEventType.java`), and without a 1-minute contract such a bar has no
+        canonical object key and can never enter compaction.  It is RAW only --
+        nothing produces adjusted 1-minute prices.
+        """
+
+        self.assertEqual(len(DATASET_CONTRACTS), 9)
         self.assertIn(("raw", "RAW", "30m"), DATASET_CONTRACTS)
         self.assertIn(("adjusted", "ADJUSTED", "30m"), DATASET_CONTRACTS)
+        self.assertIn(("raw", "RAW", "1m"), DATASET_CONTRACTS)
+        self.assertNotIn(("adjusted", "ADJUSTED", "1m"), DATASET_CONTRACTS)
+        self.assertEqual(
+            DATASET_CONTRACTS[("raw", "RAW", "1m")].feed_code, RAW_1M_FEED
+        )
         for price_type in ("raw", "adjusted"):
             for resolution in ("1h", "4h", "1d"):
                 self.assertIn(
@@ -343,7 +357,9 @@ class MarketPipelineEndToEndTests(unittest.TestCase):
                 8,
             )
             feeds = {row["code"] for row in catalog.records("market_data.feeds")}
-            self.assertEqual(feeds, {RAW_FEED, ADJUSTED_FEED})
+            # The 1-minute realtime feed is registered by every engine, but a
+            # 30-minute backfill publishes nothing into it.
+            self.assertEqual(feeds, {RAW_FEED, ADJUSTED_FEED, RAW_1M_FEED})
             lineages = catalog.records("market_data.dataset_object_lineage")
             self.assertTrue(lineages)
             self.assertTrue(
@@ -1188,7 +1204,7 @@ def test_publish_dataset_commits_every_row_on_success(postgres_catalog):
 
     assert counts == {
         "market_data.providers": 1,
-        "market_data.feeds": 2,
+        "market_data.feeds": 3,
         "market_data.dataset_manifests": 1,
         "market_data.dataset_objects": 2,
         "storage.objects": 2,
@@ -1229,6 +1245,7 @@ def test_backfill_runs_end_to_end_against_a_postgres_catalog(postgres_catalog):
         assert {row["code"] for row in postgres_catalog.records("market_data.feeds")} == {
             RAW_FEED,
             ADJUSTED_FEED,
+            RAW_1M_FEED,
         }
         lineage = postgres_catalog.records("market_data.dataset_object_lineage")
         assert lineage

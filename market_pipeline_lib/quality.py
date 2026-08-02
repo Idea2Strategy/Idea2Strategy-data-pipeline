@@ -130,7 +130,7 @@ INCIDENT_STATUS_ACTIVE = "ACTIVE"
 #: the standard 6.5-hour XNYS regular session, matching the derived-bar ceiling
 #: already used by the ``source_minutes`` checks -- rather than 24 hours, so a
 #: daily bar's recorded period stays inside its own day partition.
-BAR_SPAN_MINUTES: dict[str, int] = {"30m": 30, "1h": 60, "4h": 240, "1d": 390}
+BAR_SPAN_MINUTES: dict[str, int] = {"1m": 1, "30m": 30, "1h": 60, "4h": 240, "1d": 390}
 
 
 def bar_span(resolution: str) -> pd.Timedelta:
