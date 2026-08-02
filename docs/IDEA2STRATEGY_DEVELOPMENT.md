@@ -11,6 +11,25 @@
 - `storage.objects`, `market_data.dataset_manifests`, `dataset_objects`, `dataset_lineage` 등록
 - 기업행사 후보의 근거 수집과 관리자 검토 연결
 
+## 현재 코드 실체 (2026-08, DP1 이후)
+
+정본 구현은 `market_pipeline_lib/` + `market_pipeline.py` 하나뿐입니다.
+아래 표의 "예정 구조"와 아직 일치하지 않으며, 어느 항목도 완료로 보지
+않습니다.
+
+- 중복 구현이던 `market_data_backfill/`은 삭제했습니다.
+- `idea2strategy-market-loader/`는 정본이 아닙니다. Alpaca 클라이언트와
+  S3 어댑터를 `market_pipeline_lib`로 이관하기 위해서만 남아 있습니다.
+  개인 Flyway 이력(`db/migration/V001__*.sql`), `db/test-init/`,
+  `docker-compose.test.yaml`은 COM07 위반이라 삭제했습니다.
+- 각 repo는 개인 마이그레이션을 두지 않습니다. 스키마 변경은
+  `db/migration-contributions/`에 기여하고 중앙 `backend/db-migration`
+  모듈이 조립합니다. 파일명은
+  `V<YYYYMMDDHHMMSS>__<owner>_<slug>.sql`이며 `V001__` 같은 legacy 번호는
+  사용하지 않습니다.
+- `market_data.pipeline_partitions`는 정본 DBML에 없습니다. 추가하지 않으며
+  market-loader의 해당 의존은 제거했습니다.
+
 권장 예정 구조:
 
 ```text

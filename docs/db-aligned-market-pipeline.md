@@ -33,7 +33,15 @@ MarketDataCatalog
 5. 기존 storage object는 유지합니다.
 
 동일 idempotency key의 성공 실행은 재사용합니다. 실패 실행은 같은 staging
-fragment와 검증 완료 객체를 이용해 재개합니다. Adjusted 정정은 명시적인
+fragment와 검증 완료 객체를 이용해 재개합니다.
+
+**현재 한계**: staging fragment 재사용 판정은 아직 파일 존재 여부만
+확인하므로(`engine.py::collect_staging`) 중간에 종료된 프로세스가 남긴
+잘린 fragment를 그대로 받아들일 수 있습니다. 크기·SHA-256을 검증하는
+헬퍼는 `market_pipeline_lib/resume_verification.py`에 단위 테스트와 함께
+있으나 아직 엔진에 연결하지 않았습니다.
+
+Adjusted 정정은 명시적인
 새 Revision으로 영향 연도와 파생 데이터셋을 다시 생성합니다. 일별 실행은
 최근 10개 완료 세션의 겹치는 Adjusted 값을 재조회합니다. 변경이 감지되면
 보존 중인 Adjusted 연도 전체를 잠재 영향 범위로 보고 자동 백필한 뒤 당일
