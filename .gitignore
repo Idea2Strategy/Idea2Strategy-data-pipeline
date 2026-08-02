@@ -22,6 +22,7 @@ report/history/
 *.parquet
 *.csv
 *.txt
+!requirements-s3-test.txt
 !ticker_info/etf_universe.csv
 !examples/*.csv
 backfill-output/

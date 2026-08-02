@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Callable, Protocol, TypeVar, runtime_checkable
 
 from .contracts import sha256_file
+
+
+_ResultT = TypeVar("_ResultT")
 
 
 @dataclass(frozen=True)
@@ -129,9 +133,15 @@ class S3ObjectStore:
         prefix: str = "",
         endpoint_url: str | None = None,
         client: object | None = None,
+        max_attempts: int = 3,
+        retry_delay_seconds: float = 0.1,
     ) -> None:
         if not bucket:
             raise ValueError("S3 bucket이 필요합니다.")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if retry_delay_seconds < 0:
+            raise ValueError("retry_delay_seconds must not be negative")
         if client is None:
             try:
                 import boto3
@@ -143,6 +153,8 @@ class S3ObjectStore:
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self.max_attempts = max_attempts
+        self.retry_delay_seconds = retry_delay_seconds
 
     def _key(self, object_key: str) -> str:
         normalized = object_key.lstrip("/")
@@ -173,8 +185,49 @@ class S3ObjectStore:
         code, status = cls._error_details(exc)
         return status == 412 or code in {"412", "PreconditionFailed"}
 
+    @classmethod
+    def _is_retryable(cls, exc: Exception) -> bool:
+        code, status = cls._error_details(exc)
+        return status in {429, 500, 502, 503, 504} or code in {
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "InternalError",
+            "RequestTimeout",
+            "RequestTimeoutException",
+            "ServiceUnavailable",
+            "SlowDown",
+            "Throttling",
+            "ThrottlingException",
+        }
+
+    def _retry_delay(self, attempt: int) -> None:
+        delay = self.retry_delay_seconds * (2 ** (attempt - 1))
+        if delay:
+            time.sleep(delay)
+
+    def _call_with_retries(
+        self,
+        operation: Callable[..., _ResultT],
+        **kwargs: Any,
+    ) -> _ResultT:
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return operation(**kwargs)
+            except Exception as exc:
+                if attempt == self.max_attempts or not self._is_retryable(exc):
+                    raise
+                self._retry_delay(attempt)
+        raise AssertionError("retry loop must return or raise")
+
     def _head(self, key: str) -> dict[str, Any]:
-        return self.client.head_object(Bucket=self.bucket, Key=key)
+        return self._call_with_retries(
+            self.client.head_object,
+            Bucket=self.bucket,
+            Key=key,
+        )
 
     def _receipt_from_head(
         self,
@@ -225,28 +278,34 @@ class S3ObjectStore:
                 conflict=True,
             )
 
-        try:
-            with source.open("rb") as body:
-                self.client.put_object(
-                    Bucket=self.bucket,
-                    Key=key,
-                    Body=body,
-                    ContentLength=byte_size,
-                    ContentType="application/vnd.apache.parquet",
-                    IfNoneMatch="*",
-                    Metadata={"sha256": content_hash},
-                )
-        except Exception as exc:
-            if not self._is_precondition_failed(exc):
-                raise
-            raced = self._head(key)
-            return self._receipt_from_head(
-                key=key,
-                expected_hash=content_hash,
-                expected_size=byte_size,
-                head=raced,
-                conflict=True,
-            )
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                # Reopen the body for every attempt. A failed SDK call may have
+                # consumed the stream even when the response never arrived.
+                with source.open("rb") as body:
+                    self.client.put_object(
+                        Bucket=self.bucket,
+                        Key=key,
+                        Body=body,
+                        ContentLength=byte_size,
+                        ContentType="application/vnd.apache.parquet",
+                        IfNoneMatch="*",
+                        Metadata={"sha256": content_hash},
+                    )
+                break
+            except Exception as exc:
+                if self._is_precondition_failed(exc):
+                    raced = self._head(key)
+                    return self._receipt_from_head(
+                        key=key,
+                        expected_hash=content_hash,
+                        expected_size=byte_size,
+                        head=raced,
+                        conflict=True,
+                    )
+                if attempt == self.max_attempts or not self._is_retryable(exc):
+                    raise
+                self._retry_delay(attempt)
         return self._receipt_from_head(
             key=key,
             expected_hash=content_hash,
@@ -265,7 +324,8 @@ class S3ObjectStore:
             raise
 
     def open(self, object_key: str) -> BinaryIO:
-        body = self.client.get_object(
+        body = self._call_with_retries(
+            self.client.get_object,
             Bucket=self.bucket,
             Key=self._key(object_key),
         )["Body"]
