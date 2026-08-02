@@ -33,10 +33,11 @@ import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -70,6 +71,106 @@ _ISO_DURATION = re.compile(r"^P(?!$)(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?$")
 
 class RealtimeWarmupError(ValueError):
     """Raised when a daily warm-up bundle cannot be safely published."""
+
+
+class WarmupBlockReason(StrEnum):
+    """Why a consumer must not start.
+
+    One code per distinguishable cause, because "not ready" is not actionable.  An
+    operator seeing ``D90_WATERMARK_STALE`` restarts an ingest worker; one seeing
+    ``D90_DAILY_OBJECT_MISSING`` goes looking for a session that was never published.
+    A single generic code would send both to the same wrong place.
+    """
+
+    #: No published, AVAILABLE object covers a required shard of a required session.
+    DAILY_OBJECT_MISSING = "D90_DAILY_OBJECT_MISSING"
+    #: A manifest exists for the session but is not AVAILABLE (BUILDING/QUARANTINED/...).
+    MANIFEST_NOT_AVAILABLE = "D90_MANIFEST_NOT_AVAILABLE"
+    #: `market_data.stream_watermarks` has no row for this feed at all.
+    WATERMARK_MISSING = "D90_WATERMARK_MISSING"
+    #: The feed has a watermark but ingestion has not run recently enough.
+    WATERMARK_STALE = "D90_WATERMARK_STALE"
+    #: The feed is live but has not consumed as far as the session it must cover.
+    WATERMARK_BEHIND_SESSION = "D90_WATERMARK_BEHIND_SESSION"
+    #: The feature snapshot batch a consumer pins was never opened.
+    FEATURE_BATCH_MISSING = "D90_FEATURE_BATCH_MISSING"
+    #: The batch exists but has not reached a consumable point in time.
+    FEATURE_BATCH_INCOMPLETE = "D90_FEATURE_BATCH_INCOMPLETE"
+
+
+READY = "READY"
+BLOCKED = "BLOCKED"
+
+#: `market_data.dataset_status` values a warm-up manifest may carry.  C parses this
+#: string into `DatasetManifestStatus` and refuses anything but AVAILABLE
+#: (`StartupWarmupCoordinator.java:67-69`), which is what makes QUARANTINED a block
+#: C already honours without a single line of new Java.
+_READINESS_MANIFEST_STATUS = {READY: "AVAILABLE", BLOCKED: "QUARANTINED"}
+
+
+@dataclass(frozen=True)
+class WarmupReadiness:
+    """The verdict on whether a consumer may start from this session.
+
+    It is a required input to publication rather than something publication decides,
+    so there is no path that writes an ``AVAILABLE`` manifest without someone having
+    evaluated the gate.
+    """
+
+    state: str
+    session_date_et: str
+    feed_id: str
+    evaluated_at: datetime
+    reason_code: str | None = None
+    detail: str | None = None
+    manifest_id: str | None = None
+    observed: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.state not in _READINESS_MANIFEST_STATUS:
+            raise ValueError(
+                f"state must be one of {sorted(_READINESS_MANIFEST_STATUS)}, got {self.state!r}"
+            )
+        if not self.session_date_et:
+            raise ValueError("session_date_et must not be empty")
+        date_type.fromisoformat(self.session_date_et)
+        if not self.feed_id:
+            raise ValueError("feed_id must not be empty")
+        if self.evaluated_at.tzinfo is None or self.evaluated_at.utcoffset() is None:
+            raise ValueError("evaluated_at must be timezone-aware")
+        object.__setattr__(self, "evaluated_at", self.evaluated_at.astimezone(UTC))
+        if self.state == BLOCKED:
+            if not self.reason_code:
+                raise ValueError(
+                    "a BLOCKED verdict must name its reason_code; an unexplained block "
+                    "cannot be acted on and cannot be distinguished from a bug"
+                )
+            if not self.detail:
+                raise ValueError("a BLOCKED verdict must carry a human-readable detail")
+        elif self.reason_code is not None or self.detail is not None:
+            raise ValueError("a READY verdict must not carry a reason_code or detail")
+        object.__setattr__(self, "observed", dict(self.observed))
+
+    @property
+    def blocked(self) -> bool:
+        return self.state == BLOCKED
+
+    @property
+    def manifest_status(self) -> str:
+        return _READINESS_MANIFEST_STATUS[self.state]
+
+    def as_document(self) -> dict[str, Any]:
+        """The ``readiness`` object embedded in the manifest C reads."""
+
+        return {
+            "state": self.state,
+            "reason_code": None if self.reason_code is None else str(self.reason_code),
+            "detail": self.detail,
+            "feed_id": self.feed_id,
+            "session_date_et": self.session_date_et,
+            "evaluated_at": self.evaluated_at.isoformat().replace("+00:00", "Z"),
+            "observed": dict(sorted(self.observed.items())),
+        }
 
 
 @dataclass(frozen=True)
@@ -120,9 +221,9 @@ class FeatureRequirement:
     required_observations: int
 
     def __post_init__(self) -> None:
-        for field in ("requirement_id", "feature_id", "feature_version", "resolution", "value_field"):
-            if not getattr(self, field):
-                raise RealtimeWarmupError(f"{field} must not be empty")
+        for name in ("requirement_id", "feature_id", "feature_version", "resolution", "value_field"):
+            if not getattr(self, name):
+                raise RealtimeWarmupError(f"{name} must not be empty")
         if not _ISO_DURATION.match(self.resolution):
             raise RealtimeWarmupError(
                 f"resolution must be an ISO-8601 duration, got {self.resolution!r}"
@@ -332,6 +433,36 @@ def _object_metadata(
     }
 
 
+def _verify_readiness_binding(manifest: Mapping[str, Any]) -> str:
+    """The manifest's ``status`` must be the one its own verdict implies.
+
+    Without this, a blocked bundle could be edited to ``AVAILABLE`` while still
+    carrying ``state: BLOCKED``, and C -- which reads only ``status`` -- would start
+    on data D had already refused.
+    """
+
+    readiness = manifest.get("readiness")
+    if not isinstance(readiness, Mapping):
+        raise RealtimeWarmupError(
+            "manifest carries no readiness verdict; a bundle with no recorded gate "
+            "decision is indistinguishable from one that was never gated"
+        )
+    state = readiness.get("state")
+    if state not in _READINESS_MANIFEST_STATUS:
+        raise RealtimeWarmupError(f"manifest readiness.state is invalid: {state!r}")
+    expected = _READINESS_MANIFEST_STATUS[str(state)]
+    if manifest.get("status") != expected:
+        raise RealtimeWarmupError(
+            f"manifest status {manifest.get('status')!r} contradicts its readiness "
+            f"verdict {state!r}, which requires {expected!r}"
+        )
+    if state == BLOCKED and not readiness.get("reason_code"):
+        raise RealtimeWarmupError("a BLOCKED manifest readiness must name a reason_code")
+    if state == READY and readiness.get("reason_code") is not None:
+        raise RealtimeWarmupError("a READY manifest readiness must not carry a reason_code")
+    return str(state)
+
+
 def verify_realtime_warmup_bundle(root: Path) -> dict[str, Any]:
     """Verify every declared object and binding before a bundle is consumed."""
     root = root.resolve()
@@ -343,12 +474,21 @@ def verify_realtime_warmup_bundle(root: Path) -> dict[str, Any]:
     if (
         manifest.get("contract_id") != "d90.realtime-warmup-manifest"
         or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
-        or manifest.get("status") != "AVAILABLE"
+        or manifest.get("status") not in set(_READINESS_MANIFEST_STATUS.values())
     ):
         raise RealtimeWarmupError("manifest schema or status is incompatible")
+    state = _verify_readiness_binding(manifest)
     objects = manifest.get("objects")
-    if not isinstance(objects, list) or not objects:
+    if not isinstance(objects, list):
         raise RealtimeWarmupError("manifest objects are missing")
+    if not objects:
+        # A block that had no data to describe.  There is nothing to hash-check, and
+        # C will refuse it on `status` alone.
+        if state != BLOCKED:
+            raise RealtimeWarmupError("an AVAILABLE manifest must declare its objects")
+        if canonical_dataset_hash(()) != manifest.get("dataset_hash"):
+            raise RealtimeWarmupError("dataset hash mismatch")
+        return dict(manifest)
     source_objects = []
     feature_path: Path | None = None
     for index, item in enumerate(objects):
@@ -391,12 +531,17 @@ def publish_realtime_warmup_bundle(
     requirements: Sequence[FeatureRequirement],
     *,
     spec: WarmupPublicationSpec,
+    readiness: WarmupReadiness,
 ) -> RealtimeWarmupBundle:
     """Validate, materialize, and atomically publish one ET session bundle.
 
     The market-events object is written at its canonical key
     (:func:`market_pipeline_lib.contracts.object_key`), so the bundle's layout is
     the object identity rather than a flat file name with a key glued on.
+
+    ``readiness`` is required.  A bundle whose data is all present can still be one a
+    consumer must not start from -- a stale feed, an unconsumable feature batch -- and
+    the only way to make that visible to C is to write it into the manifest C reads.
     """
 
     if not requirements:
@@ -407,6 +552,11 @@ def publish_realtime_warmup_bundle(
     table = _bar_table(bars)
     session = bars[0]["_occurred_at"].astimezone(ET).date()
     session_date = session.isoformat()
+    if readiness.session_date_et != session_date:
+        raise RealtimeWarmupError(
+            f"readiness was evaluated for {readiness.session_date_et} but this bundle "
+            f"covers {session_date}; a verdict about one session says nothing about another"
+        )
     partition_start, partition_end = partition_bounds(session, spec.granularity)
 
     instruments = {event["instrumentId"] for event in bars}
@@ -528,10 +678,11 @@ def publish_realtime_warmup_bundle(
             "manifest_id": manifest_id,
             "dataset_id": dataset_id,
             "revision": spec.revision,
-            "status": "AVAILABLE",
+            "status": readiness.manifest_status,
             "session_date_et": session_date,
             "dataset_hash": dataset_hash,
             "dataset_hash_scope": "MARKET_EVENTS",
+            "readiness": readiness.as_document(),
             "objects": [daily, feature],
         }
         manifest_path = staging / manifest_name
@@ -554,6 +705,67 @@ def publish_realtime_warmup_bundle(
         raise
 
 
+def publish_blocked_warmup_manifest(
+    output: Path,
+    *,
+    spec: WarmupPublicationSpec,
+    readiness: WarmupReadiness,
+) -> Path:
+    """Publish a manifest for a session that produced nothing usable.
+
+    The case the previous D90 had no answer for: when the daily object itself is
+    missing there is no bundle to publish, so D published nothing -- and "nothing" is
+    indistinguishable, from C's side, from "D has not run yet".  Writing a manifest
+    that is structurally valid but ``QUARANTINED`` turns silence into a statement,
+    and C's existing status check (``StartupWarmupCoordinator.java:67-69``) already
+    refuses to start on it.
+    """
+
+    if not readiness.blocked:
+        raise RealtimeWarmupError(
+            "publish_blocked_warmup_manifest writes a QUARANTINED manifest; a READY "
+            "verdict must go through publish_realtime_warmup_bundle with its objects"
+        )
+    session = date_type.fromisoformat(readiness.session_date_et)
+    partition_start, _partition_end = partition_bounds(session, spec.granularity)
+    dataset_id = logical_dataset_id(spec.contract, partition_start.year)
+    dataset_hash = canonical_dataset_hash(())
+    manifest = {
+        "contract_id": "d90.realtime-warmup-manifest",
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "manifest_id": deterministic_uuid(
+            "d90-blocked-manifest",
+            readiness.session_date_et,
+            str(readiness.reason_code),
+            dataset_id,
+        ),
+        "dataset_id": dataset_id,
+        "revision": spec.revision,
+        "status": readiness.manifest_status,
+        "session_date_et": readiness.session_date_et,
+        "dataset_hash": dataset_hash,
+        "dataset_hash_scope": "MARKET_EVENTS",
+        "readiness": readiness.as_document(),
+        "objects": [],
+    }
+
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise RealtimeWarmupError("output must be absent or an empty directory")
+    staging = Path(tempfile.mkdtemp(prefix=".d90b-", dir=output.parent))
+    try:
+        (staging / "manifest.json").write_bytes(_canonical_json(manifest))
+        verify_realtime_warmup_bundle(staging)
+        if output.exists():
+            output.rmdir()
+        os.replace(staging, output)
+    except Exception:
+        shutil.rmtree(long_path(staging), ignore_errors=True)
+        raise
+    return output / "manifest.json"
+
+
 def _required_value(values: Mapping[str, Any], field: str, event_id: str) -> object:
     if field not in values:
         raise RealtimeWarmupError(
@@ -569,6 +781,7 @@ def warmup_bundle_from_source(
     requirements: Sequence[FeatureRequirement],
     *,
     spec: WarmupPublicationSpec,
+    readiness: WarmupReadiness,
     max_empty_cycles: int = 2,
     wait_seconds: float = 1.0,
     max_messages_per_poll: int = 10,
@@ -607,4 +820,5 @@ def warmup_bundle_from_source(
         output,
         requirements,
         spec=spec,
+        readiness=readiness,
     )

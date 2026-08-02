@@ -111,7 +111,8 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "",
         "JSON object configuring the D12/D90 realtime bar consumer. Required keys: "
         "instrument_map_path, price_type, data_layer, resolution, event_type, "
-        "source_resolution, partition_granularity, shard_count, staging_root, value_fields. "
+        "source_provider, source_feed, source_resolution, partition_granularity, "
+        "shard_count, staging_root, value_fields. "
         "Absent means INGEST_REALTIME_BARS commands are refused rather than half-handled.",
     ),
     (
@@ -196,6 +197,13 @@ REALTIME_SETTING_KEYS: tuple[str, ...] = (
     "data_layer",
     "resolution",
     "event_type",
+    # C's own `provider`/`feed` vocabulary, which is NOT D's `feed_code`: the
+    # market-gateway emits `provider="ALPACA"`, `feed="SIP"`
+    # (`AlpacaMarketEventNormalizer.java:16-17`) while D's RAW feed_code is
+    # `ALPACA_SIP_RAW_30M`.  Defaulting either would let another feed's prices be
+    # filed under this dataset, so both are declared.
+    "source_provider",
+    "source_feed",
     "source_resolution",
     "partition_granularity",
     "shard_count",
@@ -218,6 +226,8 @@ class RealtimeIngestSettings:
     data_layer: str
     resolution: str
     event_type: str
+    source_provider: str
+    source_feed: str
     source_resolution: str
     partition_granularity: str
     shard_count: int
@@ -268,6 +278,8 @@ class RealtimeIngestSettings:
             data_layer=_setting_text(document, "data_layer"),
             resolution=_setting_text(document, "resolution"),
             event_type=_setting_text(document, "event_type"),
+            source_provider=_setting_text(document, "source_provider"),
+            source_feed=_setting_text(document, "source_feed"),
             source_resolution=_setting_text(document, "source_resolution"),
             partition_granularity=_setting_text(document, "partition_granularity"),
             shard_count=shard_count,
@@ -280,6 +292,8 @@ class RealtimeIngestSettings:
             "data_layer": self.data_layer,
             "resolution": self.resolution,
             "event_type": self.event_type,
+            "source_provider": self.source_provider,
+            "source_feed": self.source_feed,
             "source_resolution": self.source_resolution,
             "partition_granularity": self.partition_granularity,
             "shard_count": self.shard_count,

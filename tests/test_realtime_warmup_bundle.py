@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -31,6 +32,7 @@ from market_pipeline_lib.realtime_warmup import (
     FeatureRequirement,
     RealtimeWarmupError,
     WarmupPublicationSpec,
+    WarmupReadiness,
     publish_realtime_warmup_bundle,
     verify_realtime_warmup_bundle,
 )
@@ -53,6 +55,26 @@ CANONICAL_EVENTS_KEY = (
     "/granularity=DAY/partition_start=2026-07-31/partition_end=2026-08-01"
     "/shard=s00-of-1/part-00001.parquet"
 )
+
+
+#: The fixture's only ET session.
+FIXTURE_SESSION = "2026-07-31"
+
+
+def ready() -> WarmupReadiness:
+    """A READY verdict for the fixture's session.
+
+    Passed explicitly at every call site rather than defaulted: D90's whole point is
+    that a manifest is ``AVAILABLE`` because a gate said so, and a default would let
+    a bundle be published without anyone having evaluated one.
+    """
+
+    return WarmupReadiness(
+        state="READY",
+        session_date_et=FIXTURE_SESSION,
+        feed_id=RAW_CONTRACT.feed_code,
+        evaluated_at=datetime(2026, 7, 31, 21, 5, tzinfo=UTC),
+    )
 
 
 def requirement(**overrides: object) -> FeatureRequirement:
@@ -85,8 +107,12 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
         document = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
         with TemporaryBundleRoot() as first, TemporaryBundleRoot() as second:
-            left = publish_realtime_warmup_bundle(document, first / "bundle", (requirement(),), spec=SPEC)
-            right = publish_realtime_warmup_bundle(document, second / "bundle", (requirement(),), spec=SPEC)
+            left = publish_realtime_warmup_bundle(
+                document, first / "bundle", (requirement(),), spec=SPEC, readiness=ready()
+            )
+            right = publish_realtime_warmup_bundle(
+                document, second / "bundle", (requirement(),), spec=SPEC, readiness=ready()
+            )
 
             self.assertEqual(left.manifest, right.manifest)
             self.assertEqual(left.manifest["status"], "AVAILABLE")
@@ -119,7 +145,7 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
         document = json.loads(FIXTURE.read_text(encoding="utf-8"))
         with TemporaryBundleRoot() as root:
             bundle = publish_realtime_warmup_bundle(
-                document, root / "bundle", (requirement(),), spec=SPEC
+                document, root / "bundle", (requirement(),), spec=SPEC, readiness=ready()
             )
             keys = {item["object_role"]: item["object_key"] for item in bundle.manifest["objects"]}
             self.assertEqual(keys["MARKET_EVENTS"], CANONICAL_EVENTS_KEY)
@@ -151,6 +177,7 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
                     ),
                 ),
                 spec=spec,
+                readiness=ready(),
             )
             table = pq.read_table(long_path(bundle.daily_object_path))
             self.assertEqual(table.column("event_id").to_pylist(), ["evt_bar_30m"])
@@ -167,6 +194,7 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
                     root / "bundle",
                     (requirement(feature_id="open_interest", value_field="openInterest"),),
                     spec=SPEC,
+                    readiness=ready(),
                 )
 
     def test_an_event_type_with_no_coverage_is_refused(self) -> None:
@@ -174,7 +202,9 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
         spec = WarmupPublicationSpec(contract=RAW_CONTRACT, event_type="BAR_5M", granularity="DAY")
         with TemporaryBundleRoot() as root:
             with self.assertRaisesRegex(RealtimeWarmupError, "BAR_5M"):
-                publish_realtime_warmup_bundle(document, root / "bundle", (requirement(),), spec=spec)
+                publish_realtime_warmup_bundle(
+                    document, root / "bundle", (requirement(),), spec=spec, readiness=ready()
+                )
 
     def test_blocks_publication_when_required_feature_coverage_is_missing(self) -> None:
         document = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -182,7 +212,7 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
             output = root / "bundle"
             with self.assertRaisesRegex(RealtimeWarmupError, "coverage"):
                 publish_realtime_warmup_bundle(
-                    document, output, (requirement(required_observations=2),), spec=SPEC
+                    document, output, (requirement(required_observations=2),), spec=SPEC, readiness=ready()
                 )
             self.assertFalse(output.exists())
 
@@ -191,7 +221,9 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
         document["events"][2]["schemaVersion"] = 2
         with TemporaryBundleRoot() as root:
             with self.assertRaisesRegex(RealtimeWarmupError, "schema"):
-                publish_realtime_warmup_bundle(document, root / "bundle", (requirement(),), spec=SPEC)
+                publish_realtime_warmup_bundle(
+                    document, root / "bundle", (requirement(),), spec=SPEC, readiness=ready()
+                )
 
     def test_applies_the_latest_revision_deterministically(self) -> None:
         document = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -208,18 +240,38 @@ class RealtimeWarmupBundleTest(unittest.TestCase):
 
         with TemporaryBundleRoot() as root:
             bundle = publish_realtime_warmup_bundle(
-                document, root / "bundle", (requirement(),), spec=SPEC
+                document, root / "bundle", (requirement(),), spec=SPEC, readiness=ready()
             )
             table = pq.read_table(long_path(bundle.daily_object_path))
             self.assertEqual(table.num_rows, 1)
             self.assertEqual(table.column("revision").to_pylist(), [1])
             self.assertEqual(table.column("close").to_pylist(), [211.0])
 
+    def test_a_bundle_cannot_be_published_without_a_readiness_verdict(self) -> None:
+        """No default, and no verdict about a different day."""
+
+        document = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        with TemporaryBundleRoot() as root:
+            with self.assertRaises(TypeError):
+                publish_realtime_warmup_bundle(  # type: ignore[call-arg]
+                    document, root / "bundle", (requirement(),), spec=SPEC
+                )
+            other_day = WarmupReadiness(
+                state="READY",
+                session_date_et="2026-07-30",
+                feed_id=RAW_CONTRACT.feed_code,
+                evaluated_at=datetime(2026, 7, 30, 21, 5, tzinfo=UTC),
+            )
+            with self.assertRaisesRegex(RealtimeWarmupError, "2026-07-30"):
+                publish_realtime_warmup_bundle(
+                    document, root / "bundle", (requirement(),), spec=SPEC, readiness=other_day
+                )
+
     def test_verifier_rejects_a_corrupted_published_object(self) -> None:
         document = json.loads(FIXTURE.read_text(encoding="utf-8"))
         with TemporaryBundleRoot() as root:
             output = root / "bundle"
-            bundle = publish_realtime_warmup_bundle(document, output, (requirement(),), spec=SPEC)
+            bundle = publish_realtime_warmup_bundle(document, output, (requirement(),), spec=SPEC, readiness=ready())
             bundle.feature_object_path.write_bytes(
                 bundle.feature_object_path.read_bytes() + b"corrupt"
             )
@@ -247,7 +299,7 @@ class WarmupConsumerTest(unittest.TestCase):
         )
         with TemporaryBundleRoot() as root:
             bundle = warmup_bundle_from_source(
-                source, root / "bundle", (requirement(),), spec=SPEC, wait_seconds=0.0
+                source, root / "bundle", (requirement(),), spec=SPEC, readiness=ready(), wait_seconds=0.0
             )
             self.assertEqual(bundle.manifest["session_date_et"], "2026-07-31")
             self.assertEqual(source.acknowledged, ["m1"])
@@ -260,7 +312,7 @@ class WarmupConsumerTest(unittest.TestCase):
         with TemporaryBundleRoot() as root:
             with self.assertRaises(RealtimeWarmupError):
                 warmup_bundle_from_source(
-                    source, root / "bundle", (requirement(),), spec=SPEC, wait_seconds=0.0
+                    source, root / "bundle", (requirement(),), spec=SPEC, readiness=ready(), wait_seconds=0.0
                 )
 
 

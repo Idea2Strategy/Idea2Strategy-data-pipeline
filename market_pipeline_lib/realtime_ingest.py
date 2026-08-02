@@ -67,10 +67,13 @@ from .engine import MarketPipelineEngine
 from .watermarks import StreamPosition, WatermarkLedger, WatermarkOutcome
 
 __all__ = [
+    "DEDUP_SESSION_RETENTION",
+    "MARKET_EVENT_SCHEMA_VERSION",
     "BarFieldMap",
     "ConsumerCycle",
     "DrainReport",
     "IngestDecision",
+    "MarketEvent",
     "RealtimeDelivery",
     "RealtimeEventSource",
     "RealtimeFlushResult",
@@ -79,6 +82,8 @@ __all__ = [
     "RealtimeIngestSpec",
     "RealtimeIngestor",
     "SqsEventSource",
+    "UnsupportedEventVersion",
+    "parse_market_event",
 ]
 
 LOGGER = logging.getLogger("market_pipeline_lib.realtime_ingest")
@@ -100,19 +105,57 @@ _RESOLUTION_DURATIONS: dict[str, str] = {
 
 _ISO_DURATION = re.compile(r"^P(?!$)(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?$")
 
-_EVENT_FIELDS = (
+#: The only ``schemaVersion`` C's market-gateway emits.
+#: ``AlpacaMarketEventNormalizer.java:15`` -- ``private static final int SCHEMA_VERSION = 1``.
+MARKET_EVENT_SCHEMA_VERSION = 1
+
+#: Every wire field of C's ``MarketEventEnvelope``, in declaration order
+#: (``MarketEventEnvelope.java:10-24``; the literal key names are the ones the
+#: publisher writes, ``RedisMarketEventPublisher.java:50-64``).
+#:
+#: There is no ``metadata`` envelope: C's market event is flat and camelCase.  The
+#: ``metadata``-wrapped, ``sha256:``-prefixed convention of the D-REBUILD-SPEC applies
+#: to the *bot-control* contracts, not to this one.  D is the consumer here, so the
+#: producer's shape wins verbatim.
+MARKET_EVENT_FIELDS: tuple[str, ...] = (
     "eventId",
+    "schemaVersion",
     "instrumentId",
+    "provider",
+    "feed",
     "eventType",
     "providerEventId",
     "occurredAt",
+    "receivedAt",
     "sequence",
+    "revision",
+    "correctionOfEventId",
     "values",
 )
+
+#: How many ET session dates of de-duplication state an ingestor keeps.
+#:
+#: Stated rather than assumed: redelivery de-duplication is keyed on C's
+#: content-addressed ``eventId``, and that set has to be bounded or a long-running
+#: consumer leaks.  Two sessions covers an overnight redelivery and a next-morning
+#: correction; a redelivery older than that is still absorbed by the bar slot key
+#: whenever its partition is still buffered, and is otherwise republished as the same
+#: row under the same canonical object key.
+DEDUP_SESSION_RETENTION = 2
 
 
 class RealtimeIngestError(ValueError):
     """A realtime event, spec or delivery could not be handled."""
+
+
+class UnsupportedEventVersion(RealtimeIngestError):
+    """The event declares a ``schemaVersion`` this build does not implement.
+
+    Separate from a malformed event on purpose.  A newer C deployment raising
+    ``schemaVersion`` is a deployment-ordering fact an operator must see; guessing that
+    version 2 means the same thing as version 1 is how a silently mis-parsed field
+    becomes a wrong bar.
+    """
 
 
 # ------------------------------------------------------------------------------------
@@ -173,6 +216,8 @@ class RealtimeIngestSpec:
 
     contract: DatasetContract
     event_type: str
+    source_provider: str
+    source_feed: str
     source_resolution: str
     partition_granularity: Granularity
     fields: BarFieldMap
@@ -180,6 +225,12 @@ class RealtimeIngestSpec:
     def __post_init__(self) -> None:
         if not self.event_type.strip():
             raise RealtimeIngestError("event_type must name the event this stream ingests")
+        for name in ("source_provider", "source_feed"):
+            if not str(getattr(self, name)).strip():
+                raise RealtimeIngestError(
+                    f"{name} must name the C-side value this stream accepts; C's `provider` "
+                    "and `feed` are its own vocabulary and do not equal D's feed_code"
+                )
         if self.partition_granularity not in PARTITION_GRANULARITIES:
             raise RealtimeIngestError(
                 f"partition_granularity must be one of {list(PARTITION_GRANULARITIES)}, "
@@ -209,13 +260,20 @@ class RealtimeIngestSpec:
 
 @dataclass(frozen=True)
 class IngestDecision:
-    """What the ingestor did with one event."""
+    """What the ingestor did with one event.
+
+    ``reason`` is the ingest decision; ``outcome`` is the *watermark's* separate
+    opinion about the position.  They are deliberately not the same field: a bar can
+    be new (``ACCEPTED_LATE``) while its position is older than the shard head
+    (``STALE``), and collapsing the two is what used to throw the bar away.
+    """
 
     event_id: str
     instrument_id: str
     shard_key: str
     accepted: bool
     reason: str
+    revision: int = 0
     outcome: WatermarkOutcome | None = None
 
 
@@ -278,6 +336,155 @@ def _integer(values: Mapping[str, Any], key: str, label: str) -> int:
     return value
 
 
+@dataclass(frozen=True)
+class MarketEvent:
+    """One parsed ``MarketEventEnvelope``, in Python names.
+
+    Every field C emits is carried: dropping ``revision`` or ``correctionOfEventId``
+    on the way in is how a corrected bar becomes indistinguishable from a duplicate.
+    """
+
+    event_id: str
+    schema_version: int
+    instrument_id: str
+    provider: str
+    feed: str
+    event_type: str
+    provider_event_id: str
+    occurred_at: datetime
+    received_at: datetime
+    sequence: int
+    revision: int
+    correction_of_event_id: str | None
+    values: Mapping[str, Any]
+
+    @property
+    def is_correction(self) -> bool:
+        return self.revision > 0
+
+    def position(self) -> StreamPosition:
+        return StreamPosition(source_event_at=self.occurred_at, sequence=self.sequence)
+
+
+def parse_market_event(event: Mapping[str, Any]) -> MarketEvent:
+    """Validate one event against C's ``MarketEventEnvelope`` and return it typed.
+
+    The invariants are C's own, not ones D invented:
+
+    * ``schemaVersion`` must be exactly :data:`MARKET_EVENT_SCHEMA_VERSION`
+      (``MarketEventEnvelope.java:27-29`` rejects ``< 1``; D additionally refuses a
+      version above the one it implements rather than reading unknown fields);
+    * ``receivedAt`` must not precede ``occurredAt`` (``MarketEventEnvelope.java:37-39``);
+    * ``sequence`` and ``revision`` must be non-negative (``:31-35``);
+    * ``correctionOfEventId`` is ``null`` exactly when ``revision == 0`` (``:46-51``);
+    * ``values`` must be a non-empty object (``:55-63``).
+    """
+
+    if not isinstance(event, Mapping):
+        raise RealtimeIngestError(f"a market event must be an object, got {type(event).__name__}")
+    label = "market event"
+    missing = [name for name in MARKET_EVENT_FIELDS if name not in event]
+    if missing:
+        raise RealtimeIngestError(
+            f"{label} is missing required field(s) {missing}; C emits all of "
+            f"{list(MARKET_EVENT_FIELDS)}"
+        )
+
+    schema_version = event["schemaVersion"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise UnsupportedEventVersion(
+            f"{label}.schemaVersion must be an integer, got {type(schema_version).__name__}"
+        )
+    if schema_version != MARKET_EVENT_SCHEMA_VERSION:
+        raise UnsupportedEventVersion(
+            f"{label}.schemaVersion is {schema_version}; this build implements only "
+            f"{MARKET_EVENT_SCHEMA_VERSION} and will not guess what a different version means"
+        )
+
+    occurred_at = _utc(event, "occurredAt", label)
+    received_at = _utc(event, "receivedAt", label)
+    if received_at < occurred_at:
+        raise RealtimeIngestError(
+            f"{label}.receivedAt {received_at.isoformat()} precedes occurredAt "
+            f"{occurred_at.isoformat()}; C refuses to construct such an envelope"
+        )
+
+    sequence = event["sequence"]
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise RealtimeIngestError(f"{label}.sequence must be a non-negative integer")
+    revision = event["revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise RealtimeIngestError(f"{label}.revision must be a non-negative integer")
+
+    correction = event["correctionOfEventId"]
+    if revision == 0 and correction is not None:
+        raise RealtimeIngestError(
+            f"{label}.correctionOfEventId must be null when revision is 0, got {correction!r}"
+        )
+    if revision > 0 and (not isinstance(correction, str) or not correction.strip()):
+        raise RealtimeIngestError(
+            f"{label}.correctionOfEventId must name the event this revision {revision} corrects"
+        )
+
+    values = event["values"]
+    if not isinstance(values, Mapping) or not values:
+        raise RealtimeIngestError(f"{label}.values must be a non-empty object")
+
+    return MarketEvent(
+        event_id=_text(event, "eventId", label),
+        schema_version=schema_version,
+        instrument_id=_text(event, "instrumentId", label),
+        provider=_text(event, "provider", label),
+        feed=_text(event, "feed", label),
+        event_type=_text(event, "eventType", label),
+        provider_event_id=_text(event, "providerEventId", label),
+        occurred_at=occurred_at,
+        received_at=received_at,
+        sequence=sequence,
+        revision=revision,
+        correction_of_event_id=None if correction is None else str(correction).strip(),
+        values=dict(values),
+    )
+
+
+@dataclass(frozen=True)
+class _BarSlot:
+    """What is already buffered for one ``(instrument, bar_start)``."""
+
+    revision: int
+    event_id: str
+    session: date
+
+
+@dataclass
+class _BatchOverlay:
+    """The effect earlier events of one batch would have, before any is applied.
+
+    Without it, two events of a single message claiming the same bar at the same
+    revision would both validate -- the conflict only appears once the first is
+    written -- and the second would silently overwrite the first.
+    """
+
+    event_ids: set[str] = field(default_factory=set)
+    slots: dict[tuple[str, datetime], _BarSlot] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PreparedEvent:
+    """A validated event, and what applying it would do.
+
+    ``rejection`` and ``row`` are mutually exclusive: a rejected event is reported
+    and changes nothing, an accepted one carries the bar it becomes.
+    """
+
+    parsed: MarketEvent
+    shard_key: str
+    rejection: str | None = None
+    row: dict[str, Any] | None = None
+    session: date | None = None
+    slot_key: tuple[str, datetime] | None = None
+
+
 # ------------------------------------------------------------------------------------
 # The ingestor
 # ------------------------------------------------------------------------------------
@@ -292,17 +499,27 @@ class RealtimeIngestor:
         spec: RealtimeIngestSpec,
         *,
         ledger: WatermarkLedger,
+        dedup_session_retention: int = DEDUP_SESSION_RETENTION,
     ) -> None:
+        if dedup_session_retention < 1:
+            raise RealtimeIngestError("dedup_session_retention must be at least 1")
         self._engine = engine
         self._spec = spec
         self._ledger = ledger
         self._shard_count = engine.config.shard_count
+        self._dedup_session_retention = dedup_session_retention
         self._symbols = {
             mapping.instrument_id: canonical_provider_symbol(mapping.provider_symbol)
             for mapping in engine.mappings.values()
         }
         # (partition_start, partition_end, shard_key) -> {(instrument, bar_start): row}
         self._buffer: dict[tuple[date, date, str], dict[tuple[str, datetime], dict[str, Any]]] = {}
+        # C's `eventId` is a SHA-256 of the event's own content, so it is the exact
+        # identity a redelivery repeats and a correction does not.
+        self._seen_event_ids: dict[str, date] = {}
+        # Survives `flush`, so a correction arriving after its original was published
+        # is still recognised as newer rather than as a rival for the same bar.
+        self._slots: dict[tuple[str, datetime], _BarSlot] = {}
 
     @property
     def spec(self) -> RealtimeIngestSpec:
@@ -318,74 +535,163 @@ class RealtimeIngestor:
 
     # -- ingestion --------------------------------------------------------------
     def submit(self, event: Mapping[str, Any]) -> IngestDecision:
-        """Validate, classify and buffer one provider-neutral market event."""
+        """Validate, classify and buffer one of C's market events.
 
-        if not isinstance(event, Mapping):
-            raise RealtimeIngestError(f"a market event must be an object, got {type(event).__name__}")
-        label = "market event"
-        missing = [name for name in _EVENT_FIELDS if name not in event]
-        if missing:
-            raise RealtimeIngestError(f"{label} is missing required field(s) {missing}")
+        Three separate questions, answered in order, because conflating them is how
+        the previous implementation lost data:
 
-        event_id = _text(event, "eventId", label)
-        instrument_id = _text(event, "instrumentId", label)
-        event_type = _text(event, "eventType", label)
-        occurred_at = _utc(event, "occurredAt", label)
-        sequence = event.get("sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
-            raise RealtimeIngestError(f"{label}.sequence must be a non-negative integer")
+        1. *Is this the same event again?*  Answered by C's content-addressed
+           ``eventId``.  Yes means ``DUPLICATE_EVENT`` -- an at-least-once
+           redelivery, absorbed.
+        2. *Is this a better version of a bar we hold?*  Answered by ``revision``.
+           A higher revision replaces the bar in place (``CORRECTION_APPLIED``); a
+           lower one is ``SUPERSEDED_REVISION``; an equal one from a different event
+           is a genuine conflict and raises.
+        3. *Where has the shard got to?*  Answered by the watermark, which is a
+           freshness projection -- **not** an admission gate.  An event whose
+           position is behind the shard head is still a bar
+           (``ACCEPTED_LATE``); the head simply does not rewind.  C itself
+           publishes out-of-order events rather than dropping them
+           (``MarketEventOrderingProcessor.java:31-34``), so a consumer that
+           dropped them would silently disagree with its producer.
+        """
 
-        symbol = self._symbols.get(instrument_id)
-        if symbol is None:
-            raise RealtimeIngestError(
-                f"{label}.instrumentId {instrument_id} is not in the instrument map; "
-                "an unmapped instrument cannot be sharded or published"
-            )
-        shard_key = stable_shard_key(instrument_id, self._shard_count)
-
-        if event_type != self._spec.event_type:
-            # A different event type on the same stream is not an error -- this
-            # stream simply does not turn it into a bar.  It is still reported.
-            return IngestDecision(
-                event_id=event_id,
-                instrument_id=instrument_id,
-                shard_key=shard_key,
-                accepted=False,
-                reason="EVENT_TYPE_NOT_INGESTED",
-            )
-
-        values = event.get("values")
-        if not isinstance(values, Mapping):
-            raise RealtimeIngestError(f"{label}.values must be an object")
-        row = self._bar_row(instrument_id, symbol, occurred_at, values, label)
-
-        decision = self._ledger.observe(
-            shard_key, StreamPosition(source_event_at=occurred_at, sequence=sequence)
-        )
-        if not decision.should_process:
-            return IngestDecision(
-                event_id=event_id,
-                instrument_id=instrument_id,
-                shard_key=shard_key,
-                accepted=False,
-                reason=decision.outcome.value,
-                outcome=decision.outcome,
-            )
-
-        session_date = occurred_at.astimezone(ET).date()
-        start, end = partition_bounds(session_date, self._spec.partition_granularity)
-        self._buffer.setdefault((start, end, shard_key), {})[(instrument_id, occurred_at)] = row
-        return IngestDecision(
-            event_id=event_id,
-            instrument_id=instrument_id,
-            shard_key=shard_key,
-            accepted=True,
-            reason=decision.outcome.value,
-            outcome=decision.outcome,
-        )
+        return self._commit(self._prepare(event, _BatchOverlay()))
 
     def submit_batch(self, events: Iterable[Mapping[str, Any]]) -> list[IngestDecision]:
-        return [self.submit(event) for event in events]
+        """Ingest a whole queue message, all of it or none of it.
+
+        One SQS message carries many events, and a message is acknowledged, retried
+        or parked *as a unit*.  Buffering the events before the bad one and then
+        parking the message left those bars in the buffer with nothing left to
+        acknowledge them -- they would be published as if they had been delivered
+        cleanly, and the redelivered message would then be a conflicting second
+        claim on the same bars.  So validation happens for every event first, and
+        the first refusal leaves this ingestor exactly as it was.
+        """
+
+        overlay = _BatchOverlay()
+        prepared = [self._prepare(event, overlay) for event in events]
+        return [self._commit(item) for item in prepared]
+
+    def _prepare(self, event: Mapping[str, Any], overlay: _BatchOverlay) -> _PreparedEvent:
+        """Decide everything that can fail, without mutating this ingestor.
+
+        ``overlay`` carries the effect of earlier events in the same batch, so two
+        events of one message are judged against each other as well as against what
+        is already buffered.
+        """
+
+        parsed = parse_market_event(event)
+        spec = self._spec
+        if parsed.provider != spec.source_provider:
+            raise RealtimeIngestError(
+                f"market event.provider {parsed.provider!r} is not the provider this stream "
+                f"ingests ({spec.source_provider!r}); routing it here would file another "
+                "provider's prices under this dataset"
+            )
+        if parsed.feed != spec.source_feed:
+            raise RealtimeIngestError(
+                f"market event.feed {parsed.feed!r} is not the feed this stream ingests "
+                f"({spec.source_feed!r}); its watermark belongs to a different shard set"
+            )
+
+        symbol = self._symbols.get(parsed.instrument_id)
+        if symbol is None:
+            raise RealtimeIngestError(
+                f"market event.instrumentId {parsed.instrument_id} is not in the instrument "
+                "map; an unmapped instrument cannot be sharded or published"
+            )
+        shard_key = stable_shard_key(parsed.instrument_id, self._shard_count)
+
+        if parsed.event_type != spec.event_type:
+            # A different event type on the same stream is not an error -- this
+            # stream simply does not turn it into a bar.  It is still reported.
+            return _PreparedEvent(parsed, shard_key, rejection="EVENT_TYPE_NOT_INGESTED")
+
+        if parsed.event_id in self._seen_event_ids or parsed.event_id in overlay.event_ids:
+            return _PreparedEvent(parsed, shard_key, rejection="DUPLICATE_EVENT")
+
+        slot_key = (parsed.instrument_id, parsed.occurred_at)
+        held = overlay.slots.get(slot_key) or self._slots.get(slot_key)
+        if held is not None:
+            if parsed.revision < held.revision:
+                return _PreparedEvent(parsed, shard_key, rejection="SUPERSEDED_REVISION")
+            if parsed.revision == held.revision:
+                raise RealtimeIngestError(
+                    f"market event {parsed.event_id} conflicts with {held.event_id}: both claim "
+                    f"instrument {parsed.instrument_id} at {parsed.occurred_at.isoformat()} at "
+                    f"revision {parsed.revision}. Two different events for one bar at one "
+                    "revision cannot both be true, and picking one would be a silent guess"
+                )
+
+        session_date = parsed.occurred_at.astimezone(ET).date()
+        row = self._bar_row(parsed.instrument_id, symbol, parsed.occurred_at, parsed.values, "market event")
+        overlay.event_ids.add(parsed.event_id)
+        overlay.slots[slot_key] = _BarSlot(
+            revision=parsed.revision, event_id=parsed.event_id, session=session_date
+        )
+        return _PreparedEvent(parsed, shard_key, row=row, session=session_date, slot_key=slot_key)
+
+    def _commit(self, prepared: _PreparedEvent) -> IngestDecision:
+        """Apply a prepared event.  Nothing here may raise, and nothing here decides."""
+
+        parsed = prepared.parsed
+        if prepared.rejection is not None:
+            return self._decision(parsed, prepared.shard_key, False, prepared.rejection)
+
+        assert prepared.row is not None  # noqa: S101 - guaranteed by `_prepare`
+        assert prepared.session is not None  # noqa: S101
+        assert prepared.slot_key is not None  # noqa: S101
+        session_date = prepared.session
+        self._retain(session_date)
+
+        decision = self._ledger.observe(prepared.shard_key, parsed.position())
+        start, end = partition_bounds(session_date, self._spec.partition_granularity)
+        self._buffer.setdefault((start, end, prepared.shard_key), {})[prepared.slot_key] = prepared.row
+        self._slots[prepared.slot_key] = _BarSlot(
+            revision=parsed.revision, event_id=parsed.event_id, session=session_date
+        )
+        self._seen_event_ids[parsed.event_id] = session_date
+
+        if parsed.is_correction:
+            reason = "CORRECTION_APPLIED"
+        elif decision.outcome is WatermarkOutcome.ADVANCED:
+            reason = "ACCEPTED_NEW"
+        else:
+            reason = "ACCEPTED_LATE"
+        return self._decision(parsed, prepared.shard_key, True, reason, outcome=decision.outcome)
+
+    @staticmethod
+    def _decision(
+        parsed: MarketEvent,
+        shard_key: str,
+        accepted: bool,
+        reason: str,
+        *,
+        outcome: WatermarkOutcome | None = None,
+    ) -> IngestDecision:
+        return IngestDecision(
+            event_id=parsed.event_id,
+            instrument_id=parsed.instrument_id,
+            shard_key=shard_key,
+            accepted=accepted,
+            reason=reason,
+            revision=parsed.revision,
+            outcome=outcome,
+        )
+
+    def _retain(self, session: date) -> None:
+        """Drop de-duplication state older than the retention window."""
+
+        sessions = {session, *self._seen_event_ids.values(), *(slot.session for slot in self._slots.values())}
+        if len(sessions) <= self._dedup_session_retention:
+            return
+        keep = set(sorted(sessions)[-self._dedup_session_retention :])
+        self._seen_event_ids = {
+            event_id: seen for event_id, seen in self._seen_event_ids.items() if seen in keep
+        }
+        self._slots = {key: slot for key, slot in self._slots.items() if slot.session in keep}
 
     def _bar_row(
         self,
@@ -710,11 +1016,16 @@ class RealtimeIngestConsumer:
     Delivery policy, stated once:
 
     * a body that is not ``{"events": [...]}``, or an event the ingestor refuses
-      to parse, is **parked immediately** -- another delivery cannot fix it;
+      to parse, is **parked immediately** -- another delivery cannot fix it.  An
+      event declaring a ``schemaVersion`` this build does not implement is parked
+      under its own reason, ``UNSUPPORTED_EVENT_VERSION``: it means C was deployed
+      ahead of D, which an operator fixes by shipping D, not by fixing a payload;
     * any other failure is **retried** until ``receive_count`` reaches
       ``max_receive_count``, then parked with ``MAX_RECEIVES_EXCEEDED``;
     * a handled message is acknowledged, and redelivery of one already handled is
-      absorbed by the watermark rather than duplicating a row.
+      absorbed by the ingestor's de-duplication rather than duplicating a row;
+    * a message is ingested **whole or not at all** -- see
+      :meth:`RealtimeIngestor.submit_batch`.
     """
 
     ingestor: Any
@@ -753,7 +1064,17 @@ class RealtimeIngestConsumer:
                 continue
 
             try:
-                decisions = [self.ingestor.submit(event) for event in events]
+                # Atomic: nothing is buffered unless every event in the message is
+                # acceptable, so a parked message leaves no half-ingested session.
+                decisions = self.ingestor.submit_batch(events)
+            except UnsupportedEventVersion as error:
+                self.source.dead_letter(delivery, reason="UNSUPPORTED_EVENT_VERSION")
+                dead_lettered += 1
+                LOGGER.error(
+                    "realtime.message.parked",
+                    extra={"message_id": delivery.message_id, "reason": str(error)},
+                )
+                continue
             except RealtimeIngestError as error:
                 self.source.dead_letter(delivery, reason="MALFORMED_EVENT")
                 dead_lettered += 1
