@@ -69,7 +69,7 @@ class FakeS3Client:
         return {"Body": io.BytesIO(payload)}
 
 
-def write_small_parquet(path: Path) -> Path:
+def write_small_parquet(path: Path, *, price_offset: float = 0.0) -> Path:
     """Write a deterministic two-row market-bars object for adapter tests."""
 
     timestamps = pa.array(
@@ -92,10 +92,18 @@ def write_small_parquet(path: Path) -> Path:
             "session_date_et": pa.array(
                 [date(2024, 1, 2), date(2024, 1, 2)], type=pa.date32()
             ),
-            "open": pa.array([100.0, 101.0], type=pa.float64()),
-            "high": pa.array([102.0, 103.0], type=pa.float64()),
-            "low": pa.array([99.0, 100.0], type=pa.float64()),
-            "close": pa.array([101.0, 102.0], type=pa.float64()),
+            "open": pa.array(
+                [100.0 + price_offset, 101.0 + price_offset], type=pa.float64()
+            ),
+            "high": pa.array(
+                [102.0 + price_offset, 103.0 + price_offset], type=pa.float64()
+            ),
+            "low": pa.array(
+                [99.0 + price_offset, 100.0 + price_offset], type=pa.float64()
+            ),
+            "close": pa.array(
+                [101.0 + price_offset, 102.0 + price_offset], type=pa.float64()
+            ),
             "volume": pa.array([1000, 1200], type=pa.int64()),
         }
     )

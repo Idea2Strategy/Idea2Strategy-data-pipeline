@@ -1,0 +1,12 @@
+{
+  "fixture_set_id": "com-d1.dataset-objects.missing-object",
+  "fixture_set_version": 1,
+  "base_fixture": "../fixture.json",
+  "object_overrides": [
+    {
+      "manifest": "raw-v1",
+      "object_index": 0,
+      "object_path": "objects/missing.parquet"
+    }
+  ]
+}
