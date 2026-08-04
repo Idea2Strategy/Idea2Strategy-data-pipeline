@@ -199,25 +199,53 @@ class CorporateActionReviewService:
 
     def apply_approval_result(self, result: ApprovalResult) -> DecisionOutcome:
         """Apply an authenticated relay result and persist its durable audit facts."""
-        if self._approval_verifier is None:
-            raise ApprovalRefusedError(
-                "APPROVAL_PROVIDER_UNWIRED",
-                "approval provider is unwired; refusing instead of reporting zero approvals",
-            )
-        self._approval_verifier.verify(result)
-        row = self._row_for_record_id(result.candidate_id)
+        try:
+            if self._approval_verifier is None:
+                raise ApprovalRefusedError(
+                    "APPROVAL_PROVIDER_UNWIRED",
+                    "approval provider is unwired; refusing instead of reporting zero approvals",
+                )
+            self._approval_verifier.verify(result)
+            if self._regenerator is None:
+                raise RegeneratorNotConfiguredError(
+                    "approval effects require an adjusted-dataset regenerator"
+                )
+            bind_catalog = getattr(self._regenerator, "with_catalog", None)
+            transaction = getattr(self._catalog, "transaction", None)
+            if not callable(bind_catalog) or not callable(transaction):
+                raise ApprovalRefusedError(
+                    "APPROVAL_TRANSACTION_UNAVAILABLE",
+                    "candidate transitions and regeneration require one catalog transaction",
+                )
+            with transaction() as catalog:
+                scoped = CorporateActionReviewService(
+                    catalog=catalog,
+                    regenerator=bind_catalog(catalog),
+                    raw_manifest_id=self._raw_manifest_id,
+                    adjusted_feed_id=self._adjusted_feed_id,
+                    approval_verifier=self._approval_verifier,
+                )
+                return scoped._apply_verified_result(result)
+        except ApprovalRefusedError as error:
+            self._record_refusal(result, error.code)
+            raise
+
+    def _apply_verified_result(self, result: ApprovalResult) -> DecisionOutcome:
+        try:
+            row = self._row_for_record_id(result.candidate_id)
+        except UnknownCandidateError as error:
+            raise ApprovalRefusedError("UNKNOWN_CANDIDATE", str(error)) from error
 
         prior = list(row["terms_document"].get("review_history", []))
         delivery = str(result.delivery_id)
         for entry in prior:
-            if entry.get("delivery_id") == delivery:
-                if (
-                    entry.get("candidate_id") == str(result.candidate_id)
-                    and entry.get("decided_content_hash") == result.decided_content_hash
-                    and entry.get("decision") == result.decision.value
-                ):
+            if entry.get("delivery_id") == delivery and entry.get("state") != "REFUSED":
+                if entry.get("envelope_hash") == result.envelope_hash:
                     return DecisionOutcome(str(result.candidate_id), self._state(row), None)
-                raise ApprovalRefusedError("DELIVERY_ID_CONFLICT", "deliveryId was reused with different content")
+                raise ApprovalRefusedError(
+                    "DELIVERY_ID_CONFLICT",
+                    "deliveryId was reused with a different protected envelope",
+                )
 
         latest_sequence = max(
             (
@@ -239,8 +267,7 @@ class CorporateActionReviewService:
         }
         if not set(result.evidence_bindings).issubset(evidence):
             self._refuse(row, result, "UNBOUND_EVIDENCE")
-        if self._regenerator is None:
-            raise RegeneratorNotConfiguredError("approval effects require an adjusted-dataset regenerator")
+        assert self._regenerator is not None
 
         target_state: ReviewState
         if result.decision is DecisionType.WITHDRAW:
@@ -296,6 +323,7 @@ class CorporateActionReviewService:
             "request_schema_version": result.request_schema_version,
             "decided_at": result.decided_at.isoformat().replace("+00:00", "Z"),
             "delivery_id": str(result.delivery_id),
+            "envelope_hash": result.envelope_hash,
             "aggregate_sequence": result.aggregate_sequence,
             "supersedes_candidate_id": (
                 None if result.supersedes_candidate_id is None else str(result.supersedes_candidate_id)
@@ -307,19 +335,30 @@ class CorporateActionReviewService:
         self._catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
 
     def _refuse(self, row: Mapping[str, Any], result: ApprovalResult, code: str) -> None:
-        document = dict(row["terms_document"])
-        refused = {
-            "state": "REFUSED",
-            "reason_code": code,
-            "candidate_id": str(result.candidate_id),
-            "delivery_id": str(result.delivery_id),
-            "audit_id": str(result.audit_id),
-            "aggregate_sequence": result.aggregate_sequence,
-            "recorded_at": result.decided_at.isoformat().replace("+00:00", "Z"),
-        }
-        document["review_history"] = [*document.get("review_history", []), refused]
-        self._catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
         raise ApprovalRefusedError(code, f"corporate-action approval refused: {code}")
+
+    def _record_refusal(self, result: ApprovalResult, code: str) -> None:
+        transaction = getattr(self._catalog, "transaction", None)
+        if not callable(transaction):
+            return
+        with transaction() as catalog:
+            rows = catalog.records(CORPORATE_ACTIONS_TABLE)
+            row = next((item for item in rows if str(item["id"]) == str(result.candidate_id)), None)
+            if row is None:
+                return
+            document = dict(row["terms_document"])
+            refused = {
+                "state": "REFUSED",
+                "reason_code": code,
+                "candidate_id": str(result.candidate_id),
+                "delivery_id": str(result.delivery_id),
+                "envelope_hash": result.envelope_hash,
+                "audit_id": str(result.audit_id),
+                "aggregate_sequence": result.aggregate_sequence,
+                "recorded_at": result.decided_at.isoformat().replace("+00:00", "Z"),
+            }
+            document["review_history"] = [*document.get("review_history", []), refused]
+            catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
 
     def _approved_for_same_subject(self, row: Mapping[str, Any]) -> list[dict[str, Any]]:
         return [

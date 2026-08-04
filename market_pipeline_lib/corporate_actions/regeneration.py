@@ -122,6 +122,14 @@ class AdjustedDatasetRegenerator:
         self._reader = reader
         self._writer = writer
 
+    def with_catalog(self, catalog: RegenerationCatalog) -> AdjustedDatasetRegenerator:
+        """Bind regeneration writes to the caller's active catalog transaction."""
+        return AdjustedDatasetRegenerator(
+            catalog=catalog,
+            reader=self._reader,
+            writer=self._writer,
+        )
+
     def regenerate(
         self,
         *,

@@ -8,6 +8,8 @@ by :class:`market_pipeline_lib.corporate_actions.service.CorporateActionReviewSe
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -109,6 +111,28 @@ class ApprovalResult:
             raise ApprovalRefusedError("DECIDED_AT_INVALID", "decidedAt must be timezone-aware UTC")
         if self.aggregate_sequence < 1:
             raise ApprovalRefusedError("AGGREGATE_SEQUENCE_INVALID", "aggregateSequence must be positive")
+
+    @property
+    def envelope_hash(self) -> str:
+        document = {
+            "candidateId": str(self.candidate_id),
+            "decision": self.decision.value,
+            "decidedContentHash": self.decided_content_hash,
+            "evidenceBindings": list(self.evidence_bindings),
+            "actorId": str(self.actor_id),
+            "auditId": str(self.audit_id),
+            "permissionId": str(self.permission_id),
+            "requestSchemaVersion": self.request_schema_version,
+            "decidedAt": self.decided_at.isoformat().replace("+00:00", "Z"),
+            "supersedesCandidateId": (
+                None if self.supersedes_candidate_id is None else str(self.supersedes_candidate_id)
+            ),
+            "deliveryId": str(self.delivery_id),
+            "aggregateSequence": self.aggregate_sequence,
+            "rationale": self.rationale,
+        }
+        encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> ApprovalResult:

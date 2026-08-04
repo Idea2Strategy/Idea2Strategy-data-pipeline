@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
@@ -42,6 +45,15 @@ class Catalog:
                 return
         self.rows.append(record)
 
+    @contextmanager
+    def transaction(self):  # type: ignore[no-untyped-def]
+        snapshot = deepcopy(self.rows)
+        try:
+            yield self
+        except Exception:
+            self.rows = snapshot
+            raise
+
 
 class Operators:
     def __init__(self, active: bool = True) -> None:
@@ -62,8 +74,14 @@ class Audits:
 class Regenerator:
     def __init__(self) -> None:
         self.calls = 0
+        self.fail = False
+
+    def with_catalog(self, catalog: Catalog) -> Regenerator:
+        return self
 
     def regenerate(self, **_: object) -> object:
+        if self.fail:
+            raise RuntimeError("injected regeneration failure")
         self.calls += 1
         return SimpleNamespace(created=True, revision_number=self.calls)
 
@@ -161,6 +179,24 @@ class CorporateActionProviderResultTest(unittest.TestCase):
         self.assertEqual(regenerator.calls, 1)
         self.assertEqual(len(catalog.rows[0]["terms_document"]["review_history"]), 1)  # type: ignore[index]
 
+    def test_duplicate_identity_covers_the_entire_protected_envelope(self) -> None:
+        service, catalog, regenerator = self.service([row()])
+        accepted = result()
+        service.apply_approval_result(accepted)
+
+        tampered = replace(
+            accepted,
+            rationale="changed after the delivery was accepted",
+        )
+        with self.assertRaises(ApprovalRefusedError) as conflict:
+            service.apply_approval_result(tampered)
+
+        self.assertEqual(conflict.exception.code, "DELIVERY_ID_CONFLICT")
+        self.assertEqual(regenerator.calls, 1)
+        history = catalog.rows[0]["terms_document"]["review_history"]  # type: ignore[index]
+        self.assertEqual([entry["state"] for entry in history], ["APPROVED", "REFUSED"])
+        self.assertNotEqual(history[0]["envelope_hash"], history[1]["envelope_hash"])
+
     def test_withdrawal_is_an_event_and_regenerates_forward(self) -> None:
         service, catalog, regenerator = self.service([row()])
         service.apply_approval_result(result())
@@ -195,6 +231,21 @@ class CorporateActionProviderResultTest(unittest.TestCase):
         self.assertEqual(states[str(PRIOR)], "SUPERSEDED")
         self.assertEqual(states[str(CANDIDATE)], "APPROVED")
         self.assertEqual(regenerator.calls, 1)
+
+    def test_supersede_rolls_back_both_transitions_when_regeneration_fails(self) -> None:
+        service, catalog, regenerator = self.service([row(PRIOR, state="APPROVED"), row()])
+        regenerator.fail = True
+        named = result(supersedes=PRIOR)
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            service.apply_approval_result(named)
+
+        states = {
+            str(item["id"]): item["terms_document"]["review"]["state"]  # type: ignore[index]
+            for item in catalog.rows
+        }
+        self.assertEqual(states[str(PRIOR)], "APPROVED")
+        self.assertEqual(states[str(CANDIDATE)], "REVIEW_REQUIRED")
 
 
 if __name__ == "__main__":
