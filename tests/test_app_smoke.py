@@ -230,6 +230,39 @@ class WorkerConfigurationTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 WorkerConfig.from_environment(environment)
 
+    def test_corporate_action_production_wiring_requires_database_and_parses_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            approval = json.dumps(
+                {
+                    "adjusted_feed_id": "10000000-0000-4000-8000-000000000011",
+                    "permission_id": "20000000-0000-4000-8000-000000000012",
+                    "request_schema_version": "schema-v1",
+                    "object_bucket": "pipeline-dev",
+                    "object_prefix": "corporate-actions",
+                    "staging_root": str(root / "staging"),
+                }
+            )
+            with self.assertRaises(ConfigurationError) as missing_database:
+                WorkerConfig.from_environment(
+                    _environment(root, PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL=approval)
+                )
+            self.assertIn("PIPELINE_WORKER_DATABASE_URL", str(missing_database.exception))
+
+            config = WorkerConfig.from_environment(
+                _environment(
+                    root,
+                    PIPELINE_WORKER_DATABASE_URL="postgresql+psycopg://pipeline:secret@db/i2s",
+                    PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL=approval,
+                )
+            )
+            assert config.corporate_action_approval is not None
+            self.assertEqual(
+                str(config.corporate_action_approval.permission_id),
+                "20000000-0000-4000-8000-000000000012",
+            )
+            self.assertNotIn("secret", str(config.describe()))
+
     def test_realtime_settings_missing_a_field_abort_boot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

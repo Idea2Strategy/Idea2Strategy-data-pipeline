@@ -83,6 +83,7 @@ class Regenerator:
         self.calls = 0
         self.fail = False
         self.catalog: Catalog | None = None
+        self.raw_manifest_ids: list[str] = []
 
     def with_catalog(self, catalog: Catalog) -> Regenerator:
         self.catalog = catalog
@@ -93,11 +94,12 @@ class Regenerator:
         with self.catalog.transaction():
             return self.regenerate_in_transaction()
 
-    def regenerate_in_transaction(self, **_: object) -> object:
+    def regenerate_in_transaction(self, **values: object) -> object:
         assert self.catalog is not None and self.catalog.transaction_active
         if self.fail:
             raise RuntimeError("injected regeneration failure")
         self.calls += 1
+        self.raw_manifest_ids.append(str(values["raw_manifest_id"]))
         return SimpleNamespace(created=True, revision_number=self.calls)
 
 
@@ -107,6 +109,7 @@ def row(candidate: UUID = CANDIDATE, *, state: str = "REVIEW_REQUIRED") -> dict[
         "instrument_id": "instrument-1",
         "action_type": "STOCK_SPLIT",
         "effective_at": "2026-08-15T00:00:00Z",
+        "source_manifest_id": "raw",
         "terms_hash": HASH,
         "terms_document": {
             "terms": {"from_shares": "1", "to_shares": "2"},
@@ -231,6 +234,26 @@ class CorporateActionProviderResultTest(unittest.TestCase):
         self.assertEqual(second.state, ReviewState.APPROVED)
         self.assertEqual(regenerator.calls, 1)
         self.assertEqual(len(catalog.rows[0]["terms_document"]["review_history"]), 1)  # type: ignore[index]
+
+    def test_each_candidate_regenerates_from_its_own_canonical_source_manifest(self) -> None:
+        second = UUID("10000000-0000-4000-8000-000000000099")
+        first_row = row()
+        first_row["source_manifest_id"] = "raw-manifest-a"
+        second_row = row(second)
+        second_row["source_manifest_id"] = "raw-manifest-b"
+        second_row["effective_at"] = "2026-09-15T00:00:00Z"
+        service, _, regenerator = self.service([first_row, second_row])
+
+        service.apply_approval_result(result())
+        service.apply_approval_result(
+            result(
+                candidate=second,
+                delivery=UUID("40000000-0000-4000-8000-000000000099"),
+                sequence=2,
+            )
+        )
+
+        self.assertEqual(regenerator.raw_manifest_ids, ["raw-manifest-a", "raw-manifest-b"])
 
     def test_duplicate_identity_covers_the_entire_protected_envelope(self) -> None:
         service, catalog, regenerator = self.service([row()])

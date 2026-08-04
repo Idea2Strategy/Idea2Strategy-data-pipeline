@@ -553,7 +553,7 @@ def apply_catalog_to_postgres(
     database_url: str | None = None,
     rights_attestations: dict[str, RightsAttestation] | None = None,
     rights_attestations_path: Path | None = None,
-    storage_objects: StorageObjectsPolicy = StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION,
+    storage_objects: StorageObjectsPolicy = StorageObjectsPolicy.WRITE_D_OWNED,
 ) -> dict[str, Any]:
     """Validate the DBML contract and optionally apply it in one transaction.
 

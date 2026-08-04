@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from apps.common.errors import ConfigurationError
 
@@ -86,6 +87,14 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "",
         "PostgreSQL URL used for durable realtime watermarks. Empty keeps the local "
         "in-memory repository for development only.",
+    ),
+    (
+        "PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL",
+        False,
+        "",
+        "JSON production wiring for approval consumption. Required keys: adjusted_feed_id, "
+        "permission_id, request_schema_version, object_bucket, object_prefix, "
+        "staging_root. Requires PIPELINE_WORKER_DATABASE_URL.",
     ),
     (
         "PIPELINE_WORKER_MAX_RECEIVE_COUNT",
@@ -173,6 +182,50 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "and removed on shutdown, so a container probe can read it.",
     ),
 )
+
+
+@dataclass(frozen=True)
+class CorporateActionApprovalSettings:
+    adjusted_feed_id: str
+    permission_id: UUID
+    request_schema_version: str
+    object_bucket: str
+    object_prefix: str
+    staging_root: Path
+
+    @classmethod
+    def parse(cls, raw: str) -> CorporateActionApprovalSettings:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ConfigurationError(
+                "PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL must be a JSON object"
+            ) from error
+        if not isinstance(value, dict):
+            raise ConfigurationError("PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL must be a JSON object")
+        required = {
+            "adjusted_feed_id", "permission_id", "request_schema_version",
+            "object_bucket", "object_prefix", "staging_root",
+        }
+        missing = sorted(key for key in required if not str(value.get(key, "")).strip())
+        if missing:
+            raise ConfigurationError(
+                f"PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL missing keys: {missing}"
+            )
+        try:
+            permission_id = UUID(str(value["permission_id"]))
+        except ValueError as error:
+            raise ConfigurationError(
+                "PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL.permission_id must be a UUID"
+            ) from error
+        return cls(
+            adjusted_feed_id=str(value["adjusted_feed_id"]).strip(),
+            permission_id=permission_id,
+            request_schema_version=str(value["request_schema_version"]).strip(),
+            object_bucket=str(value["object_bucket"]).strip(),
+            object_prefix=str(value["object_prefix"]).strip().strip("/"),
+            staging_root=Path(str(value["staging_root"]).strip()),
+        )
 
 
 def _blank(value: str | None) -> bool:
@@ -349,6 +402,7 @@ class WorkerConfig:
     realtime: RealtimeIngestSettings | None
     exit_after_idle_polls: int = 0
     database_url: str | None = None
+    corporate_action_approval: CorporateActionApprovalSettings | None = None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -407,6 +461,15 @@ class WorkerConfig:
         endpoint_raw = values.get("PIPELINE_WORKER_AWS_ENDPOINT_URL")
         database_url_raw = values.get("PIPELINE_WORKER_DATABASE_URL")
         realtime_raw = values.get("PIPELINE_WORKER_REALTIME_INGEST")
+        approval_raw = values.get("PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL")
+        approval = (
+            None if _blank(approval_raw) else CorporateActionApprovalSettings.parse(str(approval_raw))
+        )
+        if approval is not None and _blank(database_url_raw):
+            raise ConfigurationError.missing(
+                ["PIPELINE_WORKER_DATABASE_URL"],
+                hint="required by PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL",
+            )
 
         return cls(
             environment=values["PIPELINE_WORKER_ENVIRONMENT"].strip(),
@@ -422,6 +485,7 @@ class WorkerConfig:
                 if _blank(database_url_raw)
                 else str(database_url_raw).strip()
             ),
+            corporate_action_approval=approval,
             log_level=log_level,
             poll_interval_seconds=_require_float(
                 values, "PIPELINE_WORKER_POLL_INTERVAL_SECONDS", "1.0", minimum=0.001
@@ -478,6 +542,7 @@ class WorkerConfig:
             "aws_endpoint_override": self.aws_endpoint_url is not None,
             "aws_region": self.aws_region,
             "database_configured": self.database_url is not None,
+            "corporate_action_approval_configured": self.corporate_action_approval is not None,
             "log_level": self.log_level,
             "poll_interval_seconds": self.poll_interval_seconds,
             "max_messages_per_poll": self.max_messages_per_poll,

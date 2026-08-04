@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
-from ..contracts import deterministic_uuid
+from ..contracts import canonical_dataset_hash, deterministic_uuid
 from .adjustment import ApprovedAction, Bar, adjusted_bars
 
 __all__ = [
@@ -59,6 +59,8 @@ class WrittenDataset:
     content_hash: str
     row_count: int
     byte_size: int
+    storage_record: Mapping[str, Any] | None = None
+    relation_record: Mapping[str, Any] | None = None
 
 
 @runtime_checkable
@@ -89,6 +91,10 @@ class RegenerationCatalog(Protocol):
 
     def record_dataset_lineage(self, record: Mapping[str, Any]) -> None: ...
 
+    def stage_object(
+        self, storage_record: Mapping[str, Any], dataset_object_record: Mapping[str, Any]
+    ) -> None: ...
+
     def latest_available_manifest(
         self, *, feed_id: str, data_layer: str, resolution: str, year: int
     ) -> dict[str, Any] | None: ...
@@ -117,10 +123,12 @@ class AdjustedDatasetRegenerator:
         catalog: RegenerationCatalog,
         reader: RawBarReader,
         writer: AdjustedBarWriter,
+        require_feed_compatibility: bool = False,
     ) -> None:
         self._catalog = catalog
         self._reader = reader
         self._writer = writer
+        self._require_feed_compatibility = require_feed_compatibility
 
     def with_catalog(self, catalog: RegenerationCatalog) -> AdjustedDatasetRegenerator:
         """Bind regeneration writes to the caller's active catalog transaction."""
@@ -128,6 +136,7 @@ class AdjustedDatasetRegenerator:
             catalog=catalog,
             reader=self._reader,
             writer=self._writer,
+            require_feed_compatibility=self._require_feed_compatibility,
         )
 
     def regenerate(
@@ -180,6 +189,8 @@ class AdjustedDatasetRegenerator:
         transaction_active: bool,
     ) -> RegenerationResult:
         raw = self._manifest(raw_manifest_id)
+        if self._require_feed_compatibility:
+            self._verify_feed_compatibility(raw, adjusted_feed_id)
         resolution = str(raw["resolution"])
         period_start = str(raw["period_start"])
         year = int(period_start[:4])
@@ -201,8 +212,9 @@ class AdjustedDatasetRegenerator:
                 f"resolution={resolution}/revision={next_revision}"
             ),
         )
+        registered_hash = self._dataset_hash(written)
 
-        if current is not None and str(current["dataset_hash"]) == written.content_hash:
+        if current is not None and str(current["dataset_hash"]) == registered_hash:
             # The approved set produced exactly what is already published. A new
             # revision here would be a lie about the data having changed.
             return RegenerationResult(
@@ -213,7 +225,7 @@ class AdjustedDatasetRegenerator:
                     if current.get("supersedes_manifest_id") is None
                     else str(current["supersedes_manifest_id"])
                 ),
-                dataset_hash=written.content_hash,
+                dataset_hash=registered_hash,
                 row_count=written.row_count,
                 created=False,
             )
@@ -239,23 +251,25 @@ class AdjustedDatasetRegenerator:
             "period_start": period_start,
             "period_end": str(raw["period_end"]),
             "schema_version": str(raw["schema_version"]),
-            "dataset_hash": written.content_hash,
+            "dataset_hash": registered_hash,
             "supersedes_manifest_id": None if current is None else str(current["id"]),
             "created_at": moment,
             "available_at": moment,
         }
 
         if transaction_active:
-            self._publish_revision(self._catalog, current, record, manifest_id, raw_manifest_id)
+            self._publish_revision(
+                self._catalog, current, record, manifest_id, raw_manifest_id, written
+            )
         else:
             with self._catalog.transaction() as catalog:
-                self._publish_revision(catalog, current, record, manifest_id, raw_manifest_id)
+                self._publish_revision(catalog, current, record, manifest_id, raw_manifest_id, written)
 
         return RegenerationResult(
             manifest_id=manifest_id,
             revision_number=next_revision,
             supersedes_manifest_id=None if current is None else str(current["id"]),
-            dataset_hash=written.content_hash,
+            dataset_hash=registered_hash,
             row_count=written.row_count,
             created=True,
         )
@@ -267,6 +281,7 @@ class AdjustedDatasetRegenerator:
         record: Mapping[str, Any],
         manifest_id: str,
         raw_manifest_id: str,
+        written: WrittenDataset,
     ) -> None:
         if current is not None:
             # Retire the prior revision *before* publishing, so the invariant
@@ -274,7 +289,24 @@ class AdjustedDatasetRegenerator:
             catalog.upsert(
                 DATASET_MANIFESTS_TABLE, {**dict(current), "status": "SUPERSEDED"}
             )
+        # The relation's FK needs the manifest row first. All writes remain in
+        # the caller's transaction, so no observer can see a manifest without
+        # its registered object.
         catalog.publish_manifest(record)
+        if written.storage_record is not None and written.relation_record is not None:
+            object_id = deterministic_uuid(
+                "storage-object", written.content_hash, written.object_key
+            )
+            relation_id = deterministic_uuid("dataset-object", manifest_id, object_id)
+            catalog.stage_object(
+                {**dict(written.storage_record), "id": object_id},
+                {
+                    **dict(written.relation_record),
+                    "id": relation_id,
+                    "dataset_manifest_id": manifest_id,
+                    "object_id": object_id,
+                },
+            )
         catalog.record_dataset_lineage(
             {
                 "derived_manifest_id": manifest_id,
@@ -291,6 +323,18 @@ class AdjustedDatasetRegenerator:
                 }
             )
 
+    @staticmethod
+    def _dataset_hash(written: WrittenDataset) -> str:
+        if written.storage_record is None or written.relation_record is None:
+            # Legacy/in-memory adapters have no catalog registration contract.
+            return written.content_hash
+        canonical = {
+            **dict(written.relation_record),
+            "content_hash": written.content_hash,
+            "schema_version": written.storage_record["schema_version"],
+        }
+        return canonical_dataset_hash([canonical])
+
     def _manifest(self, manifest_id: str) -> dict[str, Any]:
         for row in self._catalog.records(DATASET_MANIFESTS_TABLE):
             if str(row["id"]) == manifest_id:
@@ -299,3 +343,23 @@ class AdjustedDatasetRegenerator:
             f"no dataset manifest {manifest_id!r}; the adjusted dataset cannot be "
             "regenerated without the raw revision it derives from"
         )
+
+    def _verify_feed_compatibility(
+        self, raw_manifest: Mapping[str, Any], adjusted_feed_id: str
+    ) -> None:
+        feeds = self._catalog.records("market_data.feeds")
+        raw_feed = next(
+            (item for item in feeds if str(item["id"]) == str(raw_manifest["feed_id"])), None
+        )
+        adjusted_feed = next(
+            (item for item in feeds if str(item["id"]) == adjusted_feed_id), None
+        )
+        if raw_feed is None or adjusted_feed is None:
+            raise ValueError("source and adjusted feeds must both exist before regeneration")
+        fields = ("provider_id", "data_kind", "resolution", "timezone_name")
+        mismatches = [field for field in fields if raw_feed.get(field) != adjusted_feed.get(field)]
+        if mismatches or str(raw_manifest["resolution"]) != str(adjusted_feed["resolution"]):
+            raise ValueError(
+                "adjusted feed is incompatible with the candidate source feed: "
+                f"{sorted(set(mismatches + ['manifest.resolution']))}"
+            )

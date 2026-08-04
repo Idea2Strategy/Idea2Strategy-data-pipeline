@@ -130,7 +130,8 @@ class PipelineCommandExecutor:
         else:
             self._realtime_port = UnconfiguredRealtimeIngestPort()
         self._corporate_action_approval_port = (
-            corporate_action_approval_port or UnconfiguredCorporateActionApprovalPort()
+            corporate_action_approval_port
+            or self._build_corporate_action_approval_port(config)
         )
 
     def prepare(self) -> None:
@@ -140,6 +141,65 @@ class PipelineCommandExecutor:
         self._config.object_store_root.mkdir(parents=True, exist_ok=True)
         if self._config.realtime is not None:
             self._config.realtime.staging_root.mkdir(parents=True, exist_ok=True)
+        prepare = getattr(self._corporate_action_approval_port, "prepare", None)
+        if callable(prepare):
+            prepare()
+
+    @staticmethod
+    def _build_corporate_action_approval_port(config: WorkerConfig) -> CorporateActionApprovalPort:
+        settings = config.corporate_action_approval
+        if settings is None:
+            return UnconfiguredCorporateActionApprovalPort()
+        assert config.database_url is not None  # validated by WorkerConfig
+        from market_pipeline_lib.catalog import PostgresCatalog, StorageObjectsPolicy
+        from market_pipeline_lib.corporate_actions import (
+            AdjustedDatasetRegenerator,
+            ApprovalEvidenceVerifier,
+            BackendRelayApprovalConsumer,
+            CorporateActionReviewService,
+        )
+        from market_pipeline_lib.corporate_actions.object_bars import (
+            CatalogObjectBarReader,
+            ImmutableObjectBarWriter,
+        )
+        from market_pipeline_lib.corporate_actions.postgres_evidence import (
+            PostgresApprovalAuditDirectory,
+            PostgresOperatorDirectory,
+        )
+        from market_pipeline_lib.storage import S3ObjectStore
+
+        catalog = PostgresCatalog.connect(
+            config.database_url,
+            artifact_root=config.catalog_root,
+            storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
+        )
+        store = S3ObjectStore(
+            settings.object_bucket,
+            prefix=settings.object_prefix,
+            endpoint_url=config.aws_endpoint_url,
+        )
+        regenerator = AdjustedDatasetRegenerator(
+            catalog=catalog,
+            reader=CatalogObjectBarReader(catalog=catalog, object_store=store),
+            writer=ImmutableObjectBarWriter(
+                object_store=store, staging_root=settings.staging_root
+            ),
+            require_feed_compatibility=True,
+        )
+        verifier = ApprovalEvidenceVerifier(
+            operators=PostgresOperatorDirectory(catalog.engine),
+            audits=PostgresApprovalAuditDirectory(catalog.engine),
+            permission_id=settings.permission_id,
+            request_schema_version=settings.request_schema_version,
+        )
+        service = CorporateActionReviewService(
+            catalog=catalog,
+            regenerator=regenerator,
+            raw_manifest_id=None,
+            adjusted_feed_id=settings.adjusted_feed_id,
+            approval_verifier=verifier,
+        )
+        return BackendRelayApprovalConsumer(service, catalog=catalog)
 
     def request_stop(self, reason: str) -> None:
         """Forward a shutdown request to adapters that expose cooperative cancellation."""

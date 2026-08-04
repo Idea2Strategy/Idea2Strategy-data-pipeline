@@ -98,7 +98,7 @@ class CorporateActionReviewService:
         *,
         catalog: Any,
         regenerator: AdjustedDatasetRegenerator | None,
-        raw_manifest_id: str,
+        raw_manifest_id: str | None,
         adjusted_feed_id: str,
         approval_verifier: ApprovalEvidenceVerifier | None = None,
     ) -> None:
@@ -300,8 +300,14 @@ class CorporateActionReviewService:
                 "APPROVAL_TRANSACTION_UNAVAILABLE",
                 "regenerator cannot join the active approval transaction",
             )
+        source_manifest_id = row.get("source_manifest_id")
+        if source_manifest_id in (None, ""):
+            raise ApprovalRefusedError(
+                "SOURCE_MANIFEST_MISSING",
+                "approved candidate is not bound to a canonical source_manifest_id",
+            )
         regeneration = regenerate_in_transaction(
-            raw_manifest_id=self._raw_manifest_id,
+            raw_manifest_id=str(source_manifest_id),
             adjusted_feed_id=self._adjusted_feed_id,
             approved_actions=self.approved_actions(),
             now=result.decided_at,
