@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from copy import deepcopy
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -322,11 +323,14 @@ def test_instrument_cli_has_no_semantic_selection_defaults() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("LOCALSTACK_ENDPOINT_URL"),
+    reason="set LOCALSTACK_ENDPOINT_URL to run the LocalStack runtime export integration test",
+)
 def test_localstack_export_reads_the_catalog_version_not_the_latest_object(
     tmp_path: Path,
 ) -> None:
     import hashlib
-    import os
     import uuid
 
     import boto3
