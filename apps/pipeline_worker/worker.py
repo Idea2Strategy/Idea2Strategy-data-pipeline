@@ -314,7 +314,12 @@ class PipelineWorker:
             )
             return
 
-        if not self._idempotency.claim(command.command_id):
+        # Corporate-action approvals carry their own durable full-envelope
+        # idempotency identity. They must reach that verifier on every delivery:
+        # suppressing by command_id here would hide a tampered redelivery as a
+        # harmless duplicate and skip its refusal audit.
+        durable_domain_idempotency = command.command == "APPLY_CORPORATE_ACTION_APPROVAL"
+        if not durable_domain_idempotency and not self._idempotency.claim(command.command_id):
             visibility.stop()
             self._record(
                 command=command.command,
@@ -331,7 +336,8 @@ class PipelineWorker:
             detail = self._executor.execute(command)
         except MalformedEventError as error:
             visibility.stop()
-            self._idempotency.forget(command.command_id)
+            if not durable_domain_idempotency:
+                self._idempotency.forget(command.command_id)
             parked = self._park(source, message, reason=error.code)
             self._record(
                 command=command.command,
@@ -351,7 +357,8 @@ class PipelineWorker:
             # simply cannot complete it.  It goes back on the queue rather than
             # being answered with an empty success -- until it has used up its
             # deliveries, at which point it is parked rather than retried forever.
-            self._idempotency.forget(command.command_id)
+            if not durable_domain_idempotency:
+                self._idempotency.forget(command.command_id)
             detail = {"code": getattr(error, "code", type(error).__name__), "reason": str(error)}
             exhausted = message.receive_count >= self.config.max_receive_count
             parked = True
@@ -371,7 +378,8 @@ class PipelineWorker:
 
         visibility.stop()
         if visibility.error is not None:
-            self._idempotency.forget(command.command_id)
+            if not durable_domain_idempotency:
+                self._idempotency.forget(command.command_id)
             self._record(
                 command=command.command,
                 command_id=command.command_id,

@@ -694,6 +694,48 @@ class WorkerBootTests(unittest.TestCase):
             self.assertEqual(port.calls, [{"revision": 7}])
             self.assertEqual(worker.results[0]["detail"]["status"], "PUBLISHED")
 
+    def test_approval_redelivery_and_tamper_reach_durable_domain_verification(self) -> None:
+        class _ApprovalPort:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls.append(dict(payload))
+                return {"state": "APPROVED", "regenerated": len(self.calls) == 1}
+
+        payload = {
+            "candidateId": "10000000-0000-4000-8000-000000000001",
+            "deliveryId": "40000000-0000-4000-8000-000000000001",
+            "rationale": "reviewed",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(_environment(Path(tmp)))
+            port = _ApprovalPort()
+            source = InProcessMessageSource()
+            worker = PipelineWorker(
+                config,
+                message_source=source,
+                executor=PipelineCommandExecutor(
+                    config, corporate_action_approval_port=port
+                ),
+            )
+            for body in (payload, payload, {**payload, "rationale": "tampered"}):
+                source.submit(
+                    {
+                        "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                        "command_id": payload["deliveryId"],
+                        "payload": body,
+                    }
+                )
+            thread = threading.Thread(target=worker.run, name="approval-worker", daemon=True)
+            thread.start()
+            self.assertTrue(self._await(lambda: worker.health.succeeded >= 3))
+            worker.request_stop("test")
+            thread.join(timeout=5.0)
+
+            self.assertEqual(len(port.calls), 3)
+            self.assertEqual(port.calls[-1]["rationale"], "tampered")
+
     def test_run_refuses_to_start_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = WorkerConfig.from_environment(_environment(Path(tmp)))
@@ -1245,6 +1287,50 @@ class TestWorkerOverLocalStackSqs:
         assert len(parked) == 1
         assert json.loads(parked[0]["Body"])["command_id"] == "sqs-doomed"
         assert parked[0]["MessageAttributes"]["DeadLetterReason"]["StringValue"] == "MAX_RECEIVES_EXCEEDED"
+
+    def test_approval_duplicate_and_tamper_cross_real_sqs_boundary(
+        self, worker_sqs_queues: Any, tmp_path: Path
+    ) -> None:
+        class _ApprovalPort:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls.append(dict(payload))
+                return {"state": "APPROVED", "regenerated": len(self.calls) == 1}
+
+        client, queue_url, dead_letter_url = worker_sqs_queues
+        delivery_id = "40000000-0000-4000-8000-000000000001"
+        payload = {"candidateId": "10000000-0000-4000-8000-000000000001", "rationale": "reviewed"}
+        for body in (payload, payload, {**payload, "rationale": "tampered"}):
+            client.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                        "command_id": delivery_id,
+                        "payload": body,
+                    }
+                ),
+            )
+        config = WorkerConfig.from_environment(
+            self._environment(tmp_path, queue_url, dead_letter_url)
+        )
+        port = _ApprovalPort()
+        worker = PipelineWorker(
+            config,
+            executor=PipelineCommandExecutor(config, corporate_action_approval_port=port),
+        )
+        thread = threading.Thread(target=worker.run, name="approval-sqs", daemon=True)
+        thread.start()
+        try:
+            assert WorkerBootTests._await(lambda: worker.health.succeeded >= 3, timeout=30.0)
+        finally:
+            worker.request_stop("test")
+            thread.join(timeout=15.0)
+
+        assert len(port.calls) == 3
+        assert port.calls[-1]["rationale"] == "tampered"
 
     def test_the_sqs_message_source_carries_the_receive_count_through(
         self, worker_sqs_queues: Any, tmp_path: Path
