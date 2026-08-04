@@ -324,6 +324,26 @@ class WorkerBootTests(unittest.TestCase):
             self.assertEqual(worker.health.status, ReadinessStatus.STOPPED)
             self.assertFalse(worker.health.is_ready)
 
+    def test_event_run_mode_exits_cleanly_after_the_configured_idle_poll_limit(self) -> None:
+        """A desired-zero RunTask must finish instead of polling forever."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(
+                _environment(
+                    Path(tmp),
+                    PIPELINE_WORKER_EXIT_AFTER_IDLE_POLLS="1",
+                )
+            )
+            worker = PipelineWorker(config, message_source=InProcessMessageSource())
+
+            thread = threading.Thread(target=worker.run, name="event-run-worker", daemon=True)
+            thread.start()
+            thread.join(timeout=5.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(worker.health.status, ReadinessStatus.STOPPED)
+            self.assertEqual(config.exit_after_idle_polls, 1)
+
     def test_health_snapshot_is_json_serialisable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = WorkerConfig.from_environment(_environment(Path(tmp)))
@@ -412,6 +432,41 @@ class WorkerBootTests(unittest.TestCase):
             outcomes = [result["outcome"] for result in worker.results]
             self.assertEqual(outcomes.count("SUCCEEDED"), 1)
             self.assertEqual(outcomes.count("DUPLICATE"), 1)
+
+    def test_spot_stop_requeues_the_unstarted_remainder_of_a_received_batch(self) -> None:
+        """A Fargate Spot SIGTERM must not start more work from a prefetched batch."""
+
+        class _StopAfterFirstCommand:
+            def __init__(self) -> None:
+                self.worker: PipelineWorker | None = None
+                self.executed: list[str] = []
+
+            def prepare(self) -> None:
+                return
+
+            def execute(self, command: Command) -> dict[str, str]:
+                self.executed.append(command.command_id)
+                assert self.worker is not None
+                self.worker.request_stop("SIGTERM")
+                return {"status": "DONE"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(_environment(Path(tmp)))
+            source = InProcessMessageSource()
+            executor = _StopAfterFirstCommand()
+            worker = PipelineWorker(config, message_source=source, executor=executor)  # type: ignore[arg-type]
+            executor.worker = worker
+            source.submit({"command": "VALIDATE_CATALOG", "command_id": "cmd-first"})
+            source.submit({"command": "VALIDATE_CATALOG", "command_id": "cmd-requeued"})
+
+            received = source.poll(max_messages=2, wait_seconds=0.0)
+            worker._process_batch(source, received, deadline=None)
+
+            self.assertEqual(executor.executed, ["cmd-first"])
+            redelivered = source.poll(max_messages=1, wait_seconds=0.0)
+            self.assertEqual(len(redelivered), 1)
+            self.assertEqual(redelivered[0].body["command_id"], "cmd-requeued")
+            self.assertEqual(redelivered[0].receive_count, 2)
 
     def test_validate_dataset_manifest_command_runs_the_canonical_validator(self) -> None:
         fixtures = json.loads(

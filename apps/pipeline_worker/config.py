@@ -152,6 +152,13 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "Number of recently handled command ids retained for duplicate suppression.",
     ),
     (
+        "PIPELINE_WORKER_EXIT_AFTER_IDLE_POLLS",
+        False,
+        "0",
+        "Exit successfully after this many consecutive empty polls. 0 keeps the worker "
+        "long-running; a positive value supports desired-zero ECS RunTask execution.",
+    ),
+    (
         "PIPELINE_WORKER_HEALTH_FILE",
         False,
         "",
@@ -333,6 +340,7 @@ class WorkerConfig:
     health_host: str
     health_port: int | None
     realtime: RealtimeIngestSettings | None
+    exit_after_idle_polls: int = 0
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -434,6 +442,13 @@ class WorkerConfig:
             health_host=(values.get("PIPELINE_WORKER_HEALTH_HOST") or "127.0.0.1").strip(),
             health_port=health_port,
             realtime=None if _blank(realtime_raw) else RealtimeIngestSettings.parse(str(realtime_raw)),
+            exit_after_idle_polls=_require_int(
+                values,
+                "PIPELINE_WORKER_EXIT_AFTER_IDLE_POLLS",
+                "0",
+                minimum=0,
+                maximum=1_000_000,
+            ),
         )
 
     def describe(self) -> dict[str, object]:
@@ -458,6 +473,7 @@ class WorkerConfig:
             "health_file": str(self.health_file) if self.health_file else None,
             "health_port": self.health_port,
             "realtime": None if self.realtime is None else self.realtime.describe(),
+            "exit_after_idle_polls": self.exit_after_idle_polls,
         }
 
 

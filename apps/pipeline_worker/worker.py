@@ -148,13 +148,25 @@ class PipelineWorker:
 
     # -- loop -------------------------------------------------------------
     def _consume(self, source: MessageSource) -> None:
+        idle_polls = 0
         while not self._stop.is_set():
             messages = source.poll(
                 max_messages=self.config.max_messages_per_poll,
                 wait_seconds=self.config.poll_interval_seconds,
             )
             if not messages:
+                idle_polls += 1
+                if (
+                    self.config.exit_after_idle_polls > 0
+                    and idle_polls >= self.config.exit_after_idle_polls
+                ):
+                    self.request_stop("idle-poll-limit")
+                    LOGGER.info(
+                        "worker.idle_limit_reached",
+                        extra={"idle_polls": idle_polls},
+                    )
                 continue
+            idle_polls = 0
             self._process_batch(source, messages, deadline=None)
             self._publish_health()
 
@@ -175,11 +187,15 @@ class PipelineWorker:
         deadline: float | None,
     ) -> None:
         for message in messages:
-            if deadline is not None and time.monotonic() >= deadline:
+            deadline_expired = deadline is not None and time.monotonic() >= deadline
+            if self._stop.is_set() or deadline_expired:
                 source.retry_later(message, delay_seconds=0.0)
                 LOGGER.warning(
                     "worker.drain.requeued",
-                    extra={"message_id": message.message_id},
+                    extra={
+                        "message_id": message.message_id,
+                        "reason": self._stop_reason if self._stop.is_set() else "deadline-expired",
+                    },
                 )
                 continue
             self._process(source, message)
