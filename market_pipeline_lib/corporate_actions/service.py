@@ -19,7 +19,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
+from uuid import UUID
 
 from ..corporate_action_research import (
     CORPORATE_ACTIONS_TABLE,
@@ -31,6 +32,8 @@ from ..corporate_action_research import (
 from .adjustment import ApprovedAction
 from .decisions import (
     AdminDecision,
+    ApprovalRefusedError,
+    ApprovalResult,
     ConflictingDecisionError,
     DecisionType,
     ReviewState,
@@ -38,7 +41,39 @@ from .decisions import (
 )
 from .regeneration import AdjustedDatasetRegenerator, RegenerationResult
 
-__all__ = ["CorporateActionReviewService", "DecisionOutcome"]
+__all__ = [
+    "ApprovalEvidenceVerifier",
+    "CorporateActionReviewService",
+    "DecisionOutcome",
+]
+
+
+class ActiveOperatorDirectory(Protocol):
+    def is_active(self, operator_id: UUID) -> bool: ...
+
+
+class ApprovalAuditDirectory(Protocol):
+    def matches(self, result: ApprovalResult) -> bool: ...
+
+
+@dataclass(frozen=True)
+class ApprovalEvidenceVerifier:
+    """Verifies backend-owned proof without interpreting transport headers."""
+
+    operators: ActiveOperatorDirectory
+    audits: ApprovalAuditDirectory
+    permission_id: UUID
+    request_schema_version: str
+
+    def verify(self, result: ApprovalResult) -> None:
+        if result.permission_id != self.permission_id:
+            raise ApprovalRefusedError("PERMISSION_MISMATCH", "approval permissionId is not registered")
+        if result.request_schema_version != self.request_schema_version:
+            raise ApprovalRefusedError("UNKNOWN_SCHEMA_VERSION", "approval requestSchemaVersion is unknown")
+        if not self.operators.is_active(result.actor_id):
+            raise ApprovalRefusedError("INACTIVE_OPERATOR", "approval actor is not an ACTIVE operator")
+        if not self.audits.matches(result):
+            raise ApprovalRefusedError("AUDIT_BINDING_MISMATCH", "backend audit evidence does not bind this result")
 
 
 @dataclass(frozen=True)
@@ -65,11 +100,13 @@ class CorporateActionReviewService:
         regenerator: AdjustedDatasetRegenerator | None,
         raw_manifest_id: str,
         adjusted_feed_id: str,
+        approval_verifier: ApprovalEvidenceVerifier | None = None,
     ) -> None:
         self._catalog = catalog
         self._regenerator = regenerator
         self._raw_manifest_id = raw_manifest_id
         self._adjusted_feed_id = adjusted_feed_id
+        self._approval_verifier = approval_verifier
 
     # -- recording ---------------------------------------------------------------
     def record_candidate(
@@ -160,6 +197,135 @@ class CorporateActionReviewService:
             candidate_id=decision.candidate_id, state=target, regeneration=regeneration
         )
 
+    def apply_approval_result(self, result: ApprovalResult) -> DecisionOutcome:
+        """Apply an authenticated relay result and persist its durable audit facts."""
+        if self._approval_verifier is None:
+            raise ApprovalRefusedError(
+                "APPROVAL_PROVIDER_UNWIRED",
+                "approval provider is unwired; refusing instead of reporting zero approvals",
+            )
+        self._approval_verifier.verify(result)
+        row = self._row_for_record_id(result.candidate_id)
+
+        prior = list(row["terms_document"].get("review_history", []))
+        delivery = str(result.delivery_id)
+        for entry in prior:
+            if entry.get("delivery_id") == delivery:
+                if (
+                    entry.get("candidate_id") == str(result.candidate_id)
+                    and entry.get("decided_content_hash") == result.decided_content_hash
+                    and entry.get("decision") == result.decision.value
+                ):
+                    return DecisionOutcome(str(result.candidate_id), self._state(row), None)
+                raise ApprovalRefusedError("DELIVERY_ID_CONFLICT", "deliveryId was reused with different content")
+
+        latest_sequence = max(
+            (
+                int(entry.get("aggregate_sequence", 0))
+                for entry in prior
+                if entry.get("state") != "REFUSED"
+            ),
+            default=0,
+        )
+        if result.aggregate_sequence <= latest_sequence:
+            self._refuse(row, result, "REVERSED_AGGREGATE_SEQUENCE")
+        if str(row["terms_hash"]) != result.decided_content_hash:
+            self._refuse(row, result, "STALE_CONTENT_HASH")
+
+        evidence = {
+            str(item.get("content_sha256"))
+            for item in row["terms_document"].get("evidence", [])
+            if item.get("content_sha256")
+        }
+        if not set(result.evidence_bindings).issubset(evidence):
+            self._refuse(row, result, "UNBOUND_EVIDENCE")
+        if self._regenerator is None:
+            raise RegeneratorNotConfiguredError("approval effects require an adjusted-dataset regenerator")
+
+        target_state: ReviewState
+        if result.decision is DecisionType.WITHDRAW:
+            if self._state(row) is not ReviewState.APPROVED:
+                self._refuse(row, result, "WITHDRAWAL_STATE_CONFLICT")
+            self._provider_transition(row, result, ReviewState.WITHDRAWN)
+            target_state = ReviewState.WITHDRAWN
+        else:
+            current = self._state(row)
+            if current is not ReviewState.REVIEW_REQUIRED:
+                self._refuse(row, result, "CONFLICTING_REDECISION")
+            conflicts = self._approved_for_same_subject(row)
+            if conflicts:
+                if len(conflicts) != 1 or result.supersedes_candidate_id != UUID(str(conflicts[0]["id"])):
+                    self._refuse(row, result, "UNNAMED_SUPERSEDE_CONFLICT")
+                self._provider_transition(conflicts[0], result, ReviewState.SUPERSEDED, affected_candidate=result.supersedes_candidate_id)
+            elif result.supersedes_candidate_id is not None:
+                self._refuse(row, result, "SUPERSEDED_CANDIDATE_NOT_APPROVED")
+            self._provider_transition(row, result, ReviewState.APPROVED)
+            target_state = ReviewState.APPROVED
+
+        regeneration = self._regenerator.regenerate(
+            raw_manifest_id=self._raw_manifest_id,
+            adjusted_feed_id=self._adjusted_feed_id,
+            approved_actions=self.approved_actions(),
+            now=result.decided_at,
+        )
+        return DecisionOutcome(str(result.candidate_id), target_state, regeneration)
+
+    def _provider_transition(
+        self,
+        row: Mapping[str, Any],
+        result: ApprovalResult,
+        target: ReviewState,
+        *,
+        affected_candidate: UUID | None = None,
+    ) -> None:
+        document = dict(row["terms_document"])
+        entry = {
+            "state": target.value,
+            "decision": result.decision.value,
+            "candidate_id": str(affected_candidate or result.candidate_id),
+            "decided_content_hash": result.decided_content_hash,
+            "evidence_bindings": list(result.evidence_bindings),
+            "actor_id": str(result.actor_id),
+            "audit_id": str(result.audit_id),
+            "permission_id": str(result.permission_id),
+            "request_schema_version": result.request_schema_version,
+            "decided_at": result.decided_at.isoformat().replace("+00:00", "Z"),
+            "delivery_id": str(result.delivery_id),
+            "aggregate_sequence": result.aggregate_sequence,
+            "supersedes_candidate_id": (
+                None if result.supersedes_candidate_id is None else str(result.supersedes_candidate_id)
+            ),
+            "rationale": result.rationale.strip(),
+        }
+        document["review"] = entry
+        document["review_history"] = [*document.get("review_history", []), entry]
+        self._catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
+
+    def _refuse(self, row: Mapping[str, Any], result: ApprovalResult, code: str) -> None:
+        document = dict(row["terms_document"])
+        refused = {
+            "state": "REFUSED",
+            "reason_code": code,
+            "candidate_id": str(result.candidate_id),
+            "delivery_id": str(result.delivery_id),
+            "audit_id": str(result.audit_id),
+            "aggregate_sequence": result.aggregate_sequence,
+            "recorded_at": result.decided_at.isoformat().replace("+00:00", "Z"),
+        }
+        document["review_history"] = [*document.get("review_history", []), refused]
+        self._catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
+        raise ApprovalRefusedError(code, f"corporate-action approval refused: {code}")
+
+    def _approved_for_same_subject(self, row: Mapping[str, Any]) -> list[dict[str, Any]]:
+        return [
+            other for other in self._rows()
+            if str(other["id"]) != str(row["id"])
+            and self._state(other) is ReviewState.APPROVED
+            and str(other["instrument_id"]) == str(row["instrument_id"])
+            and str(other["action_type"]) == str(row["action_type"])
+            and str(other["effective_at"]) == str(row["effective_at"])
+        ]
+
     def _transition(
         self,
         row: Mapping[str, Any],
@@ -194,6 +360,12 @@ class CorporateActionReviewService:
         raise UnknownCandidateError(
             f"no recorded corporate action carries candidate {candidate_id!r}"
         )
+
+    def _row_for_record_id(self, candidate_id: UUID) -> dict[str, Any]:
+        for row in self._rows():
+            if str(row["id"]) == str(candidate_id):
+                return row
+        raise UnknownCandidateError(f"no corporate-action row has canonical id {candidate_id}")
 
 
 def _parse_utc(value: str) -> datetime:
