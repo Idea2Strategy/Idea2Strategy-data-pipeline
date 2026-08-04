@@ -23,6 +23,7 @@ from .adjustment import (
     cash_dividend_factor,
     split_factor,
 )
+from .consumer import BackendRelayApprovalConsumer
 from .decisions import (
     AdminDecision,
     ApprovalRefusedError,
@@ -60,6 +61,7 @@ __all__ = [
     "ApprovalResult",
     "ApprovedAction",
     "Bar",
+    "BackendRelayApprovalConsumer",
     "ConflictingDecisionError",
     "CorporateActionReviewService",
     "DecisionOutcome",

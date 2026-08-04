@@ -44,6 +44,7 @@ SUPPORTED_COMMANDS: tuple[str, ...] = (
     "VALIDATE_DATASET_MANIFEST",
     "PUBLISH_DATASET",
     "INGEST_REALTIME_BARS",
+    "APPLY_CORPORATE_ACTION_APPROVAL",
 )
 
 
@@ -94,6 +95,19 @@ class UnconfiguredDatasetPublicationPort:
         )
 
 
+@runtime_checkable
+class CorporateActionApprovalPort(Protocol):
+    def apply(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class UnconfiguredCorporateActionApprovalPort:
+    def apply(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise PortNotConfiguredError(
+            "APPLY_CORPORATE_ACTION_APPROVAL requires the verified backend-relay "
+            "consumer adapter; refusing rather than treating an unwired provider as empty"
+        )
+
+
 class PipelineCommandExecutor:
     """Dispatches a validated :class:`Command` to its domain implementation."""
 
@@ -103,6 +117,7 @@ class PipelineCommandExecutor:
         *,
         publication_port: DatasetPublicationPort | None = None,
         realtime_port: RealtimeIngestPort | None = None,
+        corporate_action_approval_port: CorporateActionApprovalPort | None = None,
     ) -> None:
         self._config = config
         self._publication_port: DatasetPublicationPort = (
@@ -114,6 +129,9 @@ class PipelineCommandExecutor:
             self._realtime_port = EngineRealtimeIngestPort(config)
         else:
             self._realtime_port = UnconfiguredRealtimeIngestPort()
+        self._corporate_action_approval_port = (
+            corporate_action_approval_port or UnconfiguredCorporateActionApprovalPort()
+        )
 
     def prepare(self) -> None:
         """Create the configured roots so the first command has somewhere to read."""
@@ -126,7 +144,11 @@ class PipelineCommandExecutor:
     def request_stop(self, reason: str) -> None:
         """Forward a shutdown request to adapters that expose cooperative cancellation."""
 
-        for port in (self._publication_port, self._realtime_port):
+        for port in (
+            self._publication_port,
+            self._realtime_port,
+            self._corporate_action_approval_port,
+        ):
             stop = getattr(port, "request_stop", None)
             if callable(stop):
                 stop(reason)
@@ -140,6 +162,8 @@ class PipelineCommandExecutor:
             return self._publication_port.publish(command.payload)
         if command.command == "INGEST_REALTIME_BARS":
             return self._ingest_realtime_bars(command.payload)
+        if command.command == "APPLY_CORPORATE_ACTION_APPROVAL":
+            return self._corporate_action_approval_port.apply(command.payload)
         raise UnknownCommandError(f"no executor for command {command.command!r}")
 
     def _ingest_realtime_bars(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:

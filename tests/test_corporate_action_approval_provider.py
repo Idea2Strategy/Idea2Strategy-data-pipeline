@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
 
+from market_pipeline_lib.corporate_actions.consumer import BackendRelayApprovalConsumer
 from market_pipeline_lib.corporate_actions.decisions import (
     ApprovalRefusedError,
     ApprovalResult,
@@ -163,6 +164,29 @@ class CorporateActionProviderResultTest(unittest.TestCase):
     def test_parser_refuses_a_missing_proof_field(self) -> None:
         with self.assertRaisesRegex(ApprovalRefusedError, "missing"):
             ApprovalResult.from_mapping({"candidateId": str(CANDIDATE)})
+
+    def test_backend_relay_json_reaches_the_verified_consumer(self) -> None:
+        service, _, regenerator = self.service([row()])
+        consumer = BackendRelayApprovalConsumer(service)
+        relay_payload = {
+            "candidateId": str(CANDIDATE),
+            "decision": "APPROVE",
+            "decidedContentHash": HASH,
+            "evidenceBindings": [EVIDENCE],
+            "actorId": str(ACTOR),
+            "auditId": str(AUDIT),
+            "permissionId": str(PERMISSION),
+            "requestSchemaVersion": "schema-v1",
+            "decidedAt": "2026-08-04T00:00:00Z",
+            "deliveryId": str(DELIVERY),
+            "aggregateSequence": 1,
+        }
+
+        response = consumer.apply(relay_payload)
+
+        self.assertEqual(response["state"], "APPROVED")
+        self.assertTrue(response["regenerated"])
+        self.assertEqual(regenerator.calls, 1)
 
     def test_unwired_provider_fails_closed(self) -> None:
         service = CorporateActionReviewService(
