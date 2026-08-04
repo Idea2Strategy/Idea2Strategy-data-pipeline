@@ -55,6 +55,7 @@ __all__ = [
     "CorporateActionResearchPort",
     "CorporateActionTerms",
     "Evidence",
+    "EvidenceFetcher",
     "InstrumentResolver",
     "ResearchAdapterError",
     "ResearchCandidate",
@@ -64,10 +65,12 @@ __all__ = [
     "ResearchRunReport",
     "ResearchScheduleExecutor",
     "ResearchSlot",
+    "SourceCitation",
     "SourceManifestResolver",
     "SplitTerms",
     "TERMS_BY_EVENT_TYPE",
     "TwiceDailySchedule",
+    "UnconfiguredEvidenceFetcher",
     "UnconfiguredResearchPort",
     "UnknownInstrumentError",
     "UnknownSourceManifestError",
@@ -230,13 +233,88 @@ def parse_terms(event_type: str, payload: Mapping[str, Any]) -> CorporateActionT
 # Evidence and claims
 # ======================================================================================
 @dataclass(frozen=True)
+class SourceCitation:
+    """A source a research model *claims* substantiates a finding.
+
+    This is the whole of what a model is trusted to assert about a source: where
+    it is and what it is called.  It deliberately carries no integrity values --
+    see :class:`Evidence` for why.
+    """
+
+    source_uri: str
+    source_title: str
+
+    def __post_init__(self) -> None:
+        _require_public_uri(self.source_uri, "citation source_uri")
+        if not self.source_title.strip():
+            raise ValueError("citation source_title is required")
+
+
+@runtime_checkable
+class EvidenceFetcher(Protocol):
+    """Retrieves a cited source so its integrity values can be *derived*.
+
+    The seam exists so this module performs no network I/O and its tests drive a
+    deterministic fake, matching :class:`CorporateActionResearchPort`.  The
+    concrete HTTP implementation belongs to the deployment wiring, not here.
+    """
+
+    def fetch(self, source_uri: str) -> tuple[bytes, datetime]:
+        """Return the exact response bytes and the UTC instant they arrived."""
+
+
+class UnconfiguredEvidenceFetcher:
+    """Default fetcher: refuses rather than letting unverified evidence through."""
+
+    def fetch(self, source_uri: str) -> tuple[bytes, datetime]:
+        raise ResearchAdapterError(
+            "no EvidenceFetcher is configured, so a cited source cannot be retrieved "
+            "and its content hash cannot be derived. Storing a candidate whose evidence "
+            "was never fetched would record provenance that nothing can re-derive, so "
+            "this refuses instead. Inject an EvidenceFetcher."
+        )
+
+
+@dataclass(frozen=True)
 class Evidence:
-    """A reproducible pointer to a public research source."""
+    """A reproducible pointer to a public research source.
+
+    `content_sha256` and `retrieved_at` are **derived by this pipeline from bytes
+    it actually received** -- never asserted by a research model.  A model cannot
+    hash a document it did not fetch, so a model-supplied hash is fabricated:
+    syntactically valid, unfalsifiable, and indistinguishable from a real one.
+    That would make the provenance record look verifiable while substantiating
+    nothing, and an administrator approving the action would be approving a hash
+    no one can re-derive.  Construct via :meth:`from_fetched`.
+    """
 
     source_uri: str
     source_title: str
     content_sha256: str
     retrieved_at: datetime
+
+    @classmethod
+    def from_fetched(
+        cls,
+        citation: SourceCitation,
+        *,
+        content: bytes,
+        retrieved_at: datetime,
+    ) -> Evidence:
+        """Derive evidence from a citation and the bytes actually retrieved for it."""
+        if not isinstance(content, bytes):
+            raise ValueError("evidence content must be the retrieved bytes")
+        if not content:
+            raise ValueError(
+                f"{citation.source_uri} returned no content; a source that cannot be "
+                "read does not substantiate a claim"
+            )
+        return cls(
+            source_uri=citation.source_uri,
+            source_title=citation.source_title,
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            retrieved_at=retrieved_at,
+        )
 
     def __post_init__(self) -> None:
         _require_public_uri(self.source_uri, "evidence source_uri")
@@ -530,11 +608,13 @@ Answer with a single JSON document and nothing else:
                 "effective_date": "YYYY-MM-DD",
                 "terms": {{"from_shares": 1, "to_shares": 2}},
                 "evidence": [{{"source_uri": "https://...",
-                              "source_title": "...",
-                              "content_sha256": "<64 lowercase hex>",
-                              "retrieved_at": "YYYY-MM-DDTHH:MM:SSZ"}}],
+                              "source_title": "..."}}],
                 "claims": [{{"field": "event_type", "value": "STOCK_SPLIT",
                             "source_uri": "https://...", "confidence": "0.95"}}]}}]}}
+
+Cite only sources you actually consulted, by their real URL. Do not report a
+content hash or a retrieval time for any source: those are derived from the
+retrieved bytes by the pipeline, not by you.
 
 CASH_DIVIDEND terms are {{"amount": "0.00", "currency": "USD"}}.
 Every material field (event_type, effective_date, and each terms field) needs its own
@@ -559,7 +639,13 @@ class AiResearchAdapter:
     a warning rather than quietly promoted into a reviewable candidate.
     """
 
-    def __init__(self, model: ResearchModel, *, min_confidence: Decimal) -> None:
+    def __init__(
+        self,
+        model: ResearchModel,
+        *,
+        min_confidence: Decimal,
+        evidence_fetcher: EvidenceFetcher | None = None,
+    ) -> None:
         if not callable(model):
             raise TypeError("model must be callable")
         if not isinstance(min_confidence, Decimal):
@@ -568,6 +654,11 @@ class AiResearchAdapter:
             raise ValueError("min_confidence must be in (0, 1]")
         self._model = model
         self._min_confidence = min_confidence.quantize(CONFIDENCE_EXPONENT)
+        # Defaults to refusing rather than to trusting: an adapter with no fetcher
+        # cannot derive a content hash, and must not invent one.
+        self._evidence_fetcher: EvidenceFetcher = (
+            evidence_fetcher if evidence_fetcher is not None else UnconfiguredEvidenceFetcher()
+        )
 
     @property
     def min_confidence(self) -> Decimal:
@@ -577,8 +668,12 @@ class AiResearchAdapter:
         raw = self._model(build_research_prompt(ticker, scheduled_at))
         document = self._parse(raw)
         accepted: list[ResearchFinding] = []
+        # One fetch per distinct URI for the whole pass: two findings citing the
+        # same issuer page must not hash it twice, or a page that changed between
+        # fetches would yield two different hashes for one source.
+        fetched: dict[str, Evidence] = {}
         for index, entry in enumerate(document):
-            finding = self._finding(entry, index)
+            finding = self._finding(entry, index, fetched)
             if finding.confidence < self._min_confidence:
                 LOGGER.warning(
                     "corporate_action_research.finding_below_threshold "
@@ -610,7 +705,9 @@ class AiResearchAdapter:
                 raise ResearchAdapterError("every finding must be a JSON object")
         return list(findings)
 
-    def _finding(self, entry: Mapping[str, Any], index: int) -> ResearchFinding:
+    def _finding(
+        self, entry: Mapping[str, Any], index: int, fetched: dict[str, Evidence]
+    ) -> ResearchFinding:
         where = f"findings[{index}]"
         try:
             event_type = str(entry["event_type"]).strip().upper()
@@ -624,7 +721,7 @@ class AiResearchAdapter:
             if not isinstance(terms_payload, Mapping):
                 raise ValueError("terms must be a JSON object")
             terms = parse_terms(event_type, terms_payload)
-            evidence = self._evidence(entry.get("evidence"))
+            evidence = self._evidence(entry.get("evidence"), fetched)
             claims = self._claims(entry.get("claims"))
         except KeyError as exc:
             raise ResearchAdapterError(f"{where} is missing {exc.args[0]!r}") from exc
@@ -650,23 +747,48 @@ class AiResearchAdapter:
             raise ResearchAdapterError(f"{where} is not self-consistent: {exc}") from exc
         return finding
 
-    @staticmethod
-    def _evidence(payload: Any) -> tuple[Evidence, ...]:
+    def _evidence(self, payload: Any, fetched: dict[str, Evidence]) -> tuple[Evidence, ...]:
+        """Parse citations, then *derive* each evidence item from retrieved bytes.
+
+        A cited source that cannot be retrieved fails the finding rather than
+        being stored with an unverifiable hash -- the same fail-closed choice
+        `UnconfiguredResearchPort` makes for a whole slot.
+
+        `fetched` is the per-pass fetch cache owned by :meth:`research`.
+        """
         if not isinstance(payload, list) or not payload:
             raise ValueError("at least one evidence entry is required")
         items: list[Evidence] = []
         for entry in payload:
             if not isinstance(entry, Mapping):
                 raise ValueError("every evidence entry must be a JSON object")
-            retrieved = str(entry["retrieved_at"]).replace("Z", "+00:00")
-            items.append(
-                Evidence(
-                    source_uri=str(entry["source_uri"]),
-                    source_title=str(entry["source_title"]),
-                    content_sha256=str(entry["content_sha256"]),
-                    retrieved_at=datetime.fromisoformat(retrieved),
+            if "content_sha256" in entry or "retrieved_at" in entry:
+                raise ValueError(
+                    "evidence must not carry 'content_sha256' or 'retrieved_at': a model "
+                    "cannot hash a document it did not fetch, so these are derived here "
+                    "from the retrieved bytes"
                 )
+            citation = SourceCitation(
+                source_uri=str(entry["source_uri"]),
+                source_title=str(entry["source_title"]),
             )
+            if citation.source_uri in fetched:
+                items.append(fetched[citation.source_uri])
+                continue
+            try:
+                content, retrieved_at = self._evidence_fetcher.fetch(citation.source_uri)
+            except ResearchAdapterError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any transport failure is fatal here
+                raise ValueError(
+                    f"cited source {citation.source_uri} could not be retrieved: {exc}"
+                ) from exc
+            _require_utc(retrieved_at, "evidence retrieved_at")
+            evidence = Evidence.from_fetched(
+                citation, content=content, retrieved_at=retrieved_at
+            )
+            fetched[citation.source_uri] = evidence
+            items.append(evidence)
         return tuple(items)
 
     @staticmethod
