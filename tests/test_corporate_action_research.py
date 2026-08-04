@@ -8,6 +8,7 @@ exercised without a database.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import tempfile
@@ -260,8 +261,6 @@ def _model_payload(*, confidence: str = "0.95", source: str = SOURCE) -> str:
                         {
                             "source_uri": source,
                             "source_title": "Issuer split notice",
-                            "content_sha256": "a" * 64,
-                            "retrieved_at": "2026-08-02T00:01:00Z",
                         }
                     ],
                     "claims": [
@@ -308,10 +307,39 @@ class RecordingModel:
         return self._responses.pop(0) if self._responses else '{"findings": []}'
 
 
+class RecordingFetcher:
+    """Stands in for the evidence fetcher. Deterministic, and provably offline.
+
+    Returns fixed bytes per URI so the derived hash is reproducible, and records
+    what was fetched so a test can assert the pipeline retrieved the source
+    itself rather than trusting the model's word for it.
+    """
+
+    def __init__(self, *, body: bytes = b"<html>1-for-2 split effective 2026-08-15</html>") -> None:
+        self._body = body
+        self.fetched: list[str] = []
+
+    def fetch(self, source_uri: str) -> tuple[bytes, datetime]:
+        self.fetched.append(source_uri)
+        return self._body, datetime(2026, 8, 2, 0, 1, tzinfo=UTC)
+
+
+class FailingFetcher:
+    """A source that cannot be retrieved."""
+
+    def fetch(self, source_uri: str) -> tuple[bytes, datetime]:
+        raise ConnectionError("host unreachable")
+
+
 class AiResearchAdapterTest(unittest.TestCase):
     def _adapter(self, *responses: str, minimum: str = "0.70") -> AiResearchAdapter:
         self.model = RecordingModel(*responses)
-        return AiResearchAdapter(self.model, min_confidence=Decimal(minimum))
+        self.fetcher = RecordingFetcher()
+        return AiResearchAdapter(
+            self.model,
+            min_confidence=Decimal(minimum),
+            evidence_fetcher=self.fetcher,
+        )
 
     def test_a_well_formed_response_becomes_a_finding(self) -> None:
         adapter = self._adapter(_model_payload())
@@ -323,6 +351,76 @@ class AiResearchAdapterTest(unittest.TestCase):
         self.assertEqual(finding.terms, SplitTerms(from_shares=1, to_shares=2))
         self.assertEqual(len(finding.evidence), 1)
         self.assertEqual(len(finding.claims), 4)
+
+    def test_the_content_hash_is_derived_from_the_fetched_bytes(self) -> None:
+        body = b"<html>1-for-2 split effective 2026-08-15</html>"
+        adapter = self._adapter(_model_payload())
+
+        (finding,) = adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+        (evidence,) = finding.evidence
+        # The pipeline fetched the cited source itself...
+        self.assertEqual(self.fetcher.fetched, [SOURCE])
+        # ...and the stored hash is re-derivable from those exact bytes.
+        self.assertEqual(evidence.content_sha256, hashlib.sha256(body).hexdigest())
+        self.assertEqual(evidence.retrieved_at, datetime(2026, 8, 2, 0, 1, tzinfo=UTC))
+
+    def test_a_model_supplied_hash_is_refused(self) -> None:
+        # The defect this guards: a model cannot hash a document it did not fetch,
+        # so any hash it offers is fabricated and must not be accepted.
+        payload = json.loads(_model_payload())
+        payload["findings"][0]["evidence"][0]["content_sha256"] = "b" * 64
+        adapter = self._adapter(json.dumps(payload))
+
+        with self.assertRaisesRegex(ResearchAdapterError, "content_sha256"):
+            adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+    def test_a_model_supplied_retrieval_time_is_refused(self) -> None:
+        payload = json.loads(_model_payload())
+        payload["findings"][0]["evidence"][0]["retrieved_at"] = "2026-08-02T00:01:00Z"
+        adapter = self._adapter(json.dumps(payload))
+
+        with self.assertRaisesRegex(ResearchAdapterError, "retrieved_at"):
+            adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+    def test_an_unfetchable_source_fails_the_finding(self) -> None:
+        # Storing a candidate whose source was never retrieved would record
+        # provenance nothing can re-derive, so the finding is refused instead.
+        adapter = AiResearchAdapter(
+            RecordingModel(_model_payload()),
+            min_confidence=Decimal("0.70"),
+            evidence_fetcher=FailingFetcher(),
+        )
+
+        with self.assertRaisesRegex(ResearchAdapterError, "could not be retrieved"):
+            adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+    def test_an_unconfigured_fetcher_refuses_rather_than_inventing_a_hash(self) -> None:
+        adapter = AiResearchAdapter(
+            RecordingModel(_model_payload()), min_confidence=Decimal("0.70")
+        )
+
+        with self.assertRaisesRegex(ResearchAdapterError, "no EvidenceFetcher is configured"):
+            adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+    def test_the_prompt_forbids_model_supplied_integrity_values(self) -> None:
+        prompt = build_research_prompt("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+        self.assertNotIn("content_sha256", prompt)
+        self.assertNotIn("retrieved_at", prompt)
+        self.assertIn("derived from the retrieved bytes by the pipeline", prompt)
+
+    def test_one_source_is_fetched_once_per_finding(self) -> None:
+        # Re-fetching would let the same source hash two different ways in one finding.
+        payload = json.loads(_model_payload())
+        payload["findings"][0]["evidence"].append(
+            {"source_uri": SOURCE, "source_title": "Issuer split notice"}
+        )
+        adapter = self._adapter(json.dumps(payload))
+
+        adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+
+        self.assertEqual(self.fetcher.fetched, [SOURCE])
 
     def test_the_prompt_names_the_ticker_and_the_slot(self) -> None:
         adapter = self._adapter(_model_payload())
