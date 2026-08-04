@@ -55,3 +55,9 @@ class UnknownCommandError(MalformedEventError):
     """A structurally valid message names a command this app does not handle."""
 
     code = "UNKNOWN_COMMAND"
+
+
+class ExecutionCancelledError(PipelineAppError):
+    """Work stopped at a cooperative boundary and must remain retryable."""
+
+    code = "EXECUTION_CANCELLED"

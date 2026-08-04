@@ -26,6 +26,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -247,6 +248,17 @@ class WorkerConfigurationTests(unittest.TestCase):
             self.assertEqual(config.poll_interval_seconds, 0.01)
             self.assertEqual(config.max_receive_count, 5)
             self.assertIsNone(config.realtime)
+
+    def test_database_url_is_parsed_but_never_exposed_by_describe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_url = "postgresql+psycopg://pipeline:secret@db/idea2strategy"
+            config = WorkerConfig.from_environment(
+                _environment(Path(tmp), PIPELINE_WORKER_DATABASE_URL=secret_url)
+            )
+
+            self.assertEqual(config.database_url, secret_url)
+            self.assertTrue(config.describe()["database_configured"])
+            self.assertNotIn(secret_url, json.dumps(config.describe()))
 
 
 class MessageSourcePortTests(unittest.TestCase):
@@ -1073,6 +1085,57 @@ class RealtimeCommandTests(unittest.TestCase):
         self.assertEqual(first["accepted"], 8)
         self.assertEqual((second["accepted"], second["skipped"]), (0, 8))
         self.assertEqual(second["status"], "NO_CHANGE")
+
+    def test_database_url_selects_the_durable_sql_watermark_repository(self) -> None:
+        from apps.pipeline_worker.realtime import EngineRealtimeIngestPort
+        from market_pipeline_lib.watermarks import SqlWatermarkRepository
+
+        root = Path(self.root)
+        config = WorkerConfig.from_environment(
+            _environment(
+                root,
+                PIPELINE_WORKER_REALTIME_INGEST=_realtime_settings(root),
+                PIPELINE_WORKER_DATABASE_URL="postgresql+psycopg://pipeline:secret@db/idea2strategy",
+            )
+        )
+        guarded_engine = Mock()
+        with patch(
+            "market_pipeline_lib.db.engine.create_market_data_engine",
+            return_value=guarded_engine,
+        ) as create_engine:
+            repository = EngineRealtimeIngestPort(config)._watermark_repository()
+
+        self.assertIsInstance(repository, SqlWatermarkRepository)
+        create_engine.assert_called_once_with(
+            "postgresql+psycopg://pipeline:secret@db/idea2strategy",
+            writable_schemas=["market_data"],
+            application_name="idea2strategy-pipeline-worker-watermarks",
+        )
+
+    def test_realtime_port_refuses_new_work_after_cooperative_stop(self) -> None:
+        from apps.common.errors import ExecutionCancelledError
+        from apps.pipeline_worker.realtime import EngineRealtimeIngestPort
+
+        root = Path(self.root)
+        config = WorkerConfig.from_environment(
+            _environment(root, PIPELINE_WORKER_REALTIME_INGEST=_realtime_settings(root))
+        )
+        port = EngineRealtimeIngestPort(config)
+        port.request_stop("SIGTERM")
+
+        with self.assertRaises(ExecutionCancelledError) as raised:
+            port.ingest(_realtime_events(1), flush=True)
+        self.assertIn("SIGTERM", str(raised.exception))
+
+    def test_executor_forwards_cooperative_stop_to_the_active_port(self) -> None:
+        root = Path(self.root)
+        config = WorkerConfig.from_environment(_environment(root))
+        realtime = Mock()
+        executor = PipelineCommandExecutor(config, realtime_port=realtime)
+
+        executor.request_stop("spot-interruption")
+
+        realtime.request_stop.assert_called_once_with("spot-interruption")
 
 
 # --------------------------------------------------------------------------------------

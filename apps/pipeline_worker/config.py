@@ -81,6 +81,13 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "AWS region for the SQS client.",
     ),
     (
+        "PIPELINE_WORKER_DATABASE_URL",
+        False,
+        "",
+        "PostgreSQL URL used for durable realtime watermarks. Empty keeps the local "
+        "in-memory repository for development only.",
+    ),
+    (
         "PIPELINE_WORKER_MAX_RECEIVE_COUNT",
         False,
         "5",
@@ -341,6 +348,7 @@ class WorkerConfig:
     health_port: int | None
     realtime: RealtimeIngestSettings | None
     exit_after_idle_polls: int = 0
+    database_url: str | None = None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -397,6 +405,7 @@ class WorkerConfig:
         )
 
         endpoint_raw = values.get("PIPELINE_WORKER_AWS_ENDPOINT_URL")
+        database_url_raw = values.get("PIPELINE_WORKER_DATABASE_URL")
         realtime_raw = values.get("PIPELINE_WORKER_REALTIME_INGEST")
 
         return cls(
@@ -408,6 +417,11 @@ class WorkerConfig:
             dead_letter_queue_url=dead_letter_queue_url,
             aws_endpoint_url=None if _blank(endpoint_raw) else str(endpoint_raw).strip(),
             aws_region=(values.get("PIPELINE_WORKER_AWS_REGION") or "us-east-1").strip(),
+            database_url=(
+                None
+                if _blank(database_url_raw)
+                else str(database_url_raw).strip()
+            ),
             log_level=log_level,
             poll_interval_seconds=_require_float(
                 values, "PIPELINE_WORKER_POLL_INTERVAL_SECONDS", "1.0", minimum=0.001
@@ -463,6 +477,7 @@ class WorkerConfig:
             "dead_letter_queue_configured": self.dead_letter_queue_url is not None,
             "aws_endpoint_override": self.aws_endpoint_url is not None,
             "aws_region": self.aws_region,
+            "database_configured": self.database_url is not None,
             "log_level": self.log_level,
             "poll_interval_seconds": self.poll_interval_seconds,
             "max_messages_per_poll": self.max_messages_per_poll,
