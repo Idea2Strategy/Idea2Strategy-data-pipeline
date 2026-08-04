@@ -468,6 +468,135 @@ class WorkerBootTests(unittest.TestCase):
             self.assertEqual(redelivered[0].body["command_id"], "cmd-requeued")
             self.assertEqual(redelivered[0].receive_count, 2)
 
+    def test_long_running_command_renews_its_queue_visibility(self) -> None:
+        """Work longer than one visibility window must not be delivered twice."""
+
+        class _HeartbeatSource(InProcessMessageSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self.extensions: list[tuple[str, int]] = []
+
+            def extend_visibility(self, message: Any, *, timeout_seconds: int) -> None:
+                self.extensions.append((message.message_id, timeout_seconds))
+
+        class _BlockingExecutor:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def prepare(self) -> None:
+                return
+
+            def execute(self, command: Command) -> dict[str, str]:
+                self.started.set()
+                self.release.wait(timeout=5.0)
+                return {"status": "DONE"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(
+                _environment(
+                    Path(tmp),
+                    PIPELINE_WORKER_VISIBILITY_TIMEOUT_SECONDS="1",
+                )
+            )
+            source = _HeartbeatSource()
+            executor = _BlockingExecutor()
+            worker = PipelineWorker(config, message_source=source, executor=executor)  # type: ignore[arg-type]
+            message_id = source.submit(
+                {"command": "VALIDATE_CATALOG", "command_id": "cmd-long"}
+            )
+            queued_message_id = source.submit(
+                {"command": "VALIDATE_CATALOG", "command_id": "cmd-prefetched"}
+            )
+
+            thread = threading.Thread(target=worker.run, name="worker-heartbeat", daemon=True)
+            thread.start()
+            self.assertTrue(executor.started.wait(timeout=2.0))
+            self.assertTrue(
+                self._await(
+                    lambda: {message_id, queued_message_id}.issubset(
+                        {entry[0] for entry in source.extensions}
+                    ),
+                    timeout=2.0,
+                )
+            )
+            executor.release.set()
+            self.assertTrue(self._await(lambda: worker.health.succeeded == 2))
+            worker.request_stop("test")
+            thread.join(timeout=5.0)
+
+            self.assertEqual(
+                {entry[0] for entry in source.extensions},
+                {message_id, queued_message_id},
+            )
+            self.assertTrue(all(entry[1] == 1 for entry in source.extensions))
+            self.assertEqual(source.pending(), 0)
+
+    def test_spot_stop_is_forwarded_to_a_cooperative_executor(self) -> None:
+        class _CooperativeExecutor:
+            def __init__(self) -> None:
+                self.stop_reasons: list[str] = []
+
+            def prepare(self) -> None:
+                return
+
+            def execute(self, command: Command) -> dict[str, str]:
+                return {"status": "DONE"}
+
+            def request_stop(self, reason: str) -> None:
+                self.stop_reasons.append(reason)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = _CooperativeExecutor()
+            worker = PipelineWorker(
+                WorkerConfig.from_environment(_environment(Path(tmp))),
+                executor=executor,  # type: ignore[arg-type]
+            )
+
+            worker.request_stop("SIGTERM")
+
+            self.assertEqual(executor.stop_reasons, ["SIGTERM"])
+
+    def test_visibility_renewal_failure_leaves_the_message_for_redelivery(self) -> None:
+        class _FailingHeartbeatSource(InProcessMessageSource):
+            def extend_visibility(self, message: Any, *, timeout_seconds: int) -> None:
+                raise RuntimeError("SQS visibility renewal unavailable")
+
+        class _SlowExecutor:
+            def prepare(self) -> None:
+                return
+
+            def execute(self, command: Command) -> dict[str, str]:
+                time.sleep(0.5)
+                return {"status": "DONE"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(
+                _environment(
+                    Path(tmp),
+                    PIPELINE_WORKER_VISIBILITY_TIMEOUT_SECONDS="1",
+                    PIPELINE_WORKER_RETRY_DELAY_SECONDS="0",
+                )
+            )
+            source = _FailingHeartbeatSource()
+            worker = PipelineWorker(
+                config,
+                message_source=source,
+                executor=_SlowExecutor(),  # type: ignore[arg-type]
+            )
+            source.submit({"command": "VALIDATE_CATALOG", "command_id": "cmd-lease-lost"})
+            first = source.poll(max_messages=1, wait_seconds=0.0)[0]
+
+            worker._process(source, first)
+
+            self.assertEqual(worker.results[0]["outcome"], "FAILED")
+            self.assertEqual(
+                worker.results[0]["detail"]["code"], "VISIBILITY_HEARTBEAT_FAILED"
+            )
+            redelivered = source.poll(max_messages=1, wait_seconds=0.0)
+            self.assertEqual(len(redelivered), 1)
+            self.assertEqual(redelivered[0].message_id, first.message_id)
+
     def test_validate_dataset_manifest_command_runs_the_canonical_validator(self) -> None:
         fixtures = json.loads(
             (Path(__file__).parent / "fixtures/contracts/com06-d-fixtures.v1.json").read_text(
@@ -800,6 +929,28 @@ class WorkerHealthEndpointTests(unittest.TestCase):
 
 
 class DeadLetterTests(unittest.TestCase):
+    def test_a_dead_letter_send_failure_never_deletes_the_original_message(self) -> None:
+        class _UnavailableDeadLetterSource(InProcessMessageSource):
+            def dead_letter(self, message: Any, *, reason: str) -> None:
+                raise RuntimeError("DLQ unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(
+                _environment(Path(tmp), PIPELINE_WORKER_RETRY_DELAY_SECONDS="0")
+            )
+            source = _UnavailableDeadLetterSource()
+            worker = PipelineWorker(config, message_source=source)
+            source.submit({"command": "MAKE_COFFEE", "command_id": "cmd-preserved"})
+            first = source.poll(max_messages=1, wait_seconds=0.0)[0]
+
+            worker._process(source, first)
+
+            self.assertEqual(source.pending(), 1)
+            redelivered = source.poll(max_messages=1, wait_seconds=0.0)
+            self.assertEqual(len(redelivered), 1)
+            self.assertEqual(redelivered[0].message_id, first.message_id)
+            self.assertEqual(worker.results[0]["outcome"], "FAILED")
+
     def test_a_repeatedly_failing_message_is_parked_after_max_receives(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = WorkerConfig.from_environment(

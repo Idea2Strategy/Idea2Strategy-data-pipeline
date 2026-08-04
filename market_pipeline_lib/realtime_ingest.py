@@ -925,6 +925,11 @@ class RealtimeEventSource(Protocol):
     def retry_later(self, delivery: RealtimeDelivery, *, delay_seconds: float) -> None:
         """Make the message visible again after `delay_seconds`."""
 
+    def extend_visibility(
+        self, delivery: RealtimeDelivery, *, timeout_seconds: int
+    ) -> None:
+        """Renew an in-flight delivery while its work is still running."""
+
     def dead_letter(self, delivery: RealtimeDelivery, *, reason: str) -> None:
         """Park the message on the dead-letter queue and remove it from this one."""
 
@@ -1012,6 +1017,15 @@ class SqsEventSource:
             QueueUrl=self._queue_url,
             ReceiptHandle=delivery.receipt_handle,
             VisibilityTimeout=max(0, int(delay_seconds)),
+        )
+
+    def extend_visibility(
+        self, delivery: RealtimeDelivery, *, timeout_seconds: int
+    ) -> None:
+        self._client.change_message_visibility(
+            QueueUrl=self._queue_url,
+            ReceiptHandle=delivery.receipt_handle,
+            VisibilityTimeout=max(0, min(int(timeout_seconds), 43_200)),
         )
 
     def dead_letter(self, delivery: RealtimeDelivery, *, reason: str) -> None:

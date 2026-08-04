@@ -1,8 +1,9 @@
 """Message-source port for `pipeline-worker`, and its two adapters.
 
 The worker is a durable-queue consumer.  The queue is behind the
-:class:`MessageSource` port -- receive / acknowledge / retry_later / dead_letter
-/ close -- so the loop is identical whichever adapter is in play.
+:class:`MessageSource` port -- receive / acknowledge / retry_later /
+extend_visibility / dead_letter / close -- so the loop is identical whichever
+adapter is in play.
 
 :class:`InProcessMessageSource`
     A real, working local queue that deliberately reproduces the awkward parts of
@@ -62,6 +63,9 @@ class MessageSource(Protocol):
 
     def retry_later(self, message: Message, *, delay_seconds: float) -> None:
         """Return the message to the queue for another delivery attempt."""
+
+    def extend_visibility(self, message: Message, *, timeout_seconds: int) -> None:
+        """Keep an in-flight message private while its command is still running."""
 
     def dead_letter(self, message: Message, *, reason: str) -> None:
         """Park the message where an operator can find it, and stop delivering it."""
@@ -156,6 +160,12 @@ class InProcessMessageSource:
             envelope.in_flight = False
             envelope.visible_at = time.monotonic() + max(delay_seconds, 0.0)
 
+    def extend_visibility(self, message: Message, *, timeout_seconds: int) -> None:
+        with self._lock:
+            envelope = self._envelopes.get(message.message_id)
+            if envelope is not None:
+                envelope.visible_at = time.monotonic() + max(timeout_seconds, 0)
+
     def dead_letter(self, message: Message, *, reason: str) -> None:
         with self._lock:
             self._envelopes.pop(message.message_id, None)
@@ -221,6 +231,11 @@ class SqsMessageSource:
 
     def retry_later(self, message: Message, *, delay_seconds: float) -> None:
         self._source.retry_later(self._delivery(message), delay_seconds=delay_seconds)
+
+    def extend_visibility(self, message: Message, *, timeout_seconds: int) -> None:
+        self._source.extend_visibility(
+            self._delivery(message), timeout_seconds=timeout_seconds
+        )
 
     def dead_letter(self, message: Message, *, reason: str) -> None:
         self._source.dead_letter(self._delivery(message), reason=reason)

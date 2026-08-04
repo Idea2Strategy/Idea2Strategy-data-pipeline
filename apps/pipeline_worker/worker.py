@@ -62,6 +62,51 @@ OUTCOME_FAILED = "FAILED"
 OUTCOME_DEAD_LETTERED = "DEAD_LETTERED"
 
 
+class _VisibilityHeartbeat:
+    """Renew one queue lease until synchronous command execution returns."""
+
+    def __init__(
+        self,
+        source: MessageSource,
+        message: Message,
+        *,
+        timeout_seconds: int,
+    ) -> None:
+        self._source = source
+        self._message = message
+        self._timeout_seconds = timeout_seconds
+        self._interval_seconds = max(0.1, min(timeout_seconds / 3.0, 20.0))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.error: Exception | None = None
+
+    def start(self) -> None:
+        if self._timeout_seconds <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"visibility-{self._message.message_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                self._source.extend_visibility(
+                    self._message,
+                    timeout_seconds=self._timeout_seconds,
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced to the owner thread
+                self.error = error
+                self._stop.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self._interval_seconds * 2, 1.0))
+
+
 class PipelineWorker:
     """Long-running durable-queue consumer for market-data pipeline commands."""
 
@@ -109,6 +154,16 @@ class PipelineWorker:
         if not self._stop.is_set():
             self._stop.set()
             self.health.mark_draining(reason)
+            cooperative_stop = getattr(self._executor, "request_stop", None)
+            if callable(cooperative_stop):
+                try:
+                    cooperative_stop(reason)
+                except Exception as error:  # noqa: BLE001 - draining must continue
+                    LOGGER.error(
+                        "worker.cooperative_stop.failed",
+                        extra={"reason": reason},
+                        exc_info=error,
+                    )
 
     def run(self) -> int:
         """Run until stopped.  Returns a process exit code."""
@@ -186,22 +241,57 @@ class PipelineWorker:
         *,
         deadline: float | None,
     ) -> None:
-        for message in messages:
-            deadline_expired = deadline is not None and time.monotonic() >= deadline
-            if self._stop.is_set() or deadline_expired:
-                source.retry_later(message, delay_seconds=0.0)
-                LOGGER.warning(
-                    "worker.drain.requeued",
-                    extra={
-                        "message_id": message.message_id,
-                        "reason": self._stop_reason if self._stop.is_set() else "deadline-expired",
-                    },
-                )
-                continue
-            self._process(source, message)
+        heartbeats = {
+            message.receipt_handle: _VisibilityHeartbeat(
+                source,
+                message,
+                timeout_seconds=self.config.visibility_timeout_seconds,
+            )
+            for message in messages
+        }
+        for heartbeat in heartbeats.values():
+            heartbeat.start()
+        try:
+            for message in messages:
+                heartbeat = heartbeats[message.receipt_handle]
+                deadline_expired = deadline is not None and time.monotonic() >= deadline
+                if self._stop.is_set() or deadline_expired or heartbeat.error is not None:
+                    heartbeat.stop()
+                    source.retry_later(message, delay_seconds=0.0)
+                    LOGGER.warning(
+                        "worker.drain.requeued",
+                        extra={
+                            "message_id": message.message_id,
+                            "reason": (
+                                "visibility-heartbeat-failed"
+                                if heartbeat.error is not None
+                                else self._stop_reason
+                                if self._stop.is_set()
+                                else "deadline-expired"
+                            ),
+                        },
+                    )
+                    continue
+                self._process(source, message, heartbeat=heartbeat)
+        finally:
+            for heartbeat in heartbeats.values():
+                heartbeat.stop()
 
-    def _process(self, source: MessageSource, message: Message) -> None:
+    def _process(
+        self,
+        source: MessageSource,
+        message: Message,
+        *,
+        heartbeat: _VisibilityHeartbeat | None = None,
+    ) -> None:
         started = time.perf_counter()
+        visibility = heartbeat or _VisibilityHeartbeat(
+            source,
+            message,
+            timeout_seconds=self.config.visibility_timeout_seconds,
+        )
+        if heartbeat is None:
+            visibility.start()
         try:
             command = Command.parse(message.body, fallback_command_id=message.message_id)
         except MalformedEventError as error:
@@ -209,18 +299,23 @@ class PipelineWorker:
             # parked on the dead-letter queue rather than deleted, so the producer
             # defect is recoverable, and recorded as REJECTED so it is never
             # mistaken for a success.
+            visibility.stop()
+            parked = self._park(source, message, reason=error.code)
             self._record(
                 command="<malformed>",
                 command_id=message.message_id,
-                outcome=OUTCOME_REJECTED,
-                detail={"code": error.code, "reason": str(error)},
+                outcome=OUTCOME_REJECTED if parked else OUTCOME_FAILED,
+                detail={
+                    "code": error.code if parked else "DEAD_LETTER_UNAVAILABLE",
+                    "reason": str(error),
+                },
                 message=message,
                 started=started,
             )
-            self._park(source, message, reason=error.code)
             return
 
         if not self._idempotency.claim(command.command_id):
+            visibility.stop()
             self._record(
                 command=command.command,
                 command_id=command.command_id,
@@ -235,18 +330,23 @@ class PipelineWorker:
         try:
             detail = self._executor.execute(command)
         except MalformedEventError as error:
+            visibility.stop()
             self._idempotency.forget(command.command_id)
+            parked = self._park(source, message, reason=error.code)
             self._record(
                 command=command.command,
                 command_id=command.command_id,
-                outcome=OUTCOME_REJECTED,
-                detail={"code": error.code, "reason": str(error)},
+                outcome=OUTCOME_REJECTED if parked else OUTCOME_FAILED,
+                detail={
+                    "code": error.code if parked else "DEAD_LETTER_UNAVAILABLE",
+                    "reason": str(error),
+                },
                 message=message,
                 started=started,
             )
-            self._park(source, message, reason=error.code)
             return
         except Exception as error:  # noqa: BLE001 - the loop must survive one bad command
+            visibility.stop()
             # Includes PortNotConfiguredError: the command is valid, the worker
             # simply cannot complete it.  It goes back on the queue rather than
             # being answered with an empty success -- until it has used up its
@@ -254,18 +354,43 @@ class PipelineWorker:
             self._idempotency.forget(command.command_id)
             detail = {"code": getattr(error, "code", type(error).__name__), "reason": str(error)}
             exhausted = message.receive_count >= self.config.max_receive_count
+            parked = True
+            if exhausted:
+                parked = self._park(source, message, reason="MAX_RECEIVES_EXCEEDED")
             self._record(
                 command=command.command,
                 command_id=command.command_id,
-                outcome=OUTCOME_DEAD_LETTERED if exhausted else OUTCOME_FAILED,
+                outcome=OUTCOME_DEAD_LETTERED if exhausted and parked else OUTCOME_FAILED,
                 detail=detail,
                 message=message,
                 started=started,
             )
-            if exhausted:
-                self._park(source, message, reason="MAX_RECEIVES_EXCEEDED")
-            else:
+            if not exhausted:
                 source.retry_later(message, delay_seconds=self.config.retry_delay_seconds)
+            return
+
+        visibility.stop()
+        if visibility.error is not None:
+            self._idempotency.forget(command.command_id)
+            self._record(
+                command=command.command,
+                command_id=command.command_id,
+                outcome=OUTCOME_FAILED,
+                detail={
+                    "code": "VISIBILITY_HEARTBEAT_FAILED",
+                    "reason": str(visibility.error),
+                },
+                message=message,
+                started=started,
+            )
+            try:
+                source.retry_later(message, delay_seconds=0.0)
+            except Exception as error:  # noqa: BLE001 - never acknowledge uncertain work
+                LOGGER.error(
+                    "worker.visibility_requeue.failed",
+                    extra={"message_id": message.message_id},
+                    exc_info=error,
+                )
             return
 
         self._record(
@@ -278,12 +403,12 @@ class PipelineWorker:
         )
         source.acknowledge(message)
 
-    def _park(self, source: MessageSource, message: Message, *, reason: str) -> None:
+    def _park(self, source: MessageSource, message: Message, *, reason: str) -> bool:
         """Move a message off the queue for good, preferring the dead-letter queue.
 
-        A source without a dead-letter hop (or one that cannot reach it) must
-        still stop cycling the message, so the fallback is an acknowledgement --
-        logged at ERROR, because the payload is then only in the log.
+        If the dead-letter hop fails, the original message is made visible again.
+        It is never acknowledged: losing a recoverable payload is worse than a
+        repeated poison delivery.
         """
 
         try:
@@ -294,8 +419,15 @@ class PipelineWorker:
                 extra={"message_id": message.message_id, "reason": reason, "body": dict(message.body)},
                 exc_info=error,
             )
-            source.acknowledge(message)
-            return
+            try:
+                source.retry_later(message, delay_seconds=self.config.retry_delay_seconds)
+            except Exception as retry_error:  # noqa: BLE001 - leave the SQS lease to expire
+                LOGGER.error(
+                    "worker.dead_letter.requeue_failed",
+                    extra={"message_id": message.message_id, "reason": reason},
+                    exc_info=retry_error,
+                )
+            return False
         LOGGER.warning(
             "worker.message.parked",
             extra={
@@ -304,6 +436,7 @@ class PipelineWorker:
                 "attempt": message.receive_count,
             },
         )
+        return True
 
     # -- reporting --------------------------------------------------------
     def _record(
