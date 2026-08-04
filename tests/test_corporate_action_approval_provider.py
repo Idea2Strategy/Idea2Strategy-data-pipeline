@@ -110,7 +110,12 @@ def result(
 
 
 class CorporateActionProviderResultTest(unittest.TestCase):
-    def service(self, rows: list[dict[str, object]], *, active: bool = True) -> tuple[CorporateActionReviewService, Catalog, Regenerator]:
+    def service(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        active: bool = True,
+    ) -> tuple[CorporateActionReviewService, Catalog, Regenerator]:
         catalog = Catalog(rows)
         regenerator = Regenerator()
         verifier = ApprovalEvidenceVerifier(Operators(active), Audits(), PERMISSION, "schema-v1")
@@ -183,7 +188,10 @@ class CorporateActionProviderResultTest(unittest.TestCase):
         )
         outcome = service.apply_approval_result(named)
         self.assertEqual(outcome.state, ReviewState.APPROVED)
-        states = {str(item["id"]): item["terms_document"]["review"]["state"] for item in catalog.rows}  # type: ignore[index]
+        states = {
+            str(item["id"]): item["terms_document"]["review"]["state"]  # type: ignore[index]
+            for item in catalog.rows
+        }
         self.assertEqual(states[str(PRIOR)], "SUPERSEDED")
         self.assertEqual(states[str(CANDIDATE)], "APPROVED")
         self.assertEqual(regenerator.calls, 1)

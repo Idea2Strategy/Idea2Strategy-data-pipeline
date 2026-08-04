@@ -256,7 +256,12 @@ class CorporateActionReviewService:
             if conflicts:
                 if len(conflicts) != 1 or result.supersedes_candidate_id != UUID(str(conflicts[0]["id"])):
                     self._refuse(row, result, "UNNAMED_SUPERSEDE_CONFLICT")
-                self._provider_transition(conflicts[0], result, ReviewState.SUPERSEDED, affected_candidate=result.supersedes_candidate_id)
+                self._provider_transition(
+                    conflicts[0],
+                    result,
+                    ReviewState.SUPERSEDED,
+                    affected_candidate=result.supersedes_candidate_id,
+                )
             elif result.supersedes_candidate_id is not None:
                 self._refuse(row, result, "SUPERSEDED_CANDIDATE_NOT_APPROVED")
             self._provider_transition(row, result, ReviewState.APPROVED)

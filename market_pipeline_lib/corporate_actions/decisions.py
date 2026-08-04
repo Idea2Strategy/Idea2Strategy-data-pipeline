@@ -99,7 +99,10 @@ class ApprovalResult:
         if not _sha256(self.decided_content_hash):
             raise ApprovalRefusedError("DECIDED_CONTENT_HASH_INVALID", "decidedContentHash must be lowercase SHA-256")
         if not self.evidence_bindings or any(not _sha256(item) for item in self.evidence_bindings):
-            raise ApprovalRefusedError("EVIDENCE_BINDING_INVALID", "evidenceBindings must contain lowercase SHA-256 hashes")
+            raise ApprovalRefusedError(
+                "EVIDENCE_BINDING_INVALID",
+                "evidenceBindings must contain lowercase SHA-256 hashes",
+            )
         if not self.request_schema_version.strip():
             raise ApprovalRefusedError("SCHEMA_VERSION_MISSING", "requestSchemaVersion is required")
         if self.decided_at.tzinfo is None or self.decided_at.utcoffset() != timedelta(0):
