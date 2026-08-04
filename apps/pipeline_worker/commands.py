@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from apps.common.errors import MalformedEventError, PortNotConfiguredError, UnknownCommandError
 from apps.common.events import (
@@ -44,6 +44,7 @@ SUPPORTED_COMMANDS: tuple[str, ...] = (
     "VALIDATE_DATASET_MANIFEST",
     "PUBLISH_DATASET",
     "INGEST_REALTIME_BARS",
+    "APPLY_CORPORATE_ACTION_APPROVAL",
 )
 
 
@@ -94,6 +95,19 @@ class UnconfiguredDatasetPublicationPort:
         )
 
 
+@runtime_checkable
+class CorporateActionApprovalPort(Protocol):
+    def apply(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class UnconfiguredCorporateActionApprovalPort:
+    def apply(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise PortNotConfiguredError(
+            "APPLY_CORPORATE_ACTION_APPROVAL requires the verified backend-relay "
+            "consumer adapter; refusing rather than treating an unwired provider as empty"
+        )
+
+
 class PipelineCommandExecutor:
     """Dispatches a validated :class:`Command` to its domain implementation."""
 
@@ -103,6 +117,7 @@ class PipelineCommandExecutor:
         *,
         publication_port: DatasetPublicationPort | None = None,
         realtime_port: RealtimeIngestPort | None = None,
+        corporate_action_approval_port: CorporateActionApprovalPort | None = None,
     ) -> None:
         self._config = config
         self._publication_port: DatasetPublicationPort = (
@@ -114,6 +129,10 @@ class PipelineCommandExecutor:
             self._realtime_port = EngineRealtimeIngestPort(config)
         else:
             self._realtime_port = UnconfiguredRealtimeIngestPort()
+        self._corporate_action_approval_port = (
+            corporate_action_approval_port
+            or self._build_corporate_action_approval_port(config)
+        )
 
     def prepare(self) -> None:
         """Create the configured roots so the first command has somewhere to read."""
@@ -122,11 +141,77 @@ class PipelineCommandExecutor:
         self._config.object_store_root.mkdir(parents=True, exist_ok=True)
         if self._config.realtime is not None:
             self._config.realtime.staging_root.mkdir(parents=True, exist_ok=True)
+        prepare = getattr(self._corporate_action_approval_port, "prepare", None)
+        if callable(prepare):
+            prepare()
+
+    @staticmethod
+    def _build_corporate_action_approval_port(config: WorkerConfig) -> CorporateActionApprovalPort:
+        settings = config.corporate_action_approval
+        if settings is None:
+            return UnconfiguredCorporateActionApprovalPort()
+        assert config.database_url is not None  # validated by WorkerConfig
+        from market_pipeline_lib.catalog import PostgresCatalog, StorageObjectsPolicy
+        from market_pipeline_lib.corporate_actions import (
+            AdjustedDatasetRegenerator,
+            ApprovalEvidenceVerifier,
+            BackendRelayApprovalConsumer,
+            CorporateActionReviewService,
+        )
+        from market_pipeline_lib.corporate_actions.object_bars import (
+            CatalogObjectBarReader,
+            ImmutableObjectBarWriter,
+        )
+        from market_pipeline_lib.corporate_actions.postgres_evidence import (
+            PostgresApprovalAuditDirectory,
+            PostgresOperatorDirectory,
+        )
+        from market_pipeline_lib.storage import S3ObjectStore
+
+        catalog = PostgresCatalog.connect(
+            config.database_url,
+            artifact_root=config.catalog_root,
+            storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
+        )
+        store = S3ObjectStore(
+            settings.object_bucket,
+            prefix=settings.object_prefix,
+            endpoint_url=config.aws_endpoint_url,
+        )
+        regenerator = AdjustedDatasetRegenerator(
+            catalog=catalog,
+            reader=CatalogObjectBarReader(catalog=catalog, object_store=store),
+            writer=ImmutableObjectBarWriter(
+                object_store=store, staging_root=settings.staging_root
+            ),
+            require_feed_compatibility=True,
+        )
+        verifier = ApprovalEvidenceVerifier(
+            operators=PostgresOperatorDirectory(catalog.engine),
+            audits=PostgresApprovalAuditDirectory(catalog.engine),
+            permission_id=settings.permission_id,
+            request_schema_version=settings.request_schema_version,
+        )
+        service = CorporateActionReviewService(
+            catalog=catalog,
+            regenerator=regenerator,
+            raw_manifest_id=None,
+            adjusted_feed_id=settings.adjusted_feed_id,
+            approval_verifier=verifier,
+        )
+        return cast(
+            CorporateActionApprovalPort,
+            BackendRelayApprovalConsumer(service, catalog=catalog),
+        )
 
     def request_stop(self, reason: str) -> None:
         """Forward a shutdown request to adapters that expose cooperative cancellation."""
 
-        for port in (self._publication_port, self._realtime_port):
+        for port in (
+            self._publication_port,
+            self._realtime_port,
+            self._corporate_action_approval_port,
+        ):
             stop = getattr(port, "request_stop", None)
             if callable(stop):
                 stop(reason)
@@ -140,6 +225,8 @@ class PipelineCommandExecutor:
             return self._publication_port.publish(command.payload)
         if command.command == "INGEST_REALTIME_BARS":
             return self._ingest_realtime_bars(command.payload)
+        if command.command == "APPLY_CORPORATE_ACTION_APPROVAL":
+            return self._corporate_action_approval_port.apply(command.payload)
         raise UnknownCommandError(f"no executor for command {command.command!r}")
 
     def _ingest_realtime_bars(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:

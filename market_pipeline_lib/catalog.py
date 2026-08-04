@@ -15,10 +15,8 @@ Four things are deliberately explicit rather than defaulted:
     one-row reference upserts, and is *not* enough for a publish.
 
 `StorageObjectsPolicy`
-    `DatabaseAccessPolicy.java:36` registers the `storage` schema as SHARED while the
-    implementation checklist calls it D-owned.  `PostgresCatalog` therefore refuses to
-    guess: the caller states which side of that unresolved contradiction it is acting
-    on, and the choice narrows the connection's writable schema set.
+    Root issue #139 settled `storage.objects` write ownership on D. Production writers
+    opt into that exact boundary; read-only consumers can still refuse storage writes.
 
 `CatalogCapability`
     `market_data.pipeline_run_outputs` does not exist in `db/schema.dbml`.  The local
@@ -144,13 +142,14 @@ class CatalogCapability(StrEnum):
 
 
 class StorageObjectsPolicy(StrEnum):
-    """Which side of the `storage` schema ownership contradiction the caller takes."""
+    """Whether this D catalog instance may register immutable storage objects."""
 
     #: Read `storage.objects`; refuse to write it.  Matches `DatabaseAccessPolicy`.
     READ_ONLY = "READ_ONLY"
-    #: Write it, because `dataset_objects.object_id` is a NOT NULL foreign key to it and
-    #: the pipeline cannot publish without it.  Matches the implementation checklist.
+    #: Deprecated spelling retained for callers compiled before root issue #139 settled.
     WRITE_PENDING_OWNERSHIP_DECISION = "WRITE_PENDING_OWNERSHIP_DECISION"
+    #: D owns storage object registration; publication cannot satisfy its FK without it.
+    WRITE_D_OWNED = "WRITE_D_OWNED"
 
 
 @runtime_checkable
@@ -601,7 +600,10 @@ class PostgresCatalog:
         """
 
         writable = [MARKET_DATA_SCHEMA]
-        if storage_objects is StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION:
+        if storage_objects in {
+            StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION,
+            StorageObjectsPolicy.WRITE_D_OWNED,
+        }:
             writable.append(STORAGE_SCHEMA)
         engine = create_market_data_engine(database_url, writable_schemas=writable, **engine_kwargs)
         return cls(
@@ -796,14 +798,15 @@ class PostgresCatalog:
     def _guard_storage_write(self, table: str) -> None:
         if table != "storage.objects":
             return
-        if self._storage_objects is StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION:
+        if self._storage_objects in {
+            StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION,
+            StorageObjectsPolicy.WRITE_D_OWNED,
+        }:
             return
         raise StorageOwnershipUnresolved(
             "this catalog was constructed with StorageObjectsPolicy.READ_ONLY, so it "
-            "will not write storage.objects. DatabaseAccessPolicy.java:36 registers the "
-            "storage schema as SHARED while the implementation checklist calls it "
-            "D-owned; pass StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION to act "
-            "on the checklist's side until that is settled centrally."
+            "will not write storage.objects; pass StorageObjectsPolicy.WRITE_D_OWNED "
+            "only from the D-owned publication composition root."
         )
 
     def upsert(self, table: str, record: Mapping[str, Any]) -> None:

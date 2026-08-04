@@ -275,7 +275,10 @@ def _execute_scripts(url: str, scripts: list[str]) -> None:
             cursor = raw.cursor()
             for script in scripts:
                 cursor.execute(script)
-            raw.commit()
+                # Flyway commits each versioned migration independently. This is
+                # observable for PostgreSQL enum additions, whose new values
+                # cannot be referenced until the ALTER TYPE transaction commits.
+                raw.commit()
         finally:
             raw.close()
     finally:
@@ -314,9 +317,8 @@ def postgres_catalog(postgres_url: str, truncate_market_data: None, tmp_path: Pa
     catalog = PostgresCatalog.connect(
         postgres_url,
         artifact_root=tmp_path / "catalog-artifacts",
-        # The pipeline stages objects, so this instance takes the write side of the
-        # `storage` ownership contradiction explicitly.  See `db/tables.py`.
-        storage_objects=StorageObjectsPolicy.WRITE_PENDING_OWNERSHIP_DECISION,
+        # Root issue #139 assigns immutable object registration to D.
+        storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
     )
     try:
         catalog.verify_schema()

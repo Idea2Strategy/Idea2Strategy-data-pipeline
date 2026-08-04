@@ -68,6 +68,10 @@ class Bar:
     low: Decimal
     close: Decimal
     volume: int
+    provider_symbol: str | None = None
+    session_date_et: object | None = None
+    trade_count: int | None = None
+    vwap: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.bar_start_at.tzinfo is None or self.bar_start_at.utcoffset() != timedelta(0):
@@ -214,6 +218,14 @@ def adjusted_bars(
                     (Decimal(bar.volume) * volume_factor).quantize(
                         _WHOLE, rounding=ROUND_HALF_EVEN
                     )
+                ),
+                provider_symbol=bar.provider_symbol,
+                session_date_et=bar.session_date_et,
+                trade_count=bar.trade_count,
+                vwap=(
+                    None
+                    if bar.vwap is None
+                    else _quantize_price(bar.vwap * price_factor)
                 ),
             )
         )

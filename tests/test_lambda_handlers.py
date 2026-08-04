@@ -344,6 +344,19 @@ class PipelineTriggerHandlerTests(unittest.TestCase):
                 "events": [{"symbol": "AAPL", "value": "1"}],
                 "flush": False,
             },
+            "APPLY_CORPORATE_ACTION_APPROVAL": {
+                "candidateId": "10000000-0000-4000-8000-000000000001",
+                "decision": "APPROVE",
+                "decidedContentHash": "a" * 64,
+                "evidenceBindings": ["b" * 64],
+                "actorId": "20000000-0000-4000-8000-000000000001",
+                "auditId": "30000000-0000-4000-8000-000000000001",
+                "permissionId": "20000000-0000-4000-8000-000000000012",
+                "requestSchemaVersion": "schema-v1",
+                "decidedAt": "2026-08-04T15:00:00Z",
+                "deliveryId": "40000000-0000-4000-8000-000000000001",
+                "aggregateSequence": 1,
+            },
         }
         missing = sorted(set(SUPPORTED_COMMANDS) - set(payloads))
         self.assertEqual(

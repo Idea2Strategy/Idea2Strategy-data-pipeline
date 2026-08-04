@@ -8,12 +8,19 @@ by :class:`market_pipeline_lib.corporate_actions.service.CorporateActionReviewSe
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Any
+from uuid import UUID
 
 __all__ = [
     "AdminDecision",
+    "ApprovalResult",
+    "ApprovalRefusedError",
     "ConflictingDecisionError",
     "DecisionType",
     "ReviewState",
@@ -26,6 +33,7 @@ class DecisionType(StrEnum):
 
     APPROVE = "APPROVE"
     REJECT = "REJECT"
+    WITHDRAW = "WITHDRAW"
 
 
 class ReviewState(StrEnum):
@@ -34,10 +42,16 @@ class ReviewState(StrEnum):
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    WITHDRAWN = "WITHDRAWN"
+    SUPERSEDED = "SUPERSEDED"
 
     @classmethod
     def for_decision(cls, decision: DecisionType) -> ReviewState:
-        return cls.APPROVED if decision is DecisionType.APPROVE else cls.REJECTED
+        if decision is DecisionType.APPROVE:
+            return cls.APPROVED
+        if decision is DecisionType.WITHDRAW:
+            return cls.WITHDRAWN
+        return cls.REJECTED
 
 
 class UnknownCandidateError(LookupError):
@@ -53,6 +67,111 @@ class ConflictingDecisionError(RuntimeError):
     dataset in place while the catalog claimed the action was rejected, so this
     refuses and leaves the reversal to an explicit superseding workflow.
     """
+
+
+class ApprovalRefusedError(RuntimeError):
+    """A provider result failed a canonical fail-closed rule."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ApprovalResult:
+    """The authenticated backend-relay result consumed by the pipeline."""
+
+    candidate_id: UUID
+    decision: DecisionType
+    decided_content_hash: str
+    evidence_bindings: tuple[str, ...]
+    actor_id: UUID
+    audit_id: UUID
+    permission_id: UUID
+    request_schema_version: str
+    decided_at: datetime
+    delivery_id: UUID
+    aggregate_sequence: int
+    supersedes_candidate_id: UUID | None = None
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        if self.decision not in {DecisionType.APPROVE, DecisionType.WITHDRAW}:
+            raise ApprovalRefusedError("DECISION_UNSUPPORTED", "only APPROVE and WITHDRAW are provider decisions")
+        if not _sha256(self.decided_content_hash):
+            raise ApprovalRefusedError("DECIDED_CONTENT_HASH_INVALID", "decidedContentHash must be lowercase SHA-256")
+        if not self.evidence_bindings or any(not _sha256(item) for item in self.evidence_bindings):
+            raise ApprovalRefusedError(
+                "EVIDENCE_BINDING_INVALID",
+                "evidenceBindings must contain lowercase SHA-256 hashes",
+            )
+        if not self.request_schema_version.strip():
+            raise ApprovalRefusedError("SCHEMA_VERSION_MISSING", "requestSchemaVersion is required")
+        if self.decided_at.tzinfo is None or self.decided_at.utcoffset() != timedelta(0):
+            raise ApprovalRefusedError("DECIDED_AT_INVALID", "decidedAt must be timezone-aware UTC")
+        if self.aggregate_sequence < 1:
+            raise ApprovalRefusedError("AGGREGATE_SEQUENCE_INVALID", "aggregateSequence must be positive")
+
+    @property
+    def envelope_hash(self) -> str:
+        document = {
+            "candidateId": str(self.candidate_id),
+            "decision": self.decision.value,
+            "decidedContentHash": self.decided_content_hash,
+            "evidenceBindings": list(self.evidence_bindings),
+            "actorId": str(self.actor_id),
+            "auditId": str(self.audit_id),
+            "permissionId": str(self.permission_id),
+            "requestSchemaVersion": self.request_schema_version,
+            "decidedAt": self.decided_at.isoformat().replace("+00:00", "Z"),
+            "supersedesCandidateId": (
+                None if self.supersedes_candidate_id is None else str(self.supersedes_candidate_id)
+            ),
+            "deliveryId": str(self.delivery_id),
+            "aggregateSequence": self.aggregate_sequence,
+            "rationale": self.rationale,
+        }
+        encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> ApprovalResult:
+        required = {
+            "candidateId", "decision", "decidedContentHash", "evidenceBindings",
+            "actorId", "auditId", "permissionId", "requestSchemaVersion",
+            "decidedAt", "deliveryId", "aggregateSequence",
+        }
+        missing = sorted(required - set(value))
+        if missing:
+            raise ApprovalRefusedError("APPROVAL_FIELD_MISSING", f"missing approval field(s): {missing}")
+        try:
+            evidence = value["evidenceBindings"]
+            if not isinstance(evidence, list):
+                raise TypeError("evidenceBindings")
+            supersedes = value.get("supersedesCandidateId")
+            return cls(
+                candidate_id=UUID(str(value["candidateId"])),
+                decision=DecisionType(str(value["decision"])),
+                decided_content_hash=str(value["decidedContentHash"]),
+                evidence_bindings=tuple(str(item) for item in evidence),
+                actor_id=UUID(str(value["actorId"])),
+                audit_id=UUID(str(value["auditId"])),
+                permission_id=UUID(str(value["permissionId"])),
+                request_schema_version=str(value["requestSchemaVersion"]),
+                decided_at=datetime.fromisoformat(str(value["decidedAt"]).replace("Z", "+00:00")),
+                delivery_id=UUID(str(value["deliveryId"])),
+                aggregate_sequence=int(value["aggregateSequence"]),
+                supersedes_candidate_id=None if supersedes in (None, "") else UUID(str(supersedes)),
+                rationale=str(value.get("rationale", "")),
+            )
+        except ApprovalRefusedError:
+            raise
+        except (TypeError, ValueError, KeyError) as error:
+            raise ApprovalRefusedError("APPROVAL_ENVELOPE_INVALID", "approval envelope is malformed") from error
+
+
+def _sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 @dataclass(frozen=True)

@@ -230,6 +230,39 @@ class WorkerConfigurationTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 WorkerConfig.from_environment(environment)
 
+    def test_corporate_action_production_wiring_requires_database_and_parses_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            approval = json.dumps(
+                {
+                    "adjusted_feed_id": "10000000-0000-4000-8000-000000000011",
+                    "permission_id": "20000000-0000-4000-8000-000000000012",
+                    "request_schema_version": "schema-v1",
+                    "object_bucket": "pipeline-dev",
+                    "object_prefix": "corporate-actions",
+                    "staging_root": str(root / "staging"),
+                }
+            )
+            with self.assertRaises(ConfigurationError) as missing_database:
+                WorkerConfig.from_environment(
+                    _environment(root, PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL=approval)
+                )
+            self.assertIn("PIPELINE_WORKER_DATABASE_URL", str(missing_database.exception))
+
+            config = WorkerConfig.from_environment(
+                _environment(
+                    root,
+                    PIPELINE_WORKER_DATABASE_URL="postgresql+psycopg://pipeline:secret@db/i2s",
+                    PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL=approval,
+                )
+            )
+            assert config.corporate_action_approval is not None
+            self.assertEqual(
+                str(config.corporate_action_approval.permission_id),
+                "20000000-0000-4000-8000-000000000012",
+            )
+            self.assertNotIn("secret", str(config.describe()))
+
     def test_realtime_settings_missing_a_field_abort_boot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -693,6 +726,85 @@ class WorkerBootTests(unittest.TestCase):
 
             self.assertEqual(port.calls, [{"revision": 7}])
             self.assertEqual(worker.results[0]["detail"]["status"], "PUBLISHED")
+
+    def test_approval_redelivery_and_tamper_reach_durable_domain_verification(self) -> None:
+        class _ApprovalPort:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls.append(dict(payload))
+                return {"state": "APPROVED", "regenerated": len(self.calls) == 1}
+
+        payload = {
+            "candidateId": "10000000-0000-4000-8000-000000000001",
+            "deliveryId": "40000000-0000-4000-8000-000000000001",
+            "rationale": "reviewed",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(_environment(Path(tmp)))
+            port = _ApprovalPort()
+            source = InProcessMessageSource()
+            worker = PipelineWorker(
+                config,
+                message_source=source,
+                executor=PipelineCommandExecutor(
+                    config, corporate_action_approval_port=port
+                ),
+            )
+            for body in (payload, payload, {**payload, "rationale": "tampered"}):
+                source.submit(
+                    {
+                        "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                        "command_id": payload["deliveryId"],
+                        "payload": body,
+                    }
+                )
+            thread = threading.Thread(target=worker.run, name="approval-worker", daemon=True)
+            thread.start()
+            self.assertTrue(self._await(lambda: worker.health.succeeded >= 3))
+            worker.request_stop("test")
+            thread.join(timeout=5.0)
+
+            self.assertEqual(len(port.calls), 3)
+            self.assertEqual(port.calls[-1]["rationale"], "tampered")
+
+    def test_permanent_approval_refusal_is_parked_without_retry(self) -> None:
+        from market_pipeline_lib.corporate_actions import ApprovalRefusedError
+
+        class _RefusingApprovalPort:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls += 1
+                raise ApprovalRefusedError("STALE_CONTENT_HASH", "protected hash is stale")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(_environment(Path(tmp)))
+            port = _RefusingApprovalPort()
+            source = InProcessMessageSource()
+            worker = PipelineWorker(
+                config,
+                message_source=source,
+                executor=PipelineCommandExecutor(config, corporate_action_approval_port=port),
+            )
+            source.submit(
+                {
+                    "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                    "command_id": "40000000-0000-4000-8000-000000000001",
+                    "payload": {"candidateId": "10000000-0000-4000-8000-000000000001"},
+                }
+            )
+            thread = threading.Thread(target=worker.run, name="refusal-worker", daemon=True)
+            thread.start()
+            self.assertTrue(self._await(lambda: len(source.dead_letters) == 1))
+            worker.request_stop("test")
+            thread.join(timeout=5.0)
+
+            self.assertEqual(port.calls, 1)
+            self.assertEqual(source.dead_letters[0][1], "STALE_CONTENT_HASH")
+            self.assertEqual(worker.results[0]["outcome"], "REJECTED")
 
     def test_run_refuses_to_start_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1245,6 +1357,50 @@ class TestWorkerOverLocalStackSqs:
         assert len(parked) == 1
         assert json.loads(parked[0]["Body"])["command_id"] == "sqs-doomed"
         assert parked[0]["MessageAttributes"]["DeadLetterReason"]["StringValue"] == "MAX_RECEIVES_EXCEEDED"
+
+    def test_approval_duplicate_and_tamper_cross_real_sqs_boundary(
+        self, worker_sqs_queues: Any, tmp_path: Path
+    ) -> None:
+        class _ApprovalPort:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls.append(dict(payload))
+                return {"state": "APPROVED", "regenerated": len(self.calls) == 1}
+
+        client, queue_url, dead_letter_url = worker_sqs_queues
+        delivery_id = "40000000-0000-4000-8000-000000000001"
+        payload = {"candidateId": "10000000-0000-4000-8000-000000000001", "rationale": "reviewed"}
+        for body in (payload, payload, {**payload, "rationale": "tampered"}):
+            client.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                        "command_id": delivery_id,
+                        "payload": body,
+                    }
+                ),
+            )
+        config = WorkerConfig.from_environment(
+            self._environment(tmp_path, queue_url, dead_letter_url)
+        )
+        port = _ApprovalPort()
+        worker = PipelineWorker(
+            config,
+            executor=PipelineCommandExecutor(config, corporate_action_approval_port=port),
+        )
+        thread = threading.Thread(target=worker.run, name="approval-sqs", daemon=True)
+        thread.start()
+        try:
+            assert WorkerBootTests._await(lambda: worker.health.succeeded >= 3, timeout=30.0)
+        finally:
+            worker.request_stop("test")
+            thread.join(timeout=15.0)
+
+        assert len(port.calls) == 3
+        assert port.calls[-1]["rationale"] == "tampered"
 
     def test_the_sqs_message_source_carries_the_receive_count_through(
         self, worker_sqs_queues: Any, tmp_path: Path

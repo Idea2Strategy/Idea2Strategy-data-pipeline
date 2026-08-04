@@ -8,9 +8,8 @@ The review gate and the data effect of passing it:
 * :mod:`.regeneration` -- publishes the rebuilt dataset as a new immutable
   manifest revision with lineage to the raw source and to the revision it
   supersedes.  Never an in-place mutation.
-* :mod:`.service` -- applies a decision: approval regenerates, rejection does
-  nothing to any dataset, and an undecided candidate is inert.
-* :mod:`.cli` -- `corporate-action-decision`, non-zero on failure.
+* :mod:`.service` -- verifies backend relay evidence, applies an approval or
+  explicit withdrawal, and regenerates exactly once.
 """
 
 from __future__ import annotations
@@ -24,8 +23,11 @@ from .adjustment import (
     cash_dividend_factor,
     split_factor,
 )
+from .consumer import BackendRelayApprovalConsumer
 from .decisions import (
     AdminDecision,
+    ApprovalRefusedError,
+    ApprovalResult,
     ConflictingDecisionError,
     DecisionType,
     ReviewState,
@@ -41,6 +43,7 @@ from .regeneration import (
     WrittenDataset,
 )
 from .service import (
+    ApprovalEvidenceVerifier,
     CorporateActionReviewService,
     DecisionOutcome,
     RegeneratorNotConfiguredError,
@@ -53,8 +56,12 @@ __all__ = [
     "AdjustedDatasetRegenerator",
     "AdjustmentFactor",
     "AdminDecision",
+    "ApprovalEvidenceVerifier",
+    "ApprovalRefusedError",
+    "ApprovalResult",
     "ApprovedAction",
     "Bar",
+    "BackendRelayApprovalConsumer",
     "ConflictingDecisionError",
     "CorporateActionReviewService",
     "DecisionOutcome",
