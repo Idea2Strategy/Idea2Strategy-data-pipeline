@@ -199,6 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--staging-root", type=Path, required=True)
     cleanup.add_argument("--run-id", required=True)
     cleanup.add_argument("--execute", action="store_true")
+    bootstrap = subparsers.add_parser(
+        "bootstrap-legacy-catalog",
+        help="read-only legacy RDS/S3 audit and retry-safe canonical DB bootstrap",
+    )
+    bootstrap.add_argument("--artifact-root", type=Path, required=True)
+    bootstrap.add_argument("--bucket", required=True)
+    bootstrap.add_argument("--expected-object-count", type=int, required=True)
+    bootstrap.add_argument("--expected-manifest-count", type=int, required=True)
+    bootstrap.add_argument("--execute", action="store_true")
     return parser
 
 
@@ -356,6 +365,52 @@ def _register_reference_data(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "bootstrap-legacy-catalog":
+        from .legacy_bootstrap import (
+            S3LegacyObjectVerifier,
+            connect_read_only_catalog,
+            materialize_legacy_catalog,
+            same_database,
+        )
+
+        source_url = os.getenv("LEGACY_DATABASE_URL")
+        target_url = os.getenv("DATABASE_URL")
+        if not source_url or not target_url:
+            raise ValueError(
+                "bootstrap-legacy-catalog requires LEGACY_DATABASE_URL and DATABASE_URL"
+            )
+        if same_database(source_url, target_url):
+            raise ValueError("legacy source and canonical target database URLs must differ")
+        import boto3
+
+        artifact_root = args.artifact_root.expanduser().resolve()
+        source = connect_read_only_catalog(source_url, artifact_root=artifact_root / "source")
+        target = (
+            PostgresCatalog.connect(
+                target_url,
+                artifact_root=artifact_root / "target",
+                storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
+            )
+            if args.execute
+            else connect_read_only_catalog(target_url, artifact_root=artifact_root / "target")
+        )
+        try:
+            source.verify_schema()
+            target.verify_schema()
+            return materialize_legacy_catalog(
+                source,
+                target,
+                object_verifier=S3LegacyObjectVerifier(
+                    boto3.client("s3"), expected_bucket=args.bucket
+                ),
+                expected_object_count=args.expected_object_count,
+                expected_manifest_count=args.expected_manifest_count,
+                execute=args.execute,
+            )
+        finally:
+            target.close()
+            source.close()
+
     if args.command == "register-reference-data":
         return _register_reference_data(args)
     if args.command in {

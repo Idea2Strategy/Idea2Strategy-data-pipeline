@@ -270,6 +270,42 @@ benchmark는 파일 크기, part/granularity 수, 전체 Manifest 조회 시간,
 
 ## Catalog, S3, PostgreSQL
 
+### Legacy RDS/S3 catalog bootstrap
+
+`bootstrap-legacy-catalog` copies canonical metadata only. It opens the legacy
+database with PostgreSQL `default_transaction_read_only=on` plus the pipeline SQL
+write guard, verifies every S3 object at the exact version recorded in
+`storage.objects`, and then appends missing rows to the new database in one
+transaction. It never uploads, deletes, or rewrites an S3 object and never updates a
+legacy row. A target must be empty or an exact subset of the source; divergent or
+extra target rows fail closed. Replaying an already completed bootstrap returns
+`ALREADY_APPLIED`.
+
+Supply `LEGACY_DATABASE_URL` and `DATABASE_URL` through the one-shot task's Secrets
+Manager bindings. Do not place either URL in a command line or committed file.
+
+```powershell
+# Required preflight; performs DB reads and version-pinned S3 HEAD requests only.
+market-pipeline bootstrap-legacy-catalog `
+  --artifact-root .\bootstrap-evidence `
+  --bucket $env:MARKET_DATA_BUCKET `
+  --expected-object-count 768 `
+  --expected-manifest-count 96
+
+# Run only after reviewing the preflight digest and per-table counts.
+market-pipeline bootstrap-legacy-catalog `
+  --artifact-root .\bootstrap-evidence `
+  --bucket $env:MARKET_DATA_BUCKET `
+  --expected-object-count 768 `
+  --expected-manifest-count 96 `
+  --execute
+```
+
+The current development bucket inventory that established these gates is 768
+historical Parquet objects, 96 unique manifest IDs, eight shards per manifest, and
+1,865,563,533 bytes. The command obtains every other expected row count from the
+read-only source and reports it before writing.
+
 로컬 Catalog는 `market_data_store/catalog-export` 아래 DBML 열 이름의
 JSONL을 저장합니다.
 
