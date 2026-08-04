@@ -221,6 +221,7 @@ class MarketDataCatalog(Protocol):
         data_layer: str,
         resolution: str,
         year: int,
+        instrument_id: str | None = None,
     ) -> dict[str, Any] | None: ...
 
     def objects_for_manifest(self, manifest_id: str) -> list[dict[str, Any]]: ...
@@ -494,6 +495,7 @@ class LocalCatalog:
         data_layer: str,
         resolution: str,
         year: int,
+        instrument_id: str | None = None,
     ) -> dict[str, Any] | None:
         matches = [
             row
@@ -503,6 +505,7 @@ class LocalCatalog:
             and row["resolution"] == resolution
             and row["status"] == "AVAILABLE"
             and str(row["period_start"]).startswith(str(year))
+            and (instrument_id is None or row.get("instrument_id") == instrument_id)
         ]
         return max(matches, key=lambda row: row["revision_number"], default=None)
 
@@ -732,17 +735,21 @@ class PostgresCatalog:
         data_layer: str,
         resolution: str,
         year: int,
+        instrument_id: str | None = None,
     ) -> dict[str, Any] | None:
-        statement = (
-            select(manifests_table)
-            .where(
+        criteria = [
                 manifests_table.c.feed_id == feed_id,
                 manifests_table.c.data_layer == data_layer,
                 manifests_table.c.resolution == resolution,
                 manifests_table.c.status == "AVAILABLE",
                 manifests_table.c.period_start >= datetime(year, 1, 1, tzinfo=UTC),
                 manifests_table.c.period_start < datetime(year + 1, 1, 1, tzinfo=UTC),
-            )
+        ]
+        if instrument_id is not None:
+            criteria.append(manifests_table.c.instrument_id == instrument_id)
+        statement = (
+            select(manifests_table)
+            .where(*criteria)
             .order_by(manifests_table.c.revision_number.desc())
             .limit(1)
         )

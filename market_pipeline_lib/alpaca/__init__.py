@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from .client import (
     BARS_PATH,
+    CORPORATE_ACTIONS_PATH,
     RETRYABLE_STATUS,
     AlpacaBarsClient,
     AlpacaClientConfig,
+    AlpacaCorporateActionPage,
+    AlpacaCorporateActionsClient,
     backoff_seconds,
     parse_retry_after,
 )
@@ -31,11 +34,14 @@ __all__ = [
     "ADJUSTMENT_BY_PRICE_TYPE",
     "BAR_ROW_COLUMNS",
     "BARS_PATH",
+    "CORPORATE_ACTIONS_PATH",
     "RETRYABLE_STATUS",
     "AlpacaAuthError",
     "AlpacaBarSource",
     "AlpacaBarsClient",
     "AlpacaClientConfig",
+    "AlpacaCorporateActionPage",
+    "AlpacaCorporateActionsClient",
     "AlpacaError",
     "AlpacaRequestError",
     "AlpacaResponseError",

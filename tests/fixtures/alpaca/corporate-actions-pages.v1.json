@@ -1,0 +1,42 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/corporate-actions",
+    "symbols": ["SPY", "QQQ"],
+    "start": "2026-08-01",
+    "end": "2026-08-04",
+    "types": ["cash_dividend", "forward_split", "reverse_split"]
+  },
+  "pages": [
+    {
+      "corporate_actions": {
+        "cash_dividends": [
+          {
+            "id": "ca-div-1",
+            "initiating_symbol": "SPY",
+            "ex_date": "2026-08-14",
+            "record_date": "2026-08-14",
+            "payable_date": "2026-09-01",
+            "cash": "1.25",
+            "currency": "USD"
+          }
+        ]
+      },
+      "next_page_token": "page-2"
+    },
+    {
+      "corporate_actions": {
+        "forward_splits": [
+          {
+            "id": "ca-split-1",
+            "initiating_symbol": "QQQ",
+            "ex_date": "2026-08-15",
+            "old_rate": "1",
+            "new_rate": "2"
+          }
+        ]
+      },
+      "next_page_token": null
+    }
+  ]
+}

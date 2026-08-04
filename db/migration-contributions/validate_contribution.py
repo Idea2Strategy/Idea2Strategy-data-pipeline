@@ -33,13 +33,13 @@ KNOWN_OWNERS: frozenset[str] = frozenset(
     {"backend", "trading", "backtest", "pipeline", "shared"}
 )
 
-#: Mirror of ``DatabaseAccessPolicy.SCHEMA_OWNERS``.  ``storage`` is registered
-#: as ``shared`` even though the D checklist calls it D-owned; see README.md.
+#: Mirror of ``DatabaseAccessPolicy.SCHEMA_OWNERS`` after root #139 assigned
+#: ``storage`` to D.
 SCHEMA_OWNERS: Mapping[str, str] = {
     "identity": "backend",
     "strategy": "backend",
     "bot": "backend",
-    "storage": "shared",
+    "storage": "pipeline",
     "market_data": "pipeline",
     "trading": "trading",
     "backtest": "backtest",
@@ -99,12 +99,9 @@ class Contribution:
     def mutable_schemas(self) -> frozenset[str]:
         """The declared schemas this owner may actually emit DDL for.
 
-        A schema registered to `SHARED` may be *declared* -- the pipeline reads and
-        inserts `storage.objects`, and `dataset_objects.object_id` is a NOT NULL foreign
-        key to it, so pretending the contribution has nothing to do with `storage` would
-        be false.  It may not be *mutated*: the central assembler rejects a
-        `pipeline`-owned migration that alters `storage`, and spec section 2.4 forbids D
-        from authoring `storage` DDL until the ownership contradiction is settled.
+        Declaring a schema grants scope; the registered owner independently decides
+        which contribution may mutate it. Root #139 registers both ``market_data`` and
+        ``storage`` to D.
         """
 
         return frozenset(schema for schema in self.schemas if SCHEMA_OWNERS.get(schema) == self.owner)
@@ -307,9 +304,8 @@ def check_migration_content(filename: str, sql: str, contribution: Contribution)
     """Refuse DDL that targets a schema this owner may not mutate.
 
     This is the check the central assembler runs as
-    ``Migration owner <owner> cannot mutate <schema>.<table>``.  It is also what keeps
-    spec section 2.4's "D authors no `storage` DDL" rule enforced rather than merely
-    written down: declaring `storage` in `schemas=` grants scope, not write rights.
+    ``Migration owner <owner> cannot mutate <schema>.<table>``. Declaring a schema
+    grants scope; its registered owner independently grants mutation rights.
     """
 
     mutable = contribution.mutable_schemas

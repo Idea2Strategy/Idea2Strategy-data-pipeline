@@ -14,7 +14,7 @@ ordered bundle. This repository never runs Flyway itself.
 |---|---|---|
 | `contract.version` | `1` | The only version the central assembler supports. |
 | `owner` | `pipeline` | One of the `MigrationOwner` tokens: `backend`, `trading`, `backtest`, `pipeline`, `shared`. |
-| `schemas` | `market_data,storage` | Every schema this contribution touches (spec section 2.4). `market_data` is owned; `storage` is SHARED and therefore declared but **not mutable** — see below. |
+| `schemas` | `market_data,storage` | Every schema this contribution touches. Root #139 assigns both to D. |
 | `migrations.directory` | `migrations` | The only directory that enters the central bundle. |
 | `fixtures.directory` | `fixtures` | Test data and legacy standalone SQL. Never enters the bundle. |
 | `filename.regex` | `^V[0-9]{14}__pipeline_[a-z0-9]+(?:_[a-z0-9]+)*[.]sql$` | Must be at least as strict as the central rule. |
@@ -40,53 +40,24 @@ the declared schemas whose `DatabaseAccessPolicy` owner is `pipeline`, and
 `check_migration_content` rejects any DDL statement in `migrations/` that targets
 a schema outside that set — with the same message the central assembler uses.
 
-For this repository: declared = `{market_data, storage}`, mutable =
-`{market_data}`.
+For this repository both declared schemas are D-owned and mutable:
+`{market_data, storage}`.
 
 ## What may go in `migrations/`
 
-Only DDL that mutates `market_data`. Nothing else. In particular
+Only DDL that mutates D-owned `market_data` or `storage`. Nothing else. In particular
 `market_data.pipeline_partitions` must never appear: it is absent from the
 canonical `db/schema.dbml` and spec section 2.4 forbids adding it.
 
-**`migrations/` is intentionally empty right now.** Every `market_data` table
-this bundle needs already exists in the central `V1__initial_schema.sql`. DP1
-creates the mechanism; DP2 onwards adds SQL only when a canonical DBML change
-justifies it. An applied migration is immutable — change it with a later
-migration, never in place.
+The directory contains additive migrations accepted by the central assembler. An
+applied migration is immutable; change it with a later migration, never in place.
 
-## Open item: `storage` schema ownership is contradictory
+## `storage` schema ownership
 
-`docs/backend-implementation-master-checklist.md` lists `storage` among D's
-primary schemas, but
-`backend/db-migration/src/main/java/com/idea2strategy/backend/migration/DatabaseAccessPolicy.java:36`
-registers `storage` to `MigrationOwner.SHARED`. Under the central rule, a
-`pipeline`-owned migration that touches `storage` is rejected:
-
-> `Migration owner pipeline cannot mutate storage.<table>; registered owner is shared`
-
-Consequences held to deliberately, until A resolves the contradiction:
-
-1. `schemas=` declares `storage`, because the pipeline genuinely writes rows to
-   `storage.objects` — `market_data.dataset_objects.object_id` is a NOT NULL
-   foreign key to it, so the contribution cannot honestly claim otherwise.
-   Declaring it is not claiming ownership of it: `mutable_schemas` excludes it.
-2. This repository authors **no** `storage` DDL, and
-   `check_migration_content` fails the build if anyone tries. It uses the
-   existing V1 definition of `storage.objects` as-is.
-3. Runtime access is unaffected: `DatabaseAccessPolicy.allowsPipeline` already
-   grants the pipeline role `READ` and `INSERT` on `storage.objects`, which is
-   all the object-registration path needs. In application code the same choice
-   is named explicitly by
-   `market_pipeline_lib.catalog.StorageObjectsPolicy`.
-
-A separate ownership-correction issue is required against `backend/db-migration`
-to make the checklist and `DatabaseAccessPolicy` agree. Do not work around it by
-claiming the schema here.
-
-Related, unresolved: `DatabaseAccessPolicy` is a compile-time/unit-test helper.
-`V1__initial_schema.sql` contains no role `GRANT`s, so nothing enforces these
-rules at runtime today.
+Root #139 resolved the contradiction in favor of the implementation checklist: D owns
+`storage`. D produces the immutable objects and their registrations; other bundles read
+their references. The validator therefore accepts D-owned migrations for both declared
+schemas. Runtime roles and GRANTs are assembled centrally as a separate reviewed unit.
 
 ## Local validation
 

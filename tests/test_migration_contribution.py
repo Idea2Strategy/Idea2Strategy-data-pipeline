@@ -7,6 +7,7 @@ contribution fails here instead of in the central Flyway bundle.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 import unittest
@@ -56,22 +57,26 @@ class ContributionContractTests(unittest.TestCase):
         self.assertEqual(self.contribution.schemas, frozenset({"market_data", "storage"}))
 
     def test_only_market_data_is_mutable_by_this_owner(self) -> None:
-        # `storage` is declared because the pipeline registers objects there, but
-        # `DatabaseAccessPolicy` registers the schema to SHARED, so a
-        # `pipeline`-owned migration may not mutate it.  Declared scope and
-        # mutable scope are two different things and the contract keeps them apart.
-        self.assertEqual(self.contribution.mutable_schemas, frozenset({"market_data"}))
+        # Root #139 settled both schemas on D.  A contribution still has to declare
+        # each schema it touches; ownership now makes both declared schemas mutable.
+        self.assertEqual(self.contribution.mutable_schemas, frozenset({"market_data", "storage"}))
         self.assertEqual(validator.SCHEMA_OWNERS["market_data"], "pipeline")
-        self.assertEqual(validator.SCHEMA_OWNERS["storage"], "shared")
+        self.assertEqual(validator.SCHEMA_OWNERS["storage"], "pipeline")
 
-    def test_this_repository_authors_no_storage_ddl(self) -> None:
-        # Spec section 2.4 forbids new `storage` DDL from D outright.
-        for path in self.contribution.migrations_directory.glob("*.sql"):
-            with self.subTest(migration=path.name):
-                self.assertEqual(
-                    validator.mutated_schemas(path.read_text(encoding="utf-8")) - {"market_data"},
-                    set(),
-                )
+    def test_central_empty_manifest_hash_fixture_matches_root_139_migration(self) -> None:
+        migration = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / (
+            "V20260804160020__pipeline_dataset_manifest_empty_hash.sql"
+        )
+        sql = migration.read_text(encoding="utf-8")
+        self.assertEqual(
+            hashlib.sha256(migration.read_bytes()).hexdigest(),
+            "bea14651c4c8ae595b383c91565f15be71ccca20e66d29d78f797b434290134c",
+        )
+        self.assertIn("DROP INDEX", sql)
+        self.assertIn("CREATE UNIQUE INDEX uq_dataset_manifests_dataset_hash", sql)
+        self.assertIn("ADD COLUMN object_count bigint NOT NULL DEFAULT 0", sql)
+        self.assertIn("WHERE object_count > 0", sql)
+        self.assertIn("maintain_dataset_manifest_object_count", sql)
 
     def test_pipeline_partitions_is_never_contributed(self) -> None:
         # `market_data.pipeline_partitions` is absent from the canonical DBML; spec
@@ -110,7 +115,7 @@ class ContributionContractTests(unittest.TestCase):
         for path in self.contribution.migrations_directory.iterdir():
             if path.name == ".gitkeep":
                 continue
-            self.assertIn(path.suffix, allowed, f"unexpected file in migrations/: {path.name}")
+                self.assertIn(path.suffix, allowed, f"unexpected file in migrations/: {path.name}")
 
 
 class ContributionRejectionTests(unittest.TestCase):
@@ -156,13 +161,8 @@ class ContributionRejectionTests(unittest.TestCase):
             with self.assertRaises(validator.ContributionError):
                 validator.load_contribution(root)
 
-    def test_ddl_against_a_shared_schema_is_rejected(self) -> None:
-        """Declaring `storage` grants read/insert scope, never the right to alter it.
-
-        The central assembler rejects it with
-        `Migration owner pipeline cannot mutate storage.<table>; registered owner is
-        shared`.  Catching it locally is the whole point of this validator.
-        """
+    def test_ddl_against_pipeline_owned_storage_is_accepted(self) -> None:
+        """Root #139 assigns `storage` to D, so its contribution may mutate it."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,10 +172,9 @@ class ContributionRejectionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             contribution = validator.load_contribution(root)
-            with self.assertRaises(validator.ContributionError) as caught:
-                validator.check_migration_directory(contribution)
+            accepted = validator.check_migration_directory(contribution)
 
-        self.assertIn("storage", str(caught.exception))
+        self.assertEqual(accepted, ["V20260802120000__pipeline_touch_storage.sql"])
 
     def test_ddl_against_an_undeclared_schema_is_rejected(self) -> None:
         import tempfile

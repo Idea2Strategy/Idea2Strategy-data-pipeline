@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import logging
 import secrets
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -36,9 +36,12 @@ from .pagination import iter_pages
 
 __all__ = [
     "BARS_PATH",
+    "CORPORATE_ACTIONS_PATH",
     "RETRYABLE_STATUS",
     "AlpacaBarsClient",
     "AlpacaClientConfig",
+    "AlpacaCorporateActionPage",
+    "AlpacaCorporateActionsClient",
     "backoff_seconds",
     "parse_retry_after",
 ]
@@ -46,6 +49,7 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 BARS_PATH = "/v2/stocks/bars"
+CORPORATE_ACTIONS_PATH = "/v1/corporate-actions"
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 AUTH_STATUS = frozenset({401, 403})
 _ADJUSTMENTS = frozenset({"raw", "split", "dividend", "all"})
@@ -237,6 +241,10 @@ class AlpacaBarsClient:
         }
 
     def _request(self, params: dict[str, Any]) -> dict[str, Any]:
+        response = self._request_response(BARS_PATH, params)
+        return self._payload(response)
+
+    def _request_response(self, path: str, params: Mapping[str, Any]) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(1, self._config.max_attempts + 1):
             # Proactive: the token is taken *before* the call leaves, so the
@@ -245,7 +253,7 @@ class AlpacaBarsClient:
             response: httpx.Response | None = None
             try:
                 response = self._client.get(
-                    BARS_PATH,
+                    path,
                     params=params,
                     headers=self._headers,
                 )
@@ -266,7 +274,7 @@ class AlpacaBarsClient:
                 elif status >= 400:
                     raise AlpacaResponseError(f"예상치 못한 Alpaca HTTP {status}")
                 else:
-                    return self._payload(response)
+                    return response
 
             if attempt == self._config.max_attempts:
                 break
@@ -311,3 +319,93 @@ class AlpacaBarsClient:
 
 def _iso_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class AlpacaCorporateActionPage:
+    """One byte-preserving corporate-actions response page."""
+
+    corporate_actions: Mapping[str, tuple[Mapping[str, Any], ...]]
+    raw_bytes: bytes
+    retrieved_at: datetime
+    source_uri: str
+
+
+class AlpacaCorporateActionsClient(AlpacaBarsClient):
+    """Fetch `/v1/corporate-actions` once per source window, following every page."""
+
+    def __init__(self, *args: Any, now: Callable[[], datetime] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._now = now or (lambda: datetime.now(UTC))
+
+    def iter_corporate_action_pages(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        event_types: Sequence[str] = ("cash_dividend", "forward_split", "reverse_split"),
+    ) -> Iterator[AlpacaCorporateActionPage]:
+        if not symbols:
+            raise AlpacaRequestError("symbols must not be empty")
+        if start > end:
+            raise AlpacaRequestError("start must be on or before end")
+        if not event_types:
+            raise AlpacaRequestError("event_types must not be empty")
+        normalized_symbols = tuple(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        if any(not symbol for symbol in normalized_symbols):
+            raise AlpacaRequestError("symbols must be non-empty market symbols")
+        base_params: dict[str, Any] = {
+            "symbols": ",".join(normalized_symbols),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "types": ",".join(dict.fromkeys(event_types)),
+            "limit": min(self._config.page_limit, 1000),
+            "sort": "asc",
+            "cas_region": "us",
+        }
+        token: str | None = None
+        seen: set[str] = set()
+        while True:
+            params = dict(base_params)
+            if token:
+                params["page_token"] = token
+            response = self._request_response(CORPORATE_ACTIONS_PATH, params)
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise AlpacaResponseError("Alpaca corporate-actions response is not JSON") from exc
+            if not isinstance(payload, dict):
+                raise AlpacaResponseError("Alpaca corporate-actions response must be an object")
+            raw_actions = payload.get("corporate_actions", {})
+            if not isinstance(raw_actions, dict):
+                raise AlpacaResponseError("Alpaca corporate_actions must be an object")
+            actions: dict[str, tuple[Mapping[str, Any], ...]] = {}
+            for action_type, entries in raw_actions.items():
+                if not isinstance(action_type, str) or not isinstance(entries, list):
+                    raise AlpacaResponseError(
+                        "Alpaca corporate_actions entries must be arrays keyed by type"
+                    )
+                if any(not isinstance(entry, dict) for entry in entries):
+                    raise AlpacaResponseError(
+                        f"Alpaca corporate_actions[{action_type!r}] contains a non-object"
+                    )
+                actions[action_type] = tuple(entries)
+            retrieved_at = self._now()
+            if retrieved_at.tzinfo is None or retrieved_at.utcoffset() != UTC.utcoffset(retrieved_at):
+                raise AlpacaResponseError("corporate-action retrieval clock must return UTC")
+            yield AlpacaCorporateActionPage(
+                corporate_actions=actions,
+                raw_bytes=response.content,
+                retrieved_at=retrieved_at,
+                source_uri=str(response.request.url),
+            )
+            next_token = payload.get("next_page_token")
+            if next_token is None or next_token == "":
+                return
+            if not isinstance(next_token, str):
+                raise AlpacaResponseError("Alpaca next_page_token must be a string")
+            if next_token in seen:
+                raise AlpacaResponseError("Alpaca next_page_token repeated")
+            seen.add(next_token)
+            token = next_token

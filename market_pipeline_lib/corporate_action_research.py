@@ -386,12 +386,17 @@ class ResearchCandidate:
     evidence: tuple[Evidence, ...]
     claims: tuple[Claim, ...]
     researched_at: datetime
+    provider_source_event_id: str | None = None
 
     def __post_init__(self) -> None:
         if not _TICKER_PATTERN.fullmatch(self.ticker):
             raise ValueError("ticker must be a normalized market symbol")
         if not _EVENT_TYPE_PATTERN.fullmatch(self.event_type):
             raise ValueError("event_type must be a normalized identifier")
+        if self.provider_source_event_id is not None and (
+            not self.provider_source_event_id.strip() or len(self.provider_source_event_id) > 96
+        ):
+            raise ValueError("provider_source_event_id must be 1..96 characters")
         if type(self.proposed_date) is not date:
             raise ValueError("proposed_date must be a date")
         _require_utc(self.researched_at, "researched_at")
@@ -454,6 +459,7 @@ class ResearchCandidate:
         evidence: Iterable[Evidence],
         claims: Iterable[Claim],
         researched_at: datetime,
+        provider_source_event_id: str | None = None,
     ) -> ResearchCandidate:
         normalized_ticker = ticker.strip().upper()
         normalized_event_type = event_type.strip().upper()
@@ -485,6 +491,10 @@ class ResearchCandidate:
         object.__setattr__(draft, "evidence", normalized_evidence)
         object.__setattr__(draft, "claims", normalized_claims)
         object.__setattr__(draft, "researched_at", researched_at)
+        normalized_source_id = (
+            provider_source_event_id.strip() if provider_source_event_id is not None else None
+        )
+        object.__setattr__(draft, "provider_source_event_id", normalized_source_id)
         candidate_id = cls._identity(draft.to_identity_record())
         return cls(
             candidate_id=candidate_id,
@@ -495,6 +505,7 @@ class ResearchCandidate:
             evidence=normalized_evidence,
             claims=normalized_claims,
             researched_at=researched_at,
+            provider_source_event_id=normalized_source_id,
         )
 
     @classmethod
@@ -514,10 +525,11 @@ class ResearchCandidate:
             evidence=finding.evidence,
             claims=finding.claims,
             researched_at=researched_at,
+            provider_source_event_id=finding.provider_source_event_id,
         )
 
     def to_identity_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "ticker": self.ticker,
             "event_type": self.event_type,
             "proposed_date": self.proposed_date.isoformat(),
@@ -526,6 +538,9 @@ class ResearchCandidate:
             "evidence": [item.to_record() for item in self.evidence],
             "claims": [item.to_record() for item in self.claims],
         }
+        if self.provider_source_event_id is not None:
+            record["provider_source_event_id"] = self.provider_source_event_id
+        return record
 
     @staticmethod
     def _identity(identity_payload: dict[str, Any]) -> str:
@@ -562,6 +577,7 @@ class ResearchFinding:
     terms: CorporateActionTerms
     evidence: tuple[Evidence, ...]
     claims: tuple[Claim, ...]
+    provider_source_event_id: str | None = None
 
     @property
     def confidence(self) -> Decimal:
@@ -902,9 +918,17 @@ def effective_at_for(proposed_date: date) -> datetime:
     return datetime.combine(proposed_date, time.min, tzinfo=ET).astimezone(timezone.utc)
 
 
-def provider_event_key(ticker: str, event_type: str, proposed_date: date) -> str:
+def provider_event_key(
+    ticker: str,
+    event_type: str,
+    proposed_date: date,
+    provider_source_event_id: str | None = None,
+) -> str:
     """The natural key of a researched action, stable across re-discovery."""
-    key = f"RESEARCH:{ticker}:{event_type}:{proposed_date.isoformat()}"
+    if provider_source_event_id is None:
+        key = f"RESEARCH:{ticker}:{event_type}:{proposed_date.isoformat()}"
+    else:
+        key = f"ALPACA:{provider_source_event_id}:{proposed_date.isoformat()}"
     if len(key) > 160:  # pragma: no cover - guards the canonical varchar(160)
         raise ValueError(f"provider_event_key exceeds 160 characters: {key!r}")
     return key
@@ -940,7 +964,12 @@ def corporate_action_record(
     source_manifest_id: str,
 ) -> dict[str, Any]:
     """One canonical `market_data.corporate_actions` row, provenance included."""
-    key = provider_event_key(candidate.ticker, candidate.event_type, candidate.proposed_date)
+    key = provider_event_key(
+        candidate.ticker,
+        candidate.event_type,
+        candidate.proposed_date,
+        candidate.provider_source_event_id,
+    )
     document: dict[str, Any] = {
         "candidate_id": candidate.candidate_id,
         "ticker": candidate.ticker,
@@ -954,6 +983,8 @@ def corporate_action_record(
         "review": {"state": REVIEW_REQUIRED, "decided_by": None, "decided_at": None, "rationale": None},
         "review_history": [],
     }
+    if candidate.provider_source_event_id is not None:
+        document["provider_source_event_id"] = candidate.provider_source_event_id
     return {
         "id": deterministic_uuid(CORPORATE_ACTIONS_TABLE, source_manifest_id, key),
         "instrument_id": instrument_id,
@@ -1003,7 +1034,13 @@ class ResearchCatalog(Protocol):
     ) -> None: ...
 
     def latest_available_manifest(
-        self, *, feed_id: str, data_layer: str, resolution: str, year: int
+        self,
+        *,
+        feed_id: str,
+        data_layer: str,
+        resolution: str,
+        year: int,
+        instrument_id: str | None = None,
     ) -> dict[str, Any] | None: ...
 
 
@@ -1067,6 +1104,7 @@ class CatalogSourceManifestResolver:
             data_layer=self._data_layer,
             resolution=self._resolution,
             year=on.year,
+            instrument_id=instrument_id,
         )
         if manifest is None:
             raise UnknownSourceManifestError(
@@ -1241,7 +1279,22 @@ class ResearchScheduleExecutor:
                     "than letting either version win silently."
                 )
             return False
-        self._catalog.upsert(CORPORATE_ACTIONS_TABLE, record)
+        source_event_id = record.get("terms_document", {}).get("provider_source_event_id")
+        persisted = dict(record)
+        if source_event_id is not None:
+            revisions = [
+                row
+                for row in self._catalog.records(CORPORATE_ACTIONS_TABLE)
+                if row.get("instrument_id") == record.get("instrument_id")
+                and row.get("action_type") == record.get("action_type")
+                and row.get("terms_document", {}).get("provider_source_event_id")
+                == source_event_id
+                and row.get("id") != record.get("id")
+            ]
+            if revisions:
+                previous = max(revisions, key=lambda row: str(row.get("created_at", "")))
+                persisted["supersedes_action_id"] = previous["id"]
+        self._catalog.upsert(CORPORATE_ACTIONS_TABLE, persisted)
         return True
 
     def _existing_action(
