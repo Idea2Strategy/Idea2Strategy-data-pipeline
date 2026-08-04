@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from apps.common.errors import MalformedEventError, PortNotConfiguredError, UnknownCommandError
 from apps.common.events import (
@@ -199,7 +199,10 @@ class PipelineCommandExecutor:
             adjusted_feed_id=settings.adjusted_feed_id,
             approval_verifier=verifier,
         )
-        return BackendRelayApprovalConsumer(service, catalog=catalog)
+        return cast(
+            CorporateActionApprovalPort,
+            BackendRelayApprovalConsumer(service, catalog=catalog),
+        )
 
     def request_stop(self, reason: str) -> None:
         """Forward a shutdown request to adapters that expose cooperative cancellation."""
