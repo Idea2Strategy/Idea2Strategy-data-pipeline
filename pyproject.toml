@@ -199,6 +199,8 @@ files = [
   "market_pipeline_lib/alpaca",
   "market_pipeline_lib/corporate_action_discovery.py",
   "market_pipeline_lib/corporate_action_research.py",
+  "market_pipeline_lib/runtime_export.py",
+  "market_pipeline_lib/runtime_warmup_export.py",
 ]
 strict = true
 warn_unreachable = true

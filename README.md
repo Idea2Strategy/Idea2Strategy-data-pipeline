@@ -306,6 +306,57 @@ historical Parquet objects, 96 unique manifest IDs, eight shards per manifest, a
 1,865,563,533 bytes. The command obtains every other expected row count from the
 read-only source and reports it before writing.
 
+### Trading runtime artifacts
+
+`export-trading-instruments` reads the canonical database in PostgreSQL read-only
+mode and downloads every selected Parquet object by its exact S3 `VersionId`. It
+checks the catalog receipt before and after the download, filters the requested
+date range, intersects the actual `instrument_id` values across every selected
+latest manifest, and resolves the primary symbol in force at the explicit cutoff.
+There are no selection defaults. A dry run computes the exact output hash without
+writing either file; `--execute` writes only an absent file or accepts byte-identical
+replay.
+
+```bash
+market-pipeline export-trading-instruments \
+  --artifact-root /var/lib/idea2strategy/runtime-evidence \
+  --bucket "$MARKET_DATA_BUCKET" \
+  --adjustment raw \
+  --resolution 30m --layer 30m=RAW \
+  --resolution 1h  --layer 1h=DERIVED \
+  --resolution 4h  --layer 4h=DERIVED \
+  --resolution 1d  --layer 1d=DERIVED \
+  --start-year 2016 --end-year 2026 \
+  --latest-revision-policy latest-per-period \
+  --symbol-effective-cutoff 2026-08-05T00:00:00Z \
+  --output runtime/trading/instruments.json \
+  --evidence-output runtime/trading/instruments.evidence.json
+
+# Repeat the verified command with --execute to publish the two local artifacts.
+```
+
+`publish-trading-warmup` exposes the existing D90 publisher and verifier as a
+one-shot deployment command. Every semantic value is explicit, including the
+maximum age of the externally evaluated readiness verdict. The events file must
+contain the provider-neutral event document and the requirements file must contain
+an array of `FeatureRequirement` objects. For an intentional BLOCKED publication,
+the events file must contain JSON `null` and the requirements file must contain
+`[]`. The command writes `manifest.json`, its declared objects, and a
+`publication-receipt.json` containing their exact byte SHA-256 and schema/revision.
+
+```bash
+market-pipeline publish-trading-warmup \
+  --output runtime/trading/warmup \
+  --session-date 2026-08-05 \
+  --events runtime-inputs/market-events.json \
+  --requirements runtime-inputs/feature-requirements.json \
+  --readiness runtime-inputs/readiness.json \
+  --adjustment raw --layer RAW --resolution 30m \
+  --event-type BAR_1M --granularity DAY \
+  --revision 1 --shard-count 1 \
+  --max-readiness-age-seconds 600
+```
+
 로컬 Catalog는 `market_data_store/catalog-export` 아래 DBML 열 이름의
 JSONL을 저장합니다.
 
