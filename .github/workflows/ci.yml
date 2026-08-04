@@ -225,6 +225,58 @@ jobs:
                   raise SystemExit(f"{name} accepted a malformed event")
           PY
 
+  # --------------------------------------------------------------- gate 5b
+  gate5b-arm64-container-smoke:
+    name: gate5b-arm64-container-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the production ARM64 image
+        run: >-
+          docker buildx build --platform linux/arm64 --load
+          --tag idea2strategy-pipeline-worker:ci .
+      - name: Verify image architecture, imports and removed Perl runtime
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Architecture}}' idea2strategy-pipeline-worker:ci)" = arm64
+          docker run --rm --platform linux/arm64 --entrypoint /bin/sh \
+            idea2strategy-pipeline-worker:ci -ec '
+              python -c "import apps.pipeline_worker.main, boto3, pandas, pyarrow, sqlalchemy"
+              if dpkg-query -W perl-base 2>/dev/null; then
+                echo "perl-base must not be present in the runtime image" >&2
+                exit 1
+              fi
+            '
+      - name: Run the entrypoint and verify readiness
+        run: |
+          set -euo pipefail
+          container=idea2strategy-pipeline-worker-ci
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$container" --platform linux/arm64 \
+            --publish 18080:8080 \
+            --env PIPELINE_WORKER_ENVIRONMENT=ci \
+            --env PIPELINE_WORKER_MESSAGE_SOURCE=inprocess \
+            --env PIPELINE_WORKER_CATALOG_ROOT=/var/lib/idea2strategy/catalog \
+            --env PIPELINE_WORKER_OBJECT_STORE_ROOT=/var/lib/idea2strategy/objects \
+            --env PIPELINE_WORKER_HEALTH_HOST=0.0.0.0 \
+            --env PIPELINE_WORKER_HEALTH_PORT=8080 \
+            --env PIPELINE_WORKER_POLL_INTERVAL_SECONDS=0.1 \
+            idea2strategy-pipeline-worker:ci
+          for _ in $(seq 1 100); do
+            if curl --fail --silent http://127.0.0.1:18080/ready >ready.json; then
+              break
+            fi
+            sleep 0.2
+          done
+          grep -q '"status":"READY"' ready.json
+          docker stop --time 10 "$container"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+
   # ---------------------------------------------------------------- gate 6
   gate6-migration-contribution:
     name: gate6-migration-contribution (COM07)
