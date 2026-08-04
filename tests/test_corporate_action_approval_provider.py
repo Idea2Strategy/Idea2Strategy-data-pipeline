@@ -208,6 +208,21 @@ class CorporateActionProviderResultTest(unittest.TestCase):
             inactive.apply_approval_result(result())
         self.assertEqual(actor.exception.code, "INACTIVE_OPERATOR")
 
+    def test_permanent_refusal_redelivery_records_one_durable_fact(self) -> None:
+        service, catalog, regenerator = self.service([row()])
+        stale = result(content_hash="c" * 64)
+
+        for _ in range(2):
+            with self.assertRaises(ApprovalRefusedError) as refused:
+                service.apply_approval_result(stale)
+            self.assertEqual(refused.exception.code, "STALE_CONTENT_HASH")
+
+        history = catalog.rows[0]["terms_document"]["review_history"]  # type: ignore[index]
+        refusals = [entry for entry in history if entry["state"] == "REFUSED"]
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["reason_code"], "STALE_CONTENT_HASH")
+        self.assertEqual(regenerator.calls, 0)
+
     def test_duplicate_delivery_does_not_regenerate_twice(self) -> None:
         service, catalog, regenerator = self.service([row()])
         first = service.apply_approval_result(result())

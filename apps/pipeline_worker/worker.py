@@ -49,6 +49,7 @@ from apps.pipeline_worker.commands import Command, PipelineCommandExecutor
 from apps.pipeline_worker.config import WorkerConfig
 from apps.pipeline_worker.health import HealthEndpoint, HealthState
 from apps.pipeline_worker.messaging import Message, MessageSource, build_message_source
+from market_pipeline_lib.corporate_actions import ApprovalRefusedError
 
 LOGGER = logging.getLogger("apps.pipeline_worker")
 
@@ -338,6 +339,26 @@ class PipelineWorker:
             visibility.stop()
             if not durable_domain_idempotency:
                 self._idempotency.forget(command.command_id)
+            parked = self._park(source, message, reason=error.code)
+            self._record(
+                command=command.command,
+                command_id=command.command_id,
+                outcome=OUTCOME_REJECTED if parked else OUTCOME_FAILED,
+                detail={
+                    "code": error.code if parked else "DEAD_LETTER_UNAVAILABLE",
+                    "reason": str(error),
+                },
+                message=message,
+                started=started,
+            )
+            return
+        except ApprovalRefusedError as error:
+            # Canonical approval refusals are permanent: another delivery cannot
+            # repair a forged envelope, stale hash, inactive actor, or invalid
+            # provider sequence. Park immediately while retaining the producer
+            # evidence on the DLQ. Transient DB/object-store failures do not use
+            # this type and continue through the retry path below.
+            visibility.stop()
             parked = self._park(source, message, reason=error.code)
             self._record(
                 command=command.command,

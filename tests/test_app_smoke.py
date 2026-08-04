@@ -736,6 +736,43 @@ class WorkerBootTests(unittest.TestCase):
             self.assertEqual(len(port.calls), 3)
             self.assertEqual(port.calls[-1]["rationale"], "tampered")
 
+    def test_permanent_approval_refusal_is_parked_without_retry(self) -> None:
+        from market_pipeline_lib.corporate_actions import ApprovalRefusedError
+
+        class _RefusingApprovalPort:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def apply(self, payload: Any) -> dict[str, Any]:
+                self.calls += 1
+                raise ApprovalRefusedError("STALE_CONTENT_HASH", "protected hash is stale")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = WorkerConfig.from_environment(_environment(Path(tmp)))
+            port = _RefusingApprovalPort()
+            source = InProcessMessageSource()
+            worker = PipelineWorker(
+                config,
+                message_source=source,
+                executor=PipelineCommandExecutor(config, corporate_action_approval_port=port),
+            )
+            source.submit(
+                {
+                    "command": "APPLY_CORPORATE_ACTION_APPROVAL",
+                    "command_id": "40000000-0000-4000-8000-000000000001",
+                    "payload": {"candidateId": "10000000-0000-4000-8000-000000000001"},
+                }
+            )
+            thread = threading.Thread(target=worker.run, name="refusal-worker", daemon=True)
+            thread.start()
+            self.assertTrue(self._await(lambda: len(source.dead_letters) == 1))
+            worker.request_stop("test")
+            thread.join(timeout=5.0)
+
+            self.assertEqual(port.calls, 1)
+            self.assertEqual(source.dead_letters[0][1], "STALE_CONTENT_HASH")
+            self.assertEqual(worker.results[0]["outcome"], "REJECTED")
+
     def test_run_refuses_to_start_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = WorkerConfig.from_environment(_environment(Path(tmp)))

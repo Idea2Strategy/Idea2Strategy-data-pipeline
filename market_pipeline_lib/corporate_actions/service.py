@@ -363,7 +363,17 @@ class CorporateActionReviewService:
                 "aggregate_sequence": result.aggregate_sequence,
                 "recorded_at": result.decided_at.isoformat().replace("+00:00", "Z"),
             }
-            document["review_history"] = [*document.get("review_history", []), refused]
+            history = list(document.get("review_history", []))
+            already_recorded = any(
+                entry.get("state") == "REFUSED"
+                and entry.get("reason_code") == code
+                and entry.get("delivery_id") == str(result.delivery_id)
+                and entry.get("envelope_hash") == result.envelope_hash
+                for entry in history
+            )
+            if already_recorded:
+                return
+            document["review_history"] = [*history, refused]
             catalog.upsert(CORPORATE_ACTIONS_TABLE, {**dict(row), "terms_document": document})
 
     def _approved_for_same_subject(self, row: Mapping[str, Any]) -> list[dict[str, Any]]:
