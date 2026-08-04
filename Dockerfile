@@ -18,7 +18,12 @@ COPY data_filtering ./data_filtering
 COPY data_validation ./data_validation
 COPY daily_pipeline.py market_pipeline.py pipeline_reporting.py pipeline_state.py ./
 
+# perl-base is an Essential Debian package, so apt refuses to remove it by
+# default. The worker does not invoke Perl or package-management tools at
+# runtime; remove it only after Python dependencies are installed to keep the
+# vulnerable interpreter out of the shipped image.
 RUN python -m pip install --no-cache-dir . \
+    && dpkg --purge --force-remove-essential perl-base \
     && mkdir -p /var/lib/idea2strategy/catalog /var/lib/idea2strategy/objects \
     && chown -R 10001:10001 /var/lib/idea2strategy
 
