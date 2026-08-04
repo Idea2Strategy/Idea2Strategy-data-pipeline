@@ -10,8 +10,10 @@ real clock and no test reaches the network.
 
 from __future__ import annotations
 
+import json
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +23,7 @@ from market_pipeline_lib.alpaca import (
     AlpacaBarsClient,
     AlpacaBarSource,
     AlpacaClientConfig,
+    AlpacaCorporateActionsClient,
     AlpacaRequestError,
     AlpacaResponseError,
     AlpacaRetriesExhausted,
@@ -470,6 +473,90 @@ class PaginationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PermanentAlpacaError, "next_page_token"):
             list(client.iter_bar_pages(["AAPL"], START, END, "raw"))
+
+
+class CorporateActionsClientTests(unittest.TestCase):
+    def _client(
+        self, responses: list[httpx.Response]
+    ) -> tuple[AlpacaCorporateActionsClient, ScriptedTransport, ManualClock]:
+        clock = ManualClock()
+        transport = ScriptedTransport(responses)
+        client = AlpacaCorporateActionsClient(
+            API_KEY,
+            API_SECRET,
+            transport=transport,
+            clock=clock,
+            rate_limiter=TokenBucketRateLimiter(6000, clock=clock),
+            jitter=lambda: 0.0,
+            now=lambda: datetime(2026, 8, 4, 12, 0, tzinfo=UTC),
+        )
+        return client, transport, clock
+
+    def test_fetches_the_27_symbol_window_and_follows_page_tokens(self) -> None:
+        fixture = json.loads(
+            Path("tests/fixtures/alpaca/corporate-actions-pages.v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        first, second = fixture["pages"]
+        client, transport, _ = self._client(
+            [json_response(200, first), json_response(200, second)]
+        )
+        symbols = ("SPY", "QQQ", *(f"ETF{index}" for index in range(25)))
+
+        pages = tuple(
+            client.iter_corporate_action_pages(
+                symbols, date(2026, 8, 1), date(2026, 8, 4)
+            )
+        )
+
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(pages[0].retrieved_at, datetime(2026, 8, 4, 12, 0, tzinfo=UTC))
+        self.assertTrue(pages[0].raw_bytes)
+        self.assertEqual(transport.requests[0].url.path, "/v1/corporate-actions")
+        self.assertEqual(transport.requests[0].url.params["symbols"], ",".join(symbols))
+        self.assertEqual(transport.requests[0].url.params["limit"], "1000")
+        self.assertEqual(transport.requests[0].url.params["sort"], "asc")
+        self.assertEqual(transport.requests[0].url.params["cas_region"], "us")
+        self.assertEqual(transport.requests[1].url.params["page_token"], "page-2")
+        self.assertNotIn(API_KEY, str(transport.requests[0].url))
+        self.assertNotIn(API_SECRET, str(transport.requests[0].url))
+        self.assertEqual(fixture["request"]["path"], transport.requests[0].url.path)
+        self.assertEqual(
+            fixture["request"]["types"],
+            transport.requests[0].url.params["types"].split(","),
+        )
+
+    def test_retries_a_transient_page_without_losing_the_pagination_token(self) -> None:
+        client, transport, clock = self._client(
+            [
+                error_response(503),
+                json_response(200, {"corporate_actions": {}, "next_page_token": None}),
+            ]
+        )
+
+        pages = tuple(
+            client.iter_corporate_action_pages(
+                ("SPY",), date(2026, 8, 1), date(2026, 8, 4)
+            )
+        )
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(len(transport.requests), 2)
+        self.assertEqual(clock.sleeps, [1.0])
+
+    def test_zero_events_is_a_successful_page_not_a_provider_failure(self) -> None:
+        client, _, _ = self._client(
+            [json_response(200, {"corporate_actions": {}, "next_page_token": None})]
+        )
+
+        (page,) = tuple(
+            client.iter_corporate_action_pages(
+                ("SPY",), date(2026, 8, 1), date(2026, 8, 4)
+            )
+        )
+
+        self.assertEqual(page.corporate_actions, {})
 
 
 class MapperTests(unittest.TestCase):

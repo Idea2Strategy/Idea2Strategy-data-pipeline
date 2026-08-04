@@ -8,21 +8,17 @@ not own the right to create:
 * `create_type=False` on every enum, and this metadata is never passed to
   `MetaData.create_all()` in a production path.  The runtime creates nothing; see
   `market_pipeline_lib.db.engine.install_runtime_guards`.
-* Foreign keys to tables outside this metadata (`strategy.element_catalog_versions`)
-  are documented in comments rather than declared, so the metadata never pulls a
-  foreign schema in.
+* Foreign keys to tables outside this bounded metadata
+  (`strategy.element_catalog_versions`) are documented explicitly; PostgreSQL still
+  enforces the canonical foreign key.
 * No migration SQL is authored anywhere in this repository.  These tables already
   exist centrally.
 
 Ownership note for `storage.objects`
 ------------------------------------
-`DatabaseAccessPolicy.java:36` registers the `storage` schema as ``SHARED`` while
-`docs/backend-implementation-master-checklist.md` lists it under D's owned schemas.
-`db/migration-contributions/contribution.properties` declares ``schemas=market_data,storage``
-and its validator holds ``storage`` to declared-but-not-mutable, so this repository
-authors no ``storage`` DDL.  The ownership contradiction itself is unresolved
-centrally, so this module lists
-`storage.objects` in `READ_ONLY_TABLES` and the write path is not enabled by default:
+Root #139 settled the `storage` schema on D, matching the implementation checklist and
+the fact that D produces every object registered there. This module keeps
+`storage.objects` in `READ_ONLY_TABLES` only to require an explicit write policy:
 `PostgresCatalog` requires an explicit `StorageObjectsPolicy` from its caller.  The
 pipeline genuinely has to insert `storage.objects` rows -- `dataset_objects.object_id`
 is a NOT NULL foreign key to it -- so refusing outright would make the canonical
@@ -466,8 +462,9 @@ feature_definitions = Table(
     "feature_definitions",
     METADATA,
     Column("id", UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")),
-    # `strategy.element_catalog_versions.id`: read-only upstream reference, deliberately
-    # not declared as a ForeignKey so `strategy` stays out of this metadata.
+    # The applied DDL enforces a real FK to `strategy.element_catalog_versions.id`.
+    # This bounded metadata cannot resolve that external table, so the reference is
+    # documented here and mirrored by LocalCatalog validation.
     Column("element_catalog_version_id", UUID(as_uuid=True), nullable=False),
     Column("feature_code", VARCHAR(120), nullable=False),
     Column("calculator_version", VARCHAR(80), nullable=False),
@@ -709,17 +706,5 @@ SCHEMA_CONTRADICTIONS: tuple[tuple[str, str], ...] = (
         "V001__market_data_initial_schema.sql, which is the illegal forked migration "
         "that spec section 1 marks for deletion. Nothing in the database prevents two "
         "AVAILABLE manifests for one feed and period.",
-    ),
-    (
-        "market_data.dataset_manifests",
-        "uq_dataset_manifests_dataset_hash is globally unique, but engine.publish_dataset "
-        "derives dataset_hash from the manifest's objects, and every manifest that ends "
-        "QUARANTINED with zero objects hashes the same empty list. Two empty quarantined "
-        "manifests -- two contracts with no data for one year, for instance -- therefore "
-        "collide on insert. LocalCatalog has no such constraint, so this only appears "
-        "against PostgreSQL. Resolving it needs a central decision: either the hash is "
-        "salted with the manifest identity when the object set is empty (which changes "
-        "what dataset_hash means, and operations.validate_catalog recomputes it), or the "
-        "unique index is narrowed. Neither is D's to make; raised as a separate issue.",
     ),
 )

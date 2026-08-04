@@ -26,6 +26,7 @@ from lambdas.corporate_action_research.handler import (
     CorporateActionResearchHandler,
     PartialResearchSlotError,
     ResearchFinding,
+    build_production_handler,
 )
 from lambdas.corporate_action_research.handler import handler as corporate_action_handler
 from lambdas.lightweight_validation.handler import LightweightValidationHandler
@@ -861,6 +862,17 @@ class CorporateActionResearchHandlerTests(unittest.TestCase):
         # fail rather than report a successful research run with no findings.
         with self.assertRaises(PipelineAppError):
             corporate_action_handler(self.event, _FakeContext())
+
+    def test_production_factory_refuses_partial_secret_or_database_wiring(self) -> None:
+        from apps.common.errors import ConfigurationError
+
+        with self.assertRaises(ConfigurationError) as raised:
+            build_production_handler({"ALPACA_API_KEY": "configured"})
+
+        message = str(raised.exception)
+        self.assertIn("ALPACA_SECRET_KEY", message)
+        self.assertIn("DATABASE_URL", message)
+        self.assertIn("CORPORATE_ACTION_SOURCE_FEED_ID", message)
 
 
 if __name__ == "__main__":  # pragma: no cover

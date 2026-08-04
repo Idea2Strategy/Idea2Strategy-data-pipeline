@@ -36,8 +36,11 @@ An unwired adapter fails immediately, because "0 candidates found" is indistingu
 from a genuinely quiet slot.
 
 Environment:
-    CORPORATE_ACTION_CANDIDATE_STORE  required (unless a path is injected).
-        Path of the append-only JSONL review store.
+    Production discovery requires ``ALPACA_API_KEY``, ``ALPACA_SECRET_KEY``,
+    ``DATABASE_URL`` and ``CORPORATE_ACTION_SOURCE_FEED_ID``. Optional
+    ``CORPORATE_ACTION_SOURCE_RESOLUTION`` defaults to ``30m`` and
+    ``CORPORATE_ACTION_UNIVERSE_FILE`` defaults to the committed 27-ETF CSV.
+    The legacy candidate-only path uses ``CORPORATE_ACTION_CANDIDATE_STORE``.
 """
 
 from __future__ import annotations
@@ -45,9 +48,10 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from apps.common.errors import (
     ConfigurationError,
@@ -88,6 +92,7 @@ __all__ = [
     "ResearchFinding",
     "UnconfiguredResearchPort",
     "handler",
+    "build_production_handler",
 ]
 
 
@@ -360,9 +365,89 @@ class CorporateActionResearchHandler:
 
 #: Warm-container singleton so redelivery to the same container is idempotent.
 _DEFAULT_HANDLER = CorporateActionResearchHandler()
+_PRODUCTION_HANDLER: CorporateActionResearchHandler | None = None
+
+
+def build_production_handler(
+    environment: Mapping[str, str] | None = None,
+) -> CorporateActionResearchHandler:
+    """Compose the required Alpaca source, issuer probes and PostgreSQL ledger."""
+
+    from market_pipeline_lib.alpaca import AlpacaCorporateActionsClient
+    from market_pipeline_lib.catalog import PostgresCatalog, StorageObjectsPolicy
+    from market_pipeline_lib.corporate_action_discovery import (
+        CorporateActionDiscoveryPort,
+        HttpEvidenceFetcher,
+        load_etf_universe,
+    )
+    from market_pipeline_lib.corporate_action_research import (
+        CatalogInstrumentResolver,
+        CatalogSourceManifestResolver,
+        TwiceDailySchedule,
+    )
+
+    values = os.environ if environment is None else environment
+    required = (
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
+        "DATABASE_URL",
+        "CORPORATE_ACTION_SOURCE_FEED_ID",
+    )
+    missing = [name for name in required if not values.get(name, "").strip()]
+    if missing:
+        raise ConfigurationError.missing(
+            missing,
+            hint="required production corporate-action discovery inputs",
+        )
+    universe_path = Path(
+        values.get("CORPORATE_ACTION_UNIVERSE_FILE", "ticker_info/etf_universe.csv")
+    )
+    universe = load_etf_universe(universe_path)
+    allowed_hosts = {
+        host
+        for entry in universe
+        if (host := urlparse(entry.source_url).hostname)
+    }
+    catalog = PostgresCatalog.connect(
+        values["DATABASE_URL"].strip(),
+        artifact_root=Path(values.get("CORPORATE_ACTION_ARTIFACT_ROOT", "/tmp/i2s-corporate-actions")),
+        storage_objects=StorageObjectsPolicy.READ_ONLY,
+    )
+    port = CorporateActionDiscoveryPort(
+        universe=universe,
+        alpaca=AlpacaCorporateActionsClient(
+            values["ALPACA_API_KEY"].strip(), values["ALPACA_SECRET_KEY"].strip()
+        ),
+        issuer_fetcher=HttpEvidenceFetcher(allowed_hosts=allowed_hosts),
+        incident_recorder=catalog,
+    )
+    executor = ResearchScheduleExecutor(
+        schedule=TwiceDailySchedule((time(0, 0, tzinfo=UTC), time(12, 0, tzinfo=UTC))),
+        port=port,
+        catalog=catalog,
+        instrument_resolver=CatalogInstrumentResolver(catalog),
+        manifest_resolver=CatalogSourceManifestResolver(
+            catalog,
+            feed_id=values["CORPORATE_ACTION_SOURCE_FEED_ID"].strip(),
+            resolution=values.get("CORPORATE_ACTION_SOURCE_RESOLUTION", "30m").strip(),
+        ),
+    )
+    return CorporateActionResearchHandler(schedule_executor=executor)
 
 
 def handler(event: Any, context: Any = None) -> dict[str, Any]:
     """AWS Lambda entry point."""
-
+    global _PRODUCTION_HANDLER
+    if all(
+        os.environ.get(name, "").strip()
+        for name in (
+            "ALPACA_API_KEY",
+            "ALPACA_SECRET_KEY",
+            "DATABASE_URL",
+            "CORPORATE_ACTION_SOURCE_FEED_ID",
+        )
+    ):
+        if _PRODUCTION_HANDLER is None:
+            _PRODUCTION_HANDLER = build_production_handler()
+        return _PRODUCTION_HANDLER.handle(event, context)
     return _DEFAULT_HANDLER.handle(event, context)

@@ -584,18 +584,24 @@ class ExplodingPort:
         raise RuntimeError("upstream research provider is down")
 
 
-def _split_finding(to_shares: int = 2) -> ResearchFinding:
+def _split_finding(
+    to_shares: int = 2,
+    *,
+    proposed_date: date = date(2026, 8, 15),
+    provider_source_event_id: str | None = None,
+) -> ResearchFinding:
     return ResearchFinding(
         event_type="STOCK_SPLIT",
-        proposed_date=date(2026, 8, 15),
+        proposed_date=proposed_date,
         terms=SplitTerms(from_shares=1, to_shares=to_shares),
         evidence=(_evidence(),),
         claims=(
             Claim("event_type", "STOCK_SPLIT", SOURCE, Decimal("0.95")),
-            Claim("effective_date", "2026-08-15", SOURCE, Decimal("0.90")),
+            Claim("effective_date", proposed_date.isoformat(), SOURCE, Decimal("0.90")),
             Claim("from_shares", "1", SOURCE, Decimal("0.99")),
             Claim("to_shares", str(to_shares), SOURCE, Decimal("0.99")),
         ),
+        provider_source_event_id=provider_source_event_id,
     )
 
 
@@ -760,6 +766,77 @@ class ResearchScheduleExecutorTest(unittest.TestCase):
             self.harness.executor.run_due_slot(
                 ("AAPL",), now=datetime(2026, 8, 2, 12, 30, tzinfo=UTC)
             )
+
+    def test_a_revised_provider_event_is_immutable_and_points_to_the_row_it_supersedes(self) -> None:
+        self.harness.executor._port = StubPort(  # noqa: SLF001
+            {
+                "AAPL": (
+                    _split_finding(provider_source_event_id="alpaca-split-aapl"),
+                )
+            }
+        )
+        self.harness.executor.run_due_slot(("AAPL",), now=self.now)
+        (original,) = self.harness.action_rows()
+
+        self.harness.executor._port = StubPort(  # noqa: SLF001
+            {
+                "AAPL": (
+                    _split_finding(
+                        proposed_date=date(2026, 8, 16),
+                        provider_source_event_id="alpaca-split-aapl",
+                    ),
+                )
+            }
+        )
+        self.harness.executor.run_due_slot(
+            ("AAPL",), now=datetime(2026, 8, 2, 12, 30, tzinfo=UTC)
+        )
+
+        rows = sorted(self.harness.action_rows(), key=lambda row: row["effective_at"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], original["id"])
+        self.assertIsNone(rows[0]["supersedes_action_id"])
+        self.assertEqual(rows[1]["supersedes_action_id"], original["id"])
+        self.assertEqual(
+            rows[1]["provider_event_key"], "ALPACA:alpaca-split-aapl:2026-08-16"
+        )
+
+    def test_manifest_resolution_is_scoped_to_the_finding_instrument(self) -> None:
+        other_instrument = deterministic_uuid("instrument", "MSFT")
+        other_manifest = deterministic_uuid("manifest", "MSFT", "2026")
+        self.harness.catalog.upsert(
+            "market_data.instruments",
+            {
+                "id": other_instrument,
+                "asset_type": "EQUITY",
+                "primary_exchange_mic": "XNAS",
+                "currency_code": "USD",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.harness.catalog.publish_manifest(
+            {
+                "id": other_manifest,
+                "feed_id": FEED_ID,
+                "instrument_id": other_instrument,
+                "data_layer": "RAW",
+                "resolution": "30m",
+                "revision_number": 99,
+                "status": "AVAILABLE",
+                "period_start": "2026-01-01T00:00:00Z",
+                "period_end": "2027-01-01T00:00:00Z",
+                "schema_version": "market-bars-v2",
+                "dataset_hash": "other-instrument-hash",
+                "supersedes_manifest_id": None,
+                "created_at": "2026-01-02T00:00:00Z",
+                "available_at": "2026-01-02T00:00:00Z",
+            }
+        )
+
+        self.harness.executor.run_due_slot(("AAPL",), now=self.now)
+
+        (row,) = self.harness.action_rows()
+        self.assertEqual(row["source_manifest_id"], MANIFEST_ID)
 
     def test_an_unmapped_ticker_is_refused_rather_than_skipped(self) -> None:
         self.harness.executor._port = StubPort({"ZZZZ": (_split_finding(),)})  # noqa: SLF001
