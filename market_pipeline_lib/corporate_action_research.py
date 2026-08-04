@@ -668,8 +668,12 @@ class AiResearchAdapter:
         raw = self._model(build_research_prompt(ticker, scheduled_at))
         document = self._parse(raw)
         accepted: list[ResearchFinding] = []
+        # One fetch per distinct URI for the whole pass: two findings citing the
+        # same issuer page must not hash it twice, or a page that changed between
+        # fetches would yield two different hashes for one source.
+        fetched: dict[str, Evidence] = {}
         for index, entry in enumerate(document):
-            finding = self._finding(entry, index)
+            finding = self._finding(entry, index, fetched)
             if finding.confidence < self._min_confidence:
                 LOGGER.warning(
                     "corporate_action_research.finding_below_threshold "
@@ -701,7 +705,9 @@ class AiResearchAdapter:
                 raise ResearchAdapterError("every finding must be a JSON object")
         return list(findings)
 
-    def _finding(self, entry: Mapping[str, Any], index: int) -> ResearchFinding:
+    def _finding(
+        self, entry: Mapping[str, Any], index: int, fetched: dict[str, Evidence]
+    ) -> ResearchFinding:
         where = f"findings[{index}]"
         try:
             event_type = str(entry["event_type"]).strip().upper()
@@ -715,7 +721,7 @@ class AiResearchAdapter:
             if not isinstance(terms_payload, Mapping):
                 raise ValueError("terms must be a JSON object")
             terms = parse_terms(event_type, terms_payload)
-            evidence = self._evidence(entry.get("evidence"))
+            evidence = self._evidence(entry.get("evidence"), fetched)
             claims = self._claims(entry.get("claims"))
         except KeyError as exc:
             raise ResearchAdapterError(f"{where} is missing {exc.args[0]!r}") from exc
@@ -741,19 +747,18 @@ class AiResearchAdapter:
             raise ResearchAdapterError(f"{where} is not self-consistent: {exc}") from exc
         return finding
 
-    def _evidence(self, payload: Any) -> tuple[Evidence, ...]:
+    def _evidence(self, payload: Any, fetched: dict[str, Evidence]) -> tuple[Evidence, ...]:
         """Parse citations, then *derive* each evidence item from retrieved bytes.
 
         A cited source that cannot be retrieved fails the finding rather than
         being stored with an unverifiable hash -- the same fail-closed choice
         `UnconfiguredResearchPort` makes for a whole slot.
+
+        `fetched` is the per-pass fetch cache owned by :meth:`research`.
         """
         if not isinstance(payload, list) or not payload:
             raise ValueError("at least one evidence entry is required")
         items: list[Evidence] = []
-        # One fetch per distinct URI: re-fetching would let the same source hash
-        # two different ways inside one finding.
-        fetched: dict[str, Evidence] = {}
         for entry in payload:
             if not isinstance(entry, Mapping):
                 raise ValueError("every evidence entry must be a JSON object")

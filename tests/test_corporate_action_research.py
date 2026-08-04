@@ -408,19 +408,28 @@ class AiResearchAdapterTest(unittest.TestCase):
 
         self.assertNotIn("content_sha256", prompt)
         self.assertNotIn("retrieved_at", prompt)
-        self.assertIn("derived from the retrieved bytes by the pipeline", prompt)
+        self.assertIn("content hash or a retrieval time for any source", prompt)
 
-    def test_one_source_is_fetched_once_per_finding(self) -> None:
-        # Re-fetching would let the same source hash two different ways in one finding.
+    def test_one_source_is_fetched_once_per_research_pass(self) -> None:
+        # Two findings citing the same page must not hash it twice: a page that
+        # changed between fetches would give one source two different hashes.
+        # (Within a single finding, ResearchCandidate already forbids duplicate
+        # evidence, so the cache only ever earns its keep across findings.)
         payload = json.loads(_model_payload())
-        payload["findings"][0]["evidence"].append(
-            {"source_uri": SOURCE, "source_title": "Issuer split notice"}
-        )
+        second = json.loads(json.dumps(payload["findings"][0]))
+        second["effective_date"] = "2026-09-15"
+        for claim in second["claims"]:
+            if claim["field"] == "effective_date":
+                claim["value"] = "2026-09-15"
+        payload["findings"].append(second)
         adapter = self._adapter(json.dumps(payload))
 
-        adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
+        findings = adapter.research("AAPL", datetime(2026, 8, 2, 0, 0, tzinfo=UTC))
 
+        self.assertEqual(len(findings), 2)
         self.assertEqual(self.fetcher.fetched, [SOURCE])
+        # Both findings carry the identical derived evidence.
+        self.assertEqual(findings[0].evidence, findings[1].evidence)
 
     def test_the_prompt_names_the_ticker_and_the_slot(self) -> None:
         adapter = self._adapter(_model_payload())
