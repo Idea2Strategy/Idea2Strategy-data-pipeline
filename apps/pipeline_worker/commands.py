@@ -123,6 +123,14 @@ class PipelineCommandExecutor:
         if self._config.realtime is not None:
             self._config.realtime.staging_root.mkdir(parents=True, exist_ok=True)
 
+    def request_stop(self, reason: str) -> None:
+        """Forward a shutdown request to adapters that expose cooperative cancellation."""
+
+        for port in (self._publication_port, self._realtime_port):
+            stop = getattr(port, "request_stop", None)
+            if callable(stop):
+                stop(reason)
+
     def execute(self, command: Command) -> Mapping[str, Any]:
         if command.command == "VALIDATE_CATALOG":
             return self._validate_catalog()

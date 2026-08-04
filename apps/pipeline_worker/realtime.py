@@ -19,10 +19,11 @@ batch is recognised as a replay rather than published twice.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from apps.common.errors import MalformedEventError, PortNotConfiguredError
+from apps.common.errors import ExecutionCancelledError, MalformedEventError, PortNotConfiguredError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from apps.pipeline_worker.config import RealtimeIngestSettings, WorkerConfig
@@ -35,6 +36,9 @@ class RealtimeIngestPort(Protocol):
 
     def ingest(self, events: Sequence[Mapping[str, Any]], *, flush: bool) -> Mapping[str, Any]:
         """Ingest `events`; publish immediately when `flush` is true."""
+
+    def request_stop(self, reason: str) -> None:
+        """Stop at the next safe boundary when supported."""
 
 
 class UnconfiguredRealtimeIngestPort:
@@ -49,6 +53,9 @@ class UnconfiguredRealtimeIngestPort:
             "Run `pipeline-worker --print-env` for the full document shape."
         )
 
+    def request_stop(self, reason: str) -> None:
+        return None
+
 
 class EngineRealtimeIngestPort:
     """Drives :class:`~market_pipeline_lib.realtime_ingest.RealtimeIngestor`."""
@@ -60,6 +67,8 @@ class EngineRealtimeIngestPort:
         self._config = config
         self._settings: RealtimeIngestSettings = settings
         self._ingestor: RealtimeIngestor | None = None
+        self._stop = threading.Event()
+        self._stop_reason: str | None = None
 
     def _build(self) -> RealtimeIngestor:
         # Imported lazily: pyarrow, pandas and pandas_market_calendars cost about a
@@ -71,7 +80,7 @@ class EngineRealtimeIngestPort:
             RealtimeIngestor,
             RealtimeIngestSpec,
         )
-        from market_pipeline_lib.watermarks import InMemoryWatermarkRepository, WatermarkLedger
+        from market_pipeline_lib.watermarks import WatermarkLedger
 
         settings = self._settings
         key = (settings.price_type, settings.data_layer, settings.resolution)
@@ -110,12 +119,26 @@ class EngineRealtimeIngestPort:
         ledger = WatermarkLedger(
             feed_id=engine.feed_ids[contract.feed_code],
             shard_keys=shard_keys,
-            # A durable `SqlWatermarkRepository` drops in here once the worker is
-            # given a database URL; the process-local one is honest about what it
-            # is, and `checkpoint` still refuses to invent a floor.
-            repository=InMemoryWatermarkRepository(),
+            repository=self._watermark_repository(),
         )
         return RealtimeIngestor(engine, spec, ledger=ledger)
+
+    def _watermark_repository(self) -> Any:
+        from market_pipeline_lib.watermarks import (
+            InMemoryWatermarkRepository,
+            SqlWatermarkRepository,
+        )
+
+        if self._config.database_url is None:
+            return InMemoryWatermarkRepository()
+        from market_pipeline_lib.db.engine import create_market_data_engine
+
+        engine = create_market_data_engine(
+            self._config.database_url,
+            writable_schemas=["market_data"],
+            application_name="idea2strategy-pipeline-worker-watermarks",
+        )
+        return SqlWatermarkRepository(engine)
 
     def _catalog(self) -> Any:
         from market_pipeline_lib.catalog import LocalCatalog
@@ -131,9 +154,13 @@ class EngineRealtimeIngestPort:
     def ingest(self, events: Sequence[Mapping[str, Any]], *, flush: bool) -> Mapping[str, Any]:
         from market_pipeline_lib.realtime_ingest import RealtimeIngestError
 
+        self._raise_if_stopped()
         ingestor = self.ingestor
         try:
-            decisions = ingestor.submit_batch(events)
+            decisions = []
+            for event in events:
+                self._raise_if_stopped()
+                decisions.extend(ingestor.submit_batch([event]))
         except RealtimeIngestError as error:
             # A structurally bad event cannot be fixed by another delivery.
             raise MalformedEventError(str(error)) from error
@@ -147,6 +174,7 @@ class EngineRealtimeIngestPort:
         }
         if not flush:
             return summary
+        self._raise_if_stopped()
         result = ingestor.flush()
         summary.update(
             {
@@ -161,3 +189,13 @@ class EngineRealtimeIngestPort:
             }
         )
         return summary
+
+    def request_stop(self, reason: str) -> None:
+        self._stop_reason = reason
+        self._stop.set()
+
+    def _raise_if_stopped(self) -> None:
+        if self._stop.is_set():
+            raise ExecutionCancelledError(
+                f"realtime ingest cancelled at a safe boundary: {self._stop_reason or 'stop requested'}"
+            )

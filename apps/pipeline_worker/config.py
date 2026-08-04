@@ -81,6 +81,13 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "AWS region for the SQS client.",
     ),
     (
+        "PIPELINE_WORKER_DATABASE_URL",
+        False,
+        "",
+        "PostgreSQL URL used for durable realtime watermarks. Empty keeps the local "
+        "in-memory repository for development only.",
+    ),
+    (
         "PIPELINE_WORKER_MAX_RECEIVE_COUNT",
         False,
         "5",
@@ -150,6 +157,13 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         False,
         "10000",
         "Number of recently handled command ids retained for duplicate suppression.",
+    ),
+    (
+        "PIPELINE_WORKER_EXIT_AFTER_IDLE_POLLS",
+        False,
+        "0",
+        "Exit successfully after this many consecutive empty polls. 0 keeps the worker "
+        "long-running; a positive value supports desired-zero ECS RunTask execution.",
     ),
     (
         "PIPELINE_WORKER_HEALTH_FILE",
@@ -333,6 +347,8 @@ class WorkerConfig:
     health_host: str
     health_port: int | None
     realtime: RealtimeIngestSettings | None
+    exit_after_idle_polls: int = 0
+    database_url: str | None = None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -389,6 +405,7 @@ class WorkerConfig:
         )
 
         endpoint_raw = values.get("PIPELINE_WORKER_AWS_ENDPOINT_URL")
+        database_url_raw = values.get("PIPELINE_WORKER_DATABASE_URL")
         realtime_raw = values.get("PIPELINE_WORKER_REALTIME_INGEST")
 
         return cls(
@@ -400,6 +417,11 @@ class WorkerConfig:
             dead_letter_queue_url=dead_letter_queue_url,
             aws_endpoint_url=None if _blank(endpoint_raw) else str(endpoint_raw).strip(),
             aws_region=(values.get("PIPELINE_WORKER_AWS_REGION") or "us-east-1").strip(),
+            database_url=(
+                None
+                if _blank(database_url_raw)
+                else str(database_url_raw).strip()
+            ),
             log_level=log_level,
             poll_interval_seconds=_require_float(
                 values, "PIPELINE_WORKER_POLL_INTERVAL_SECONDS", "1.0", minimum=0.001
@@ -434,6 +456,13 @@ class WorkerConfig:
             health_host=(values.get("PIPELINE_WORKER_HEALTH_HOST") or "127.0.0.1").strip(),
             health_port=health_port,
             realtime=None if _blank(realtime_raw) else RealtimeIngestSettings.parse(str(realtime_raw)),
+            exit_after_idle_polls=_require_int(
+                values,
+                "PIPELINE_WORKER_EXIT_AFTER_IDLE_POLLS",
+                "0",
+                minimum=0,
+                maximum=1_000_000,
+            ),
         )
 
     def describe(self) -> dict[str, object]:
@@ -448,6 +477,7 @@ class WorkerConfig:
             "dead_letter_queue_configured": self.dead_letter_queue_url is not None,
             "aws_endpoint_override": self.aws_endpoint_url is not None,
             "aws_region": self.aws_region,
+            "database_configured": self.database_url is not None,
             "log_level": self.log_level,
             "poll_interval_seconds": self.poll_interval_seconds,
             "max_messages_per_poll": self.max_messages_per_poll,
@@ -458,6 +488,7 @@ class WorkerConfig:
             "health_file": str(self.health_file) if self.health_file else None,
             "health_port": self.health_port,
             "realtime": None if self.realtime is None else self.realtime.describe(),
+            "exit_after_idle_polls": self.exit_after_idle_polls,
         }
 
 
