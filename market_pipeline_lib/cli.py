@@ -208,6 +208,52 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--expected-object-count", type=int, required=True)
     bootstrap.add_argument("--expected-manifest-count", type=int, required=True)
     bootstrap.add_argument("--execute", action="store_true")
+    runtime_instruments = subparsers.add_parser(
+        "export-trading-instruments",
+        help="version-pinned historical intersection to canonical trading symbols",
+    )
+    runtime_instruments.add_argument("--artifact-root", type=Path, required=True)
+    runtime_instruments.add_argument("--bucket", required=True)
+    runtime_instruments.add_argument("--adjustment", choices=("raw", "adjusted"), required=True)
+    runtime_instruments.add_argument("--resolution", action="append", required=True)
+    runtime_instruments.add_argument(
+        "--layer",
+        action="append",
+        required=True,
+        metavar="RESOLUTION=LAYER",
+    )
+    runtime_instruments.add_argument("--start-date")
+    runtime_instruments.add_argument("--end-date-exclusive")
+    runtime_instruments.add_argument("--start-year", type=int)
+    runtime_instruments.add_argument("--end-year", type=int)
+    runtime_instruments.add_argument(
+        "--latest-revision-policy",
+        choices=("latest-per-period", "all-available"),
+        required=True,
+    )
+    runtime_instruments.add_argument("--symbol-effective-cutoff", required=True)
+    runtime_instruments.add_argument("--output", type=Path, required=True)
+    runtime_instruments.add_argument("--evidence-output", type=Path, required=True)
+    runtime_instruments.add_argument("--execute", action="store_true")
+    runtime_warmup = subparsers.add_parser(
+        "publish-trading-warmup",
+        help="explicit D90 warm-up publication plus byte-level receipt",
+    )
+    runtime_warmup.add_argument("--output", type=Path, required=True)
+    runtime_warmup.add_argument("--session-date", required=True)
+    runtime_warmup.add_argument("--events", type=Path, required=True)
+    runtime_warmup.add_argument("--requirements", type=Path, required=True)
+    runtime_warmup.add_argument("--readiness", type=Path, required=True)
+    runtime_warmup.add_argument("--adjustment", choices=("raw", "adjusted"), required=True)
+    runtime_warmup.add_argument("--layer", choices=("RAW", "ADJUSTED", "DERIVED"), required=True)
+    runtime_warmup.add_argument("--resolution", required=True)
+    runtime_warmup.add_argument("--event-type", required=True)
+    runtime_warmup.add_argument(
+        "--granularity", choices=("DAY", "WEEK", "MONTH", "YEAR"), required=True
+    )
+    runtime_warmup.add_argument("--revision", type=int, required=True)
+    runtime_warmup.add_argument("--shard-count", type=int, required=True)
+    runtime_warmup.add_argument("--max-readiness-age-seconds", type=int, required=True)
     return parser
 
 
@@ -364,7 +410,176 @@ def _register_reference_data(args: argparse.Namespace) -> dict[str, Any]:
         target.close()
 
 
+def _runtime_date_range(args: argparse.Namespace) -> tuple[date, date]:
+    dates = args.start_date is not None or args.end_date_exclusive is not None
+    years = args.start_year is not None or args.end_year is not None
+    if dates == years:
+        raise ValueError(
+            "supply exactly one complete range: --start-date/--end-date-exclusive "
+            "or --start-year/--end-year"
+        )
+    if dates:
+        if args.start_date is None or args.end_date_exclusive is None:
+            raise ValueError("both explicit date range bounds are required")
+        start = date.fromisoformat(args.start_date)
+        end = date.fromisoformat(args.end_date_exclusive)
+    else:
+        if args.start_year is None or args.end_year is None:
+            raise ValueError("both explicit year range bounds are required")
+        start = date(args.start_year, 1, 1)
+        end = date(args.end_year + 1, 1, 1)
+    if end <= start:
+        raise ValueError("runtime export end must be after start")
+    return start, end
+
+
+def _runtime_layers(args: argparse.Namespace) -> dict[str, str]:
+    resolutions = list(args.resolution)
+    if not resolutions or len(set(resolutions)) != len(resolutions):
+        raise ValueError("--resolution values must be non-empty and unique")
+    layers: dict[str, str] = {}
+    for value in args.layer:
+        try:
+            resolution, layer = value.split("=", 1)
+        except ValueError as exc:
+            raise ValueError("--layer must use RESOLUTION=LAYER") from exc
+        if resolution in layers:
+            raise ValueError(f"duplicate --layer resolution: {resolution}")
+        if layer not in {"RAW", "ADJUSTED", "DERIVED"}:
+            raise ValueError(f"unsupported layer: {layer}")
+        layers[resolution] = layer
+    if set(layers) != set(resolutions):
+        raise ValueError("--layer resolutions must exactly match --resolution")
+    return layers
+
+
+def _timezone_aware(value: str, label: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _json_file(path: Path, label: str) -> Any:
+    try:
+        return json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must be a readable JSON file") from exc
+
+
+def _export_trading_instruments(args: argparse.Namespace) -> dict[str, Any]:
+    from .legacy_bootstrap import connect_read_only_catalog
+    from .runtime_export import HistoricalSelection, export_trading_instruments
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("export-trading-instruments requires DATABASE_URL")
+    start, end = _runtime_date_range(args)
+    selection = HistoricalSelection(
+        layer_by_resolution=_runtime_layers(args),
+        adjustment=args.adjustment,
+        start=start,
+        end_exclusive=end,
+        latest_revision_policy=args.latest_revision_policy,
+        symbol_effective_cutoff=_timezone_aware(
+            args.symbol_effective_cutoff, "--symbol-effective-cutoff"
+        ),
+    )
+    import boto3
+
+    catalog = connect_read_only_catalog(
+        database_url,
+        artifact_root=args.artifact_root.expanduser().resolve(),
+    )
+    try:
+        catalog.verify_schema()
+        return export_trading_instruments(
+            catalog,
+            boto3.client("s3"),
+            selection,
+            output=args.output,
+            evidence_output=args.evidence_output,
+            expected_bucket=args.bucket,
+            execute=args.execute,
+        )
+    finally:
+        catalog.close()
+
+
+def _publish_trading_warmup(args: argparse.Namespace) -> dict[str, Any]:
+    from .realtime_warmup import (
+        FeatureRequirement,
+        WarmupPublicationSpec,
+        WarmupReadiness,
+    )
+    from .runtime_warmup_export import publish_trading_warmup
+
+    contract_key = (args.adjustment, args.layer, args.resolution)
+    contract = DATASET_CONTRACTS.get(contract_key)
+    if contract is None:
+        raise ValueError(f"no dataset contract for {'/'.join(contract_key)}")
+    events = _json_file(args.events, "--events")
+    if events is not None and not isinstance(events, dict):
+        raise ValueError("--events JSON must be an object or null")
+    raw_requirements = _json_file(args.requirements, "--requirements")
+    if not isinstance(raw_requirements, list):
+        raise ValueError("--requirements JSON must be an array")
+    requirements = tuple(
+        FeatureRequirement(
+            requirement_id=str(item["requirement_id"]),
+            feature_id=str(item["feature_id"]),
+            feature_version=str(item["feature_version"]),
+            resolution=str(item["resolution"]),
+            value_field=str(item["value_field"]),
+            instruments=tuple(str(value) for value in item["instruments"]),
+            required_observations=int(item["required_observations"]),
+        )
+        for item in raw_requirements
+        if isinstance(item, dict)
+    )
+    if len(requirements) != len(raw_requirements):
+        raise ValueError("every --requirements item must be an object")
+    raw_readiness = _json_file(args.readiness, "--readiness")
+    if not isinstance(raw_readiness, dict):
+        raise ValueError("--readiness JSON must be an object")
+    readiness = WarmupReadiness(
+        state=str(raw_readiness["state"]),
+        session_date_et=str(raw_readiness["session_date_et"]),
+        feed_id=str(raw_readiness["feed_id"]),
+        evaluated_at=_timezone_aware(str(raw_readiness["evaluated_at"]), "readiness.evaluated_at"),
+        reason_code=(
+            None if raw_readiness.get("reason_code") is None else str(raw_readiness["reason_code"])
+        ),
+        detail=None if raw_readiness.get("detail") is None else str(raw_readiness["detail"]),
+        manifest_id=(
+            None if raw_readiness.get("manifest_id") is None else str(raw_readiness["manifest_id"])
+        ),
+        observed=raw_readiness.get("observed") or {},
+    )
+    spec = WarmupPublicationSpec(
+        contract=contract,
+        event_type=args.event_type,
+        granularity=args.granularity,
+        revision=args.revision,
+        shard_count=args.shard_count,
+    )
+    return publish_trading_warmup(
+        output=args.output,
+        session_date=date.fromisoformat(args.session_date),
+        spec=spec,
+        readiness=readiness,
+        requirements=requirements,
+        events=events,
+        now=datetime.now(timezone.utc),
+        max_readiness_age=timedelta(seconds=args.max_readiness_age_seconds),
+    )
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "export-trading-instruments":
+        return _export_trading_instruments(args)
+    if args.command == "publish-trading-warmup":
+        return _publish_trading_warmup(args)
     if args.command == "bootstrap-legacy-catalog":
         from .legacy_bootstrap import (
             S3LegacyObjectVerifier,
