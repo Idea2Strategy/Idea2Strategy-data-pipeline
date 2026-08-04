@@ -138,6 +138,47 @@ class AdjustedDatasetRegenerator:
         approved_actions: Sequence[ApprovedAction],
         now: datetime,
     ) -> RegenerationResult:
+        """Regenerate as a standalone operation with its own DB transaction."""
+        return self._regenerate(
+            raw_manifest_id=raw_manifest_id,
+            adjusted_feed_id=adjusted_feed_id,
+            approved_actions=approved_actions,
+            now=now,
+            transaction_active=False,
+        )
+
+    def regenerate_in_transaction(
+        self,
+        *,
+        raw_manifest_id: str,
+        adjusted_feed_id: str,
+        approved_actions: Sequence[ApprovedAction],
+        now: datetime,
+    ) -> RegenerationResult:
+        """Regenerate using the caller's active catalog transaction.
+
+        Object bytes are written before relational publication. If the database
+        transaction rolls back, those bytes are deliberately left unreferenced;
+        the object-store orphan collector may remove them later, while no
+        manifest is ever allowed to expose a partially committed revision.
+        """
+        return self._regenerate(
+            raw_manifest_id=raw_manifest_id,
+            adjusted_feed_id=adjusted_feed_id,
+            approved_actions=approved_actions,
+            now=now,
+            transaction_active=True,
+        )
+
+    def _regenerate(
+        self,
+        *,
+        raw_manifest_id: str,
+        adjusted_feed_id: str,
+        approved_actions: Sequence[ApprovedAction],
+        now: datetime,
+        transaction_active: bool,
+    ) -> RegenerationResult:
         raw = self._manifest(raw_manifest_id)
         resolution = str(raw["resolution"])
         period_start = str(raw["period_start"])
@@ -204,29 +245,11 @@ class AdjustedDatasetRegenerator:
             "available_at": moment,
         }
 
-        with self._catalog.transaction() as catalog:
-            if current is not None:
-                # Retire the prior revision *before* publishing, so the invariant
-                # "one AVAILABLE revision per dataset" never briefly breaks.
-                catalog.upsert(
-                    DATASET_MANIFESTS_TABLE, {**dict(current), "status": "SUPERSEDED"}
-                )
-            catalog.publish_manifest(record)
-            catalog.record_dataset_lineage(
-                {
-                    "derived_manifest_id": manifest_id,
-                    "source_manifest_id": raw_manifest_id,
-                    "relation_type": ADJUSTMENT_SOURCE,
-                }
-            )
-            if current is not None:
-                catalog.record_dataset_lineage(
-                    {
-                        "derived_manifest_id": manifest_id,
-                        "source_manifest_id": str(current["id"]),
-                        "relation_type": SUPERSEDES,
-                    }
-                )
+        if transaction_active:
+            self._publish_revision(self._catalog, current, record, manifest_id, raw_manifest_id)
+        else:
+            with self._catalog.transaction() as catalog:
+                self._publish_revision(catalog, current, record, manifest_id, raw_manifest_id)
 
         return RegenerationResult(
             manifest_id=manifest_id,
@@ -236,6 +259,37 @@ class AdjustedDatasetRegenerator:
             row_count=written.row_count,
             created=True,
         )
+
+    @staticmethod
+    def _publish_revision(
+        catalog: RegenerationCatalog,
+        current: Mapping[str, Any] | None,
+        record: Mapping[str, Any],
+        manifest_id: str,
+        raw_manifest_id: str,
+    ) -> None:
+        if current is not None:
+            # Retire the prior revision *before* publishing, so the invariant
+            # "one AVAILABLE revision per dataset" never briefly breaks.
+            catalog.upsert(
+                DATASET_MANIFESTS_TABLE, {**dict(current), "status": "SUPERSEDED"}
+            )
+        catalog.publish_manifest(record)
+        catalog.record_dataset_lineage(
+            {
+                "derived_manifest_id": manifest_id,
+                "source_manifest_id": raw_manifest_id,
+                "relation_type": ADJUSTMENT_SOURCE,
+            }
+        )
+        if current is not None:
+            catalog.record_dataset_lineage(
+                {
+                    "derived_manifest_id": manifest_id,
+                    "source_manifest_id": str(current["id"]),
+                    "relation_type": SUPERSEDES,
+                }
+            )
 
     def _manifest(self, manifest_id: str) -> dict[str, Any]:
         for row in self._catalog.records(DATASET_MANIFESTS_TABLE):

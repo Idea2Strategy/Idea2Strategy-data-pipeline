@@ -32,6 +32,7 @@ EVIDENCE = "b" * 64
 class Catalog:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self.rows = rows
+        self.transaction_active = False
 
     def records(self, table: str) -> list[dict[str, object]]:
         assert table == "market_data.corporate_actions"
@@ -47,12 +48,17 @@ class Catalog:
 
     @contextmanager
     def transaction(self):  # type: ignore[no-untyped-def]
+        if self.transaction_active:
+            raise RuntimeError("catalog transactions do not nest")
         snapshot = deepcopy(self.rows)
+        self.transaction_active = True
         try:
             yield self
         except Exception:
             self.rows = snapshot
             raise
+        finally:
+            self.transaction_active = False
 
 
 class Operators:
@@ -75,11 +81,19 @@ class Regenerator:
     def __init__(self) -> None:
         self.calls = 0
         self.fail = False
+        self.catalog: Catalog | None = None
 
     def with_catalog(self, catalog: Catalog) -> Regenerator:
+        self.catalog = catalog
         return self
 
     def regenerate(self, **_: object) -> object:
+        assert self.catalog is not None
+        with self.catalog.transaction():
+            return self.regenerate_in_transaction()
+
+    def regenerate_in_transaction(self, **_: object) -> object:
+        assert self.catalog is not None and self.catalog.transaction_active
         if self.fail:
             raise RuntimeError("injected regeneration failure")
         self.calls += 1

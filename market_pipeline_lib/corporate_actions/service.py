@@ -294,7 +294,13 @@ class CorporateActionReviewService:
             self._provider_transition(row, result, ReviewState.APPROVED)
             target_state = ReviewState.APPROVED
 
-        regeneration = self._regenerator.regenerate(
+        regenerate_in_transaction = getattr(self._regenerator, "regenerate_in_transaction", None)
+        if not callable(regenerate_in_transaction):
+            raise ApprovalRefusedError(
+                "APPROVAL_TRANSACTION_UNAVAILABLE",
+                "regenerator cannot join the active approval transaction",
+            )
+        regeneration = regenerate_in_transaction(
             raw_manifest_id=self._raw_manifest_id,
             adjusted_feed_id=self._adjusted_feed_id,
             approved_actions=self.approved_actions(),
