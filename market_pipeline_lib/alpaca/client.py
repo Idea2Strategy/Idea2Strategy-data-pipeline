@@ -362,7 +362,6 @@ class AlpacaCorporateActionsClient(AlpacaBarsClient):
             "types": ",".join(dict.fromkeys(event_types)),
             "limit": min(self._config.page_limit, 1000),
             "sort": "asc",
-            "cas_region": "us",
         }
         token: str | None = None
         seen: set[str] = set()

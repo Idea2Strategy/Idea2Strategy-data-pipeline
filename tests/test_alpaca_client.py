@@ -517,7 +517,7 @@ class CorporateActionsClientTests(unittest.TestCase):
         self.assertEqual(transport.requests[0].url.params["symbols"], ",".join(symbols))
         self.assertEqual(transport.requests[0].url.params["limit"], "1000")
         self.assertEqual(transport.requests[0].url.params["sort"], "asc")
-        self.assertEqual(transport.requests[0].url.params["cas_region"], "us")
+        self.assertNotIn("cas_region", transport.requests[0].url.params)
         self.assertEqual(transport.requests[1].url.params["page_token"], "page-2")
         self.assertNotIn(API_KEY, str(transport.requests[0].url))
         self.assertNotIn(API_SECRET, str(transport.requests[0].url))
