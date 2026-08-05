@@ -165,6 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
     apply_db.add_argument("--local-root", type=Path, required=True)
     apply_db.add_argument("--dbml", type=Path, required=True)
     apply_db.add_argument("--execute", action="store_true")
+    apply_db.add_argument(
+        "--preserve-existing-provider-rights",
+        action="store_true",
+        help=(
+            "reuse only an existing ACTIVE, non-placeholder provider rights row with "
+            "the same canonical id; never creates rights evidence"
+        ),
+    )
     upload = subparsers.add_parser(
         "upload",
         help="명시적으로 요청할 때만 S3 호환 저장소 업로드",
@@ -669,6 +677,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 dbml_path=args.dbml,
                 execute=args.execute,
                 database_url=os.getenv("DATABASE_URL"),
+                preserve_existing_provider_rights=args.preserve_existing_provider_rights,
             )
         if args.command == "cleanup-staging":
             run = next(

@@ -29,11 +29,16 @@ from market_pipeline_lib.contracts import (
     stable_shard_key,
 )
 from market_pipeline_lib.db.errors import RuntimeDdlForbidden, SchemaWriteForbidden
-from market_pipeline_lib.db.tables import METADATA, instruments as instruments_table
+from market_pipeline_lib.db.tables import (
+    METADATA,
+    instruments as instruments_table,
+    providers as providers_table,
+)
 from market_pipeline_lib.engine import MarketPipelineEngine, PipelineConfig
 from market_pipeline_lib.fs_paths import long_path
 from market_pipeline_lib.operations import (
     RightsAttestation,
+    RightsVersionNotAttested,
     apply_catalog_to_postgres,
     export_db_plan,
     validate_catalog,
@@ -1635,6 +1640,106 @@ def test_apply_catalog_to_postgres_writes_the_local_catalog_into_the_database(
     assert postgres_catalog.records("market_data.dataset_manifests")
     assert postgres_catalog.records("storage.objects")
     assert postgres_catalog.records("market_data.dataset_objects")
+
+
+@pytest.mark.integration
+def test_apply_catalog_can_preserve_existing_attested_provider_rights(
+    postgres_catalog,
+    postgres_url,
+    admin_engine,
+):
+    """A recent run may reuse, but never invent, the target's approved rights row."""
+
+    with temporary_root() as temporary:
+        root = Path(temporary)
+        engine = build_engine(root, sessions=[("2024-11-29", 7)])
+        engine.backfill(
+            start=datetime(2024, 11, 29, tzinfo=timezone.utc),
+            end=datetime(2024, 11, 30, tzinfo=timezone.utc),
+            price_types=("raw",),
+            resolutions=("30m",),
+            symbols=["AAPL"],
+        )
+        catalog = LocalCatalog(root / "objects" / "catalog-export")
+        store = LocalObjectStore(root / "objects")
+        provider = catalog.records("market_data.providers")[0]
+
+        with admin_engine.begin() as connection:
+            connection.execute(
+                providers_table.insert(),
+                {
+                    **provider,
+                    "rights_version": "alpaca-sip-live-approved",
+                    "status": "ACTIVE",
+                },
+            )
+            connection.execute(
+                instruments_table.insert(),
+                {
+                    "id": uuid.UUID(IDS["AAPL"]),
+                    "asset_type": "STOCK",
+                    "primary_exchange_mic": "XNAS",
+                    "currency_code": "USD",
+                    "provider_reference": None,
+                    "listed_at": None,
+                    "delisted_at": None,
+                    "created_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                },
+            )
+
+        applied = apply_catalog_to_postgres(
+            catalog,
+            store,
+            dbml_path=Path("tests/fixtures/market-data-schema.dbml").resolve(),
+            execute=True,
+            database_url=postgres_url,
+            preserve_existing_provider_rights=True,
+        )
+
+    assert applied["status"] == "APPLIED"
+    assert applied["rights_attested_providers"] == []
+    assert applied["rights_preserved_providers"] == ["ALPACA"]
+    assert applied["rights_review_required_providers"] == []
+    providers = postgres_catalog.records("market_data.providers")
+    assert [row["rights_version"] for row in providers] == ["alpaca-sip-live-approved"]
+    assert [row["status"] for row in providers] == ["ACTIVE"]
+
+
+@pytest.mark.integration
+def test_apply_refuses_to_preserve_unapproved_existing_provider_rights(
+    postgres_catalog,
+    postgres_url,
+    admin_engine,
+):
+    """A target placeholder is not approval evidence and must leave execute blocked."""
+
+    with temporary_root() as temporary:
+        root = Path(temporary)
+        engine = build_engine(root, sessions=[("2024-11-29", 7)])
+        engine.backfill(
+            start=datetime(2024, 11, 29, tzinfo=timezone.utc),
+            end=datetime(2024, 11, 30, tzinfo=timezone.utc),
+            price_types=("raw",),
+            resolutions=("30m",),
+            symbols=["AAPL"],
+        )
+        catalog = LocalCatalog(root / "objects" / "catalog-export")
+        provider = catalog.records("market_data.providers")[0]
+
+        with admin_engine.begin() as connection:
+            connection.execute(providers_table.insert(), provider)
+
+        with pytest.raises(RightsVersionNotAttested, match="ALPACA"):
+            apply_catalog_to_postgres(
+                catalog,
+                LocalObjectStore(root / "objects"),
+                dbml_path=Path("tests/fixtures/market-data-schema.dbml").resolve(),
+                execute=True,
+                database_url=postgres_url,
+                preserve_existing_provider_rights=True,
+            )
+
+    assert postgres_catalog.records("storage.objects") == []
 
 
 @pytest.mark.integration
