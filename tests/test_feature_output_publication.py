@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -231,11 +232,14 @@ def test_feature_publication_commits_through_the_canonical_postgres_schema(
                 "INSERT INTO strategy.element_catalog_versions "
                 "(id, language_version, schema_version, catalog_version, "
                 " data_requirement_version, definition_hash, published_at) "
-                "VALUES (:id, '1.0.0', '1', '1.0.0', '1.0.0', :digest, "
+                "VALUES (:id, '248.0.0', '248', '248.0.0', '248.0.0', :digest, "
                 " TIMESTAMPTZ '2026-01-01 00:00:00+00') "
                 "ON CONFLICT (id) DO NOTHING"
             ),
-            {"id": CATALOG_VERSION, "digest": "e" * 64},
+            {
+                "id": CATALOG_VERSION,
+                "digest": hashlib.sha256(CATALOG_VERSION.encode("ascii")).hexdigest(),
+            },
         )
     postgres_catalog.upsert(
         "market_data.providers",
