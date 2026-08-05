@@ -134,6 +134,33 @@ class LocalStackStorageAdapterIntegrationTests(unittest.TestCase):
             with remote.open(object_key) as body:
                 self.assertEqual(body.read(), source.read_bytes())
 
+    def test_exact_version_read_and_cleanup_never_touch_a_newer_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "feature-series.parquet"
+            source.write_bytes(b"feature-series.parquet.v1-original")
+            object_key = f"{self.key_prefix}/feature-series.parquet"
+            store = self.make_store()
+
+            receipt = store.put(source, object_key)
+            self.assertTrue(receipt.created)
+            self.assertNotEqual(receipt.provider_version_id, receipt.etag)
+            with store.open_version(receipt.object_key, receipt.provider_version_id) as body:
+                self.assertEqual(body.read(), source.read_bytes())
+
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=object_key,
+                Body=b"newer-version-must-survive-cleanup",
+                ServerSideEncryption="AES256",
+                Metadata={"sha256": "newer"},
+            )
+            with store.open_version(receipt.object_key, receipt.provider_version_id) as body:
+                self.assertEqual(body.read(), source.read_bytes())
+
+            store.delete(receipt)
+            latest = self.client.get_object(Bucket=self.bucket, Key=object_key)["Body"].read()
+            self.assertEqual(latest, b"newer-version-must-survive-cleanup")
+
     def test_real_s3_stores_sse_checksum_and_version_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source.parquet"

@@ -47,7 +47,7 @@ Canonical constraints honoured here
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -64,6 +64,7 @@ from .errors import (
     MaterializationConflict,
 )
 from .hashing import canonical_json, canonical_sha256, is_sha256_hex, iso_utc, materialization_version
+from .output import FeatureOutputPublisher, PreparedFeatureOutput
 from .tables import FEATURE_MATERIALIZATIONS, FeatureCatalog
 
 __all__ = [
@@ -166,6 +167,10 @@ class MaterializationRequest:
     #: Required: `feature_materialization_success_complete` refuses a SUCCEEDED row
     #: without one, so the caller publishes the output dataset first.
     output_dataset_manifest_id: str
+    #: Required only for immutable feature-series publication.  It is explicit because
+    #: the canonical model has no feature-definition-to-feed mapping to infer safely.
+    output_feed_id: str | None = None
+    output_revision_number: int | None = None
 
     def validate(self) -> None:
         _require_uuid(self.instrument_id, "instrument_id")
@@ -219,6 +224,17 @@ class MaterializationRequest:
                     f"[{self.period_start.isoformat()}, {self.period_end.isoformat()})"
                 )
 
+    def validate_output_publication(self) -> None:
+        if self.output_feed_id is None:
+            raise ValueError("output_feed_id is required for feature-series publication")
+        _require_uuid(self.output_feed_id, "output_feed_id")
+        if (
+            not isinstance(self.output_revision_number, int)
+            or isinstance(self.output_revision_number, bool)
+            or self.output_revision_number < 1
+        ):
+            raise ValueError("output_revision_number must be a positive integer")
+
     @property
     def input_dataset_set_hash(self) -> str:
         return input_bundle_fingerprint(self.sources)
@@ -253,6 +269,9 @@ class MaterializationResult:
     values: tuple[FeatureValue, ...]
     result_hash: str
     status: str = field(default="SUCCEEDED")
+    published_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    output_content_hash: str | None = None
+    output_provider_version_id: str | None = None
 
     @property
     def row_count(self) -> int:
@@ -275,6 +294,30 @@ class MaterializationResult:
         """The exact bytes the value rows contribute to `result_hash`."""
 
         return canonical_json(_rows_payload(self.values))
+
+    def verify_decoded_values(self, table: Any) -> bool:
+        """Recompute ``result_hash`` from decoded Parquet rows, not original memory."""
+
+        try:
+            timestamps = table.column("bar_start_at").to_pylist()
+            values = table.column("value").to_pylist()
+            decoded = tuple(
+                FeatureValue(bar_start_at=moment, value=value)
+                for moment, value in zip(timestamps, values, strict=True)
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            _result_hash(
+                definition_hash=self.definition_hash,
+                instrument_id=self.instrument_id,
+                input_dataset_set_hash=self.input_dataset_set_hash,
+                period_start=self.period_start,
+                period_end=self.period_end,
+                values=decoded,
+            )
+            == self.result_hash
+        )
 
 
 def _rows_payload(values: Sequence[FeatureValue]) -> list[dict[str, str]]:
@@ -307,9 +350,16 @@ def _result_hash(
 class FeatureMaterializer:
     """Runs one materialization and records it in the catalog."""
 
-    def __init__(self, catalog: FeatureCatalog, registry: FeatureDefinitionRegistry) -> None:
+    def __init__(
+        self,
+        catalog: FeatureCatalog,
+        registry: FeatureDefinitionRegistry,
+        *,
+        output_publisher: FeatureOutputPublisher | None = None,
+    ) -> None:
         self._catalog = catalog
         self._registry = registry
+        self._output_publisher = output_publisher
 
     def materialize(self, request: MaterializationRequest) -> MaterializationResult:
         """Compute, persist and return one materialization.
@@ -325,6 +375,8 @@ class FeatureMaterializer:
         """
 
         request.validate()
+        if self._output_publisher is not None:
+            request.validate_output_publication()
         if not self._registry.is_published(request.definition):
             raise FeatureDefinitionNotPublished(
                 f"feature definition {request.definition.feature_definition_version} "
@@ -334,7 +386,16 @@ class FeatureMaterializer:
         materialization_id = request.materialization_id
         self._assert_run_is_free(materialization_id, request)
 
-        self._write(request, materialization_id, status="RUNNING", result_hash=None)
+        previous_success = next(
+            (
+                row
+                for row in self._catalog.records(FEATURE_MATERIALIZATIONS)
+                if str(row.get("id")) == materialization_id and row.get("status") == "SUCCEEDED"
+            ),
+            None,
+        )
+        if previous_success is None:
+            self._write(request, materialization_id, status="RUNNING", result_hash=None)
         try:
             values = request.definition.calculator().compute(
                 request.bars, request.definition.normalized_parameters
@@ -353,9 +414,7 @@ class FeatureMaterializer:
             period_end=request.period_end,
             values=values,
         )
-        self._write(request, materialization_id, status="SUCCEEDED", result_hash=digest)
-        self._record_lineage(request)
-        return MaterializationResult(
+        result = MaterializationResult(
             materialization_id=materialization_id,
             definition_hash=request.definition.definition_hash,
             instrument_id=request.instrument_id,
@@ -367,6 +426,67 @@ class FeatureMaterializer:
             result_hash=digest,
             status="SUCCEEDED",
         )
+        if previous_success is not None and previous_success.get("result_hash") != digest:
+            raise MaterializationConflict(
+                f"successful materialization {materialization_id} recomputed a different result_hash"
+            )
+        if self._output_publisher is None:
+            if previous_success is None:
+                self._write(request, materialization_id, status="SUCCEEDED", result_hash=digest)
+                self._record_lineage(request)
+            return result
+
+        prepared = None
+        try:
+            prepared = self._output_publisher.prepare(request, result)
+            if previous_success is not None:
+                self._assert_existing_publication(request, prepared)
+                return replace(
+                    result,
+                    output_content_hash=prepared.receipt.content_hash,
+                    output_provider_version_id=prepared.receipt.provider_version_id,
+                )
+            with self._catalog.transaction():
+                self._output_publisher.register(request, prepared)
+                self._write(request, materialization_id, status="SUCCEEDED", result_hash=digest)
+        except Exception:
+            if prepared is not None:
+                self._output_publisher.cleanup(prepared)
+            if previous_success is None:
+                self._write(request, materialization_id, status="FAILED", result_hash=None)
+            raise
+        return replace(
+            result,
+            output_content_hash=prepared.receipt.content_hash,
+            output_provider_version_id=prepared.receipt.provider_version_id,
+        )
+
+    def _assert_existing_publication(
+        self, request: MaterializationRequest, prepared: PreparedFeatureOutput
+    ) -> None:
+        manifests = [
+            row
+            for row in self._catalog.records("market_data.dataset_manifests")
+            if row.get("id") == request.output_dataset_manifest_id
+            and row.get("status") == "AVAILABLE"
+        ]
+        objects = [
+            row
+            for row in self._catalog.records("storage.objects")
+            if row.get("object_key") == prepared.receipt.object_key
+            and row.get("provider_version_id") == prepared.receipt.provider_version_id
+            and row.get("content_hash") == prepared.receipt.content_hash
+        ]
+        relations = [
+            row
+            for row in self._catalog.records("market_data.dataset_objects")
+            if row.get("dataset_manifest_id") == request.output_dataset_manifest_id
+            and row.get("object_id") == prepared.storage["id"]
+        ]
+        if len(manifests) != 1 or len(objects) != 1 or len(relations) != 1:
+            raise MaterializationConflict(
+                f"successful materialization {request.materialization_id} has incomplete version-pinned output"
+            )
 
     # -- internals ---------------------------------------------------------------------
 
