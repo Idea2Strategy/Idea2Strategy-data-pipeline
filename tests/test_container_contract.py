@@ -32,7 +32,14 @@ def test_container_build_context_excludes_local_state_and_credentials() -> None:
 
 def test_ci_executes_the_arm64_image_and_checks_readiness() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "docker/setup-qemu-action@v3" in workflow
+    assert (
+        "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0"
+        in workflow
+    )
+    assert (
+        "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0"
+        in workflow
+    )
     assert "docker buildx build --platform linux/arm64 --load" in workflow
     assert "curl --fail --silent http://127.0.0.1:18080/ready" in workflow
     assert "dpkg-query -W perl-base" in workflow
