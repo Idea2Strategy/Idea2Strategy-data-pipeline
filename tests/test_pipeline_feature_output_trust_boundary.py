@@ -352,3 +352,156 @@ def test_failed_worker_owned_run_is_retryable_without_orphaning_an_output(tmp_pa
     assert catalog.pipeline_run(run_id)["status"] == "SUCCEEDED"  # type: ignore[index]
     assert len(catalog.records("market_data.pipeline_runs")) == 1
     assert len(catalog.records("market_data.feature_materializations")) == 1
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ([], "must be an object"),
+        ({}, "fields mismatch"),
+    ],
+)
+def test_malformed_command_documents_fail_before_catalog_access(tmp_path: Path, document: object, message: str) -> None:
+    catalog, source_store, output_store, _published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match=message):
+        port.materialize(document, command_id="malformed-document")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("definition_hash", "", "non-empty string"),
+        ("instrument_id", "not-a-uuid", "UUID string"),
+        ("period_start", "not-a-time", "ISO-8601"),
+        ("period_start", "2026-01-05T14:30:00", "timezone"),
+        ("period_end", PERIOD_START.isoformat(), "must be after"),
+        ("source_dataset_object_ids", "not-an-array", "must be an array"),
+    ],
+)
+def test_invalid_worker_owned_inputs_fail_before_a_run(tmp_path: Path, field: str, value: object, message: str) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    request = {**payload(published), field: value}
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match=message):
+        port.materialize(request, command_id="invalid-worker-input")
+
+    assert catalog.records("market_data.pipeline_runs") == []
+
+
+@pytest.mark.parametrize("command_id", ["", "x" * 161, None])
+def test_invalid_worker_command_identity_is_rejected(tmp_path: Path, command_id: object) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="1..160"):
+        port.materialize(payload(published), command_id=command_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("source_ids", "message"),
+    [
+        ([], "non-empty array"),
+        ([SOURCE_OBJECT, SOURCE_OBJECT], "must be unique"),
+        (["60000000-0000-4000-8000-000000000002"], "is missing"),
+    ],
+)
+def test_invalid_canonical_source_identity_sets_are_rejected(
+    tmp_path: Path, source_ids: list[str], message: str
+) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+    request = {**payload(published), "source_dataset_object_ids": source_ids}
+
+    with pytest.raises(MalformedEventError, match=message):
+        port.materialize(request, command_id="invalid-source-set")
+
+
+def test_source_manifest_must_cover_the_requested_period(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    manifest = catalog.records("market_data.dataset_manifests")[0]
+    catalog.upsert(
+        "market_data.dataset_manifests",
+        {**manifest, "period_end": (PERIOD_END - timedelta(minutes=1)).isoformat()},
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="does not cover"):
+        port.materialize(payload(published), command_id="short-source-period")
+
+
+def test_tampered_source_bytes_fail_exact_version_verification(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    receipt = catalog.records("storage.objects")[0]
+    source_store.path_for(receipt["object_key"]).write_bytes(b"tampered")
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="exact object verification failed"):
+        port.materialize(payload(published), command_id="tampered-source")
+
+
+def test_requested_period_must_contain_canonical_bars(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    request = {
+        **payload(published),
+        "period_start": (PERIOD_START + timedelta(minutes=10)).isoformat(),
+        "period_end": (PERIOD_START + timedelta(minutes=20)).isoformat(),
+    }
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="contain no bars"):
+        port.materialize(request, command_id="empty-request-window")
+
+
+def test_mismatched_authority_seed_fails_closed(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    provider_id = feature_output_provider_id()
+    provider = next(row for row in catalog.records("market_data.providers") if row["id"] == provider_id)
+    catalog.upsert("market_data.providers", {**provider, "rights_version": "unapproved"})
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(PortNotConfiguredError, match="does not match"):
+        port.materialize(payload(published), command_id="mismatched-authority-seed")
+
+
+@pytest.mark.parametrize(
+    ("table", "record_id", "updates", "message"),
+    [
+        ("market_data.dataset_objects", SOURCE_OBJECT, {"object_kind": "FEATURE_SERIES"}, "not MARKET_BARS"),
+        ("market_data.dataset_manifests", SOURCE_MANIFEST, {"status": "QUARANTINED"}, "not AVAILABLE"),
+        ("storage.objects", SOURCE_STORAGE, {"status": "QUARANTINED"}, "not AVAILABLE"),
+        (
+            "market_data.dataset_manifests",
+            SOURCE_MANIFEST,
+            {"instrument_id": "20000000-0000-4000-8000-000000000002"},
+            "another instrument",
+        ),
+        ("market_data.dataset_manifests", SOURCE_MANIFEST, {"resolution": "1d"}, "resolution"),
+        ("storage.objects", SOURCE_STORAGE, {"schema_version": "unknown"}, "schema version"),
+        ("storage.objects", SOURCE_STORAGE, {"file_format": "CSV"}, "not Parquet"),
+        (
+            "storage.objects",
+            SOURCE_STORAGE,
+            {"period_end": (PERIOD_END - timedelta(minutes=1)).isoformat()},
+            "period receipt",
+        ),
+    ],
+)
+def test_untrusted_canonical_source_state_fails_closed(
+    tmp_path: Path,
+    table: str,
+    record_id: str,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    record = next(row for row in catalog.records(table) if row["id"] == record_id)
+    catalog.upsert(table, {**record, **updates})
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match=message):
+        port.materialize(payload(published), command_id="untrusted-canonical-source")
+
+    assert catalog.records("market_data.pipeline_runs") == []
