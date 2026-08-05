@@ -97,6 +97,13 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "staging_root. Requires PIPELINE_WORKER_DATABASE_URL.",
     ),
     (
+        "PIPELINE_WORKER_FEATURE_OUTPUT",
+        False,
+        "",
+        "JSON production wiring for immutable feature outputs. Required keys: "
+        "object_bucket, object_prefix, staging_root. Requires PIPELINE_WORKER_DATABASE_URL.",
+    ),
+    (
         "PIPELINE_WORKER_MAX_RECEIVE_COUNT",
         False,
         "5",
@@ -224,6 +231,35 @@ class CorporateActionApprovalSettings:
             request_schema_version=str(value["request_schema_version"]).strip(),
             object_bucket=str(value["object_bucket"]).strip(),
             object_prefix=str(value["object_prefix"]).strip().strip("/"),
+            staging_root=Path(str(value["staging_root"]).strip()),
+        )
+
+
+@dataclass(frozen=True)
+class FeatureOutputSettings:
+    object_bucket: str
+    object_prefix: str
+    staging_root: Path
+
+    @classmethod
+    def parse(cls, raw: str) -> FeatureOutputSettings:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ConfigurationError("PIPELINE_WORKER_FEATURE_OUTPUT must be a JSON object") from error
+        if not isinstance(value, dict):
+            raise ConfigurationError("PIPELINE_WORKER_FEATURE_OUTPUT must be a JSON object")
+        expected = {"object_bucket", "object_prefix", "staging_root"}
+        missing = sorted(key for key in expected if not str(value.get(key, "")).strip())
+        unknown = sorted(set(value) - expected)
+        if missing or unknown:
+            raise ConfigurationError(
+                "PIPELINE_WORKER_FEATURE_OUTPUT fields mismatch: "
+                f"missing={missing}, unknown={unknown}"
+            )
+        return cls(
+            object_bucket=str(value["object_bucket"]).strip(),
+            object_prefix=str(value["object_prefix"]).strip(),
             staging_root=Path(str(value["staging_root"]).strip()),
         )
 
@@ -403,6 +439,7 @@ class WorkerConfig:
     exit_after_idle_polls: int = 0
     database_url: str | None = None
     corporate_action_approval: CorporateActionApprovalSettings | None = None
+    feature_output: FeatureOutputSettings | None = None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -462,6 +499,7 @@ class WorkerConfig:
         database_url_raw = values.get("PIPELINE_WORKER_DATABASE_URL")
         realtime_raw = values.get("PIPELINE_WORKER_REALTIME_INGEST")
         approval_raw = values.get("PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL")
+        feature_output_raw = values.get("PIPELINE_WORKER_FEATURE_OUTPUT")
         approval = (
             None if _blank(approval_raw) else CorporateActionApprovalSettings.parse(str(approval_raw))
         )
@@ -469,6 +507,16 @@ class WorkerConfig:
             raise ConfigurationError.missing(
                 ["PIPELINE_WORKER_DATABASE_URL"],
                 hint="required by PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL",
+            )
+        feature_output = (
+            None
+            if _blank(feature_output_raw)
+            else FeatureOutputSettings.parse(str(feature_output_raw))
+        )
+        if feature_output is not None and _blank(database_url_raw):
+            raise ConfigurationError.missing(
+                ["PIPELINE_WORKER_DATABASE_URL"],
+                hint="required by PIPELINE_WORKER_FEATURE_OUTPUT",
             )
 
         return cls(
@@ -486,6 +534,7 @@ class WorkerConfig:
                 else str(database_url_raw).strip()
             ),
             corporate_action_approval=approval,
+            feature_output=feature_output,
             log_level=log_level,
             poll_interval_seconds=_require_float(
                 values, "PIPELINE_WORKER_POLL_INTERVAL_SECONDS", "1.0", minimum=0.001
@@ -543,6 +592,7 @@ class WorkerConfig:
             "aws_region": self.aws_region,
             "database_configured": self.database_url is not None,
             "corporate_action_approval_configured": self.corporate_action_approval is not None,
+            "feature_output_configured": self.feature_output is not None,
             "log_level": self.log_level,
             "poll_interval_seconds": self.poll_interval_seconds,
             "max_messages_per_poll": self.max_messages_per_poll,
