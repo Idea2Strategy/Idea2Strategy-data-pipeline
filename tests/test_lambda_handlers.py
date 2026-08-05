@@ -341,6 +341,7 @@ class PipelineTriggerHandlerTests(unittest.TestCase):
             "VALIDATE_CATALOG": {},
             "VALIDATE_DATASET_MANIFEST": {"manifest": fixtures["dataset_manifest"]},
             "PUBLISH_DATASET": {"manifest_id": "m-1"},
+            "MATERIALIZE_FEATURE_OUTPUT": {"output_revision_number": 1},
             "INGEST_REALTIME_BARS": {
                 "events": [{"symbol": "AAPL", "value": "1"}],
                 "flush": False,

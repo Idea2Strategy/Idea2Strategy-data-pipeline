@@ -45,6 +45,7 @@ SUPPORTED_COMMANDS: tuple[str, ...] = (
     "PUBLISH_DATASET",
     "INGEST_REALTIME_BARS",
     "APPLY_CORPORATE_ACTION_APPROVAL",
+    "MATERIALIZE_FEATURE_OUTPUT",
 )
 
 
@@ -108,6 +109,19 @@ class UnconfiguredCorporateActionApprovalPort:
         )
 
 
+@runtime_checkable
+class FeatureMaterializationPort(Protocol):
+    def materialize(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class UnconfiguredFeatureMaterializationPort:
+    def materialize(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise PortNotConfiguredError(
+            "MATERIALIZE_FEATURE_OUTPUT requires PIPELINE_WORKER_FEATURE_OUTPUT and "
+            "PIPELINE_WORKER_DATABASE_URL; refusing an unwired feature publisher"
+        )
+
+
 class PipelineCommandExecutor:
     """Dispatches a validated :class:`Command` to its domain implementation."""
 
@@ -118,6 +132,7 @@ class PipelineCommandExecutor:
         publication_port: DatasetPublicationPort | None = None,
         realtime_port: RealtimeIngestPort | None = None,
         corporate_action_approval_port: CorporateActionApprovalPort | None = None,
+        feature_materialization_port: FeatureMaterializationPort | None = None,
     ) -> None:
         self._config = config
         self._publication_port: DatasetPublicationPort = (
@@ -133,6 +148,9 @@ class PipelineCommandExecutor:
             corporate_action_approval_port
             or self._build_corporate_action_approval_port(config)
         )
+        self._feature_materialization_port = (
+            feature_materialization_port or self._build_feature_materialization_port(config)
+        )
 
     def prepare(self) -> None:
         """Create the configured roots so the first command has somewhere to read."""
@@ -144,6 +162,35 @@ class PipelineCommandExecutor:
         prepare = getattr(self._corporate_action_approval_port, "prepare", None)
         if callable(prepare):
             prepare()
+        prepare_feature = getattr(self._feature_materialization_port, "prepare", None)
+        if callable(prepare_feature):
+            prepare_feature()
+
+    @staticmethod
+    def _build_feature_materialization_port(config: WorkerConfig) -> FeatureMaterializationPort:
+        settings = config.feature_output
+        if settings is None:
+            return UnconfiguredFeatureMaterializationPort()
+        assert config.database_url is not None
+        from apps.pipeline_worker.feature_output import ProductionFeatureMaterializationPort
+        from market_pipeline_lib.catalog import PostgresCatalog, StorageObjectsPolicy
+        from market_pipeline_lib.storage import S3ObjectStore
+
+        catalog = PostgresCatalog.connect(
+            config.database_url,
+            artifact_root=config.catalog_root,
+            storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
+        )
+        store = S3ObjectStore(
+            settings.object_bucket,
+            prefix=settings.object_prefix,
+            endpoint_url=config.aws_endpoint_url,
+        )
+        return ProductionFeatureMaterializationPort(
+            catalog,
+            store,
+            staging_root=settings.staging_root,
+        )
 
     @staticmethod
     def _build_corporate_action_approval_port(config: WorkerConfig) -> CorporateActionApprovalPort:
@@ -211,6 +258,7 @@ class PipelineCommandExecutor:
             self._publication_port,
             self._realtime_port,
             self._corporate_action_approval_port,
+            self._feature_materialization_port,
         ):
             stop = getattr(port, "request_stop", None)
             if callable(stop):
@@ -227,6 +275,8 @@ class PipelineCommandExecutor:
             return self._ingest_realtime_bars(command.payload)
         if command.command == "APPLY_CORPORATE_ACTION_APPROVAL":
             return self._corporate_action_approval_port.apply(command.payload)
+        if command.command == "MATERIALIZE_FEATURE_OUTPUT":
+            return self._feature_materialization_port.materialize(command.payload)
         raise UnknownCommandError(f"no executor for command {command.command!r}")
 
     def _ingest_realtime_bars(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
