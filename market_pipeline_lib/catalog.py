@@ -50,6 +50,7 @@ from .db.errors import (
     CanonicalTableMissing,
     DuplicateAvailableManifest,
     PipelineRunNotFound,
+    StorageObjectConflict,
     StorageOwnershipUnresolved,
     UnknownCatalogTable,
 )
@@ -837,6 +838,29 @@ class PostgresCatalog:
         if absent:
             raise ValueError(f"{table} upsert needs its natural key column(s) {absent}")
         statement = pg_insert(target).values(**params)
+        if table == "storage.objects":
+            # Object registrations are immutable and the D runtime role deliberately
+            # has no UPDATE privilege.  A retry may reuse the exact same identity, but
+            # it must never turn an UPSERT into a mutation of canonical object facts.
+            storage_statement = statement.on_conflict_do_nothing(index_elements=primary_key).returning(target.c.id)
+            with self._write_connection() as connection:
+                inserted = connection.execute(storage_statement).scalar_one_or_none()
+                if inserted is not None:
+                    return
+                existing = connection.execute(
+                    select(target).where(*(target.c[name] == params[name] for name in primary_key))
+                ).mappings().one_or_none()
+                if existing is None:
+                    raise StorageObjectConflict(
+                        "storage.objects conflicts with an existing natural identity"
+                    )
+                mismatched = sorted(name for name, value in params.items() if existing[name] != value)
+                if mismatched:
+                    raise StorageObjectConflict(
+                        "storage.objects identity already exists with different immutable "
+                        f"field(s): {mismatched}"
+                    )
+            return
         # `id` is never overwritten on conflict: the stored row keeps the identity it
         # was inserted with, so foreign keys pointing at it stay valid.
         frozen = set(conflict_target) | set(primary_key)
