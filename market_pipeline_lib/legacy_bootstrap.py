@@ -14,11 +14,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy.engine import make_url
+from sqlalchemy import UniqueConstraint, func, inspect, select
+from sqlalchemy.engine import Connection, make_url
 
 from .catalog import MarketDataCatalog, PostgresCatalog, StorageObjectsPolicy
 from .db.codec import table_for
 from .db.engine import create_market_data_engine
+from .db.schema_guard import describe_schema_drift
 
 __all__ = [
     "BOOTSTRAP_TABLE_ORDER",
@@ -61,6 +63,105 @@ class BootstrapConflict(RuntimeError):
 
 class ObjectVerificationError(RuntimeError):
     """A version-pinned S3 object differs from its legacy DB receipt."""
+
+
+_V001_CHANGED_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "market_data.dataset_objects": frozenset(
+        {
+            "id",
+            "dataset_manifest_id",
+            "object_id",
+            "object_kind",
+            "partition_key",
+            "row_count",
+            "min_bar_start_at",
+            "max_bar_start_at",
+            "created_at",
+        }
+    ),
+    "market_data.dataset_lineage": frozenset(
+        {
+            "id",
+            "dataset_manifest_id",
+            "source_manifest_id",
+            "relationship_type",
+            "created_at",
+        }
+    ),
+    "market_data.quality_incidents": frozenset(
+        {
+            "id",
+            "dataset_manifest_id",
+            "instrument_id",
+            "incident_type",
+            "severity",
+            "period_start",
+            "period_end",
+            "status",
+            "detail",
+            "detected_at",
+            "resolved_at",
+        }
+    ),
+}
+
+_V001_MISSING_TABLES = frozenset(
+    {
+        "market_data.dataset_object_lineage",
+        "market_data.corporate_actions",
+        "market_data.feature_materializations",
+    }
+)
+
+# These are the complete differences reported by the canonical schema guard for
+# tests/fixtures/legacy-market-schema.sql.  Matching only a subset would turn an
+# unknown drift into an implicitly supported source shape.
+_V001_CANONICAL_DRIFT = frozenset(
+    {
+        "market_data.corporate_actions: table is missing",
+        "market_data.dataset_lineage.derived_manifest_id: column is missing",
+        "market_data.dataset_lineage.relation_type: column is missing",
+        "market_data.dataset_lineage: unique constraint on "
+        "['derived_manifest_id', 'relation_type', 'source_manifest_id'] is missing",
+        "market_data.dataset_objects.object_kind: type is varchar(30), expected varchar(40)",
+        "market_data.dataset_objects.partition_granularity: column is missing",
+        "market_data.dataset_objects.partition_start: column is missing",
+        "market_data.dataset_objects.partition_end: column is missing",
+        "market_data.dataset_objects.period_start: column is missing",
+        "market_data.dataset_objects.period_end: column is missing",
+        "market_data.dataset_objects.shard_key: column is missing",
+        "market_data.dataset_objects.part_number: column is missing",
+        "market_data.dataset_objects.min_instrument_id: column is missing",
+        "market_data.dataset_objects.max_instrument_id: column is missing",
+        "market_data.dataset_objects: unique constraint on "
+        "['dataset_manifest_id', 'object_kind', 'part_number', 'partition_end', "
+        "'partition_granularity', 'partition_start', 'shard_key'] is missing",
+        "market_data.feature_materializations: table is missing",
+        "market_data.quality_incidents.incident_code: column is missing",
+        "market_data.quality_incidents.period_start: nullable is True, expected False",
+        "market_data.quality_incidents.evidence_object_id: column is missing",
+        "market_data.dataset_object_lineage: table is missing",
+    }
+)
+
+_V001_CHANGED_TABLE_UNIQUES: dict[str, frozenset[frozenset[str]]] = {
+    "market_data.dataset_objects": frozenset(
+        {
+            frozenset({"id"}),
+            frozenset({"dataset_manifest_id", "object_id"}),
+            frozenset({"dataset_manifest_id", "partition_key"}),
+        }
+    ),
+    "market_data.dataset_lineage": frozenset(
+        {
+            frozenset({"id"}),
+            frozenset(
+                {"dataset_manifest_id", "source_manifest_id", "relationship_type"}
+            ),
+        }
+    ),
+    "market_data.quality_incidents": frozenset({frozenset({"id"})}),
+}
 
 
 class ObjectVerifier(Protocol):
@@ -138,6 +239,130 @@ def same_database(left: str, right: str) -> bool:
     )
 
 
+def _canonical_columns(table: str) -> frozenset[str]:
+    return frozenset(column.name for column in table_for(table).columns)
+
+
+def _canonical_uniques(table: str) -> frozenset[frozenset[str]]:
+    target = table_for(table)
+    unique_sets: set[frozenset[str]] = {
+        frozenset(column.name for column in target.primary_key.columns)
+    }
+    for constraint in target.constraints:
+        if isinstance(constraint, UniqueConstraint):
+            unique_sets.add(frozenset(column.name for column in constraint.columns))
+    for index in target.indexes:
+        if index.unique:
+            unique_sets.add(frozenset(column.name for column in index.columns))
+    return frozenset(unique_sets)
+
+
+def _actual_uniques(connection: Connection, table: str) -> frozenset[frozenset[str]]:
+    schema, name = table.split(".", 1)
+    inspector = inspect(connection)
+    unique_sets: set[frozenset[str]] = set()
+    for index in inspector.get_indexes(name, schema=schema):
+        if index.get("unique"):
+            unique_sets.add(frozenset(value for value in index["column_names"] if value))
+    for constraint in inspector.get_unique_constraints(name, schema=schema):
+        unique_sets.add(frozenset(constraint["column_names"]))
+    primary_key = inspector.get_pk_constraint(name, schema=schema).get("constrained_columns")
+    if primary_key:
+        unique_sets.add(frozenset(primary_key))
+    return frozenset(unique_sets)
+
+
+class _ImmutableLegacyCatalog(PostgresCatalog):
+    """Canonical reader with one strict, empty-only retired V001 compatibility mode."""
+
+    _schema_mode: str | None = None
+
+    def verify_schema(self) -> None:
+        if self._schema_mode is not None:
+            return
+
+        with self.engine.connect() as connection:
+            drift = frozenset(describe_schema_drift(connection))
+            mode = "canonical" if not drift else "legacy-v001"
+            if drift and drift != _V001_CANONICAL_DRIFT:
+                raise BootstrapConflict(
+                    "legacy source is not the exact retired V001 schema; canonical drift was: "
+                    + "; ".join(sorted(drift))
+                )
+
+            inspector = inspect(connection)
+            for table in BOOTSTRAP_TABLE_ORDER:
+                schema, name = table.split(".", 1)
+                exists = inspector.has_table(name, schema=schema)
+                if mode == "legacy-v001" and table in _V001_MISSING_TABLES:
+                    if exists:
+                        raise BootstrapConflict(
+                            f"legacy source is not the exact retired V001 schema: unexpected {table}"
+                        )
+                    continue
+                if not exists:
+                    raise BootstrapConflict(
+                        f"legacy source is not the exact retired V001 schema: missing {table}"
+                    )
+
+                expected_columns = (
+                    _V001_CHANGED_TABLE_COLUMNS[table]
+                    if mode == "legacy-v001" and table in _V001_CHANGED_TABLE_COLUMNS
+                    else _canonical_columns(table)
+                )
+                actual_columns = frozenset(
+                    column["name"] for column in inspector.get_columns(name, schema=schema)
+                )
+                if actual_columns != expected_columns:
+                    raise BootstrapConflict(
+                        f"legacy source is not the exact retired V001 schema: {table} columns differ"
+                    )
+
+                expected_uniques = (
+                    _V001_CHANGED_TABLE_UNIQUES[table]
+                    if mode == "legacy-v001" and table in _V001_CHANGED_TABLE_UNIQUES
+                    else _canonical_uniques(table)
+                )
+                if _actual_uniques(connection, table) != expected_uniques:
+                    raise BootstrapConflict(
+                        f"legacy source is not the exact retired V001 schema: {table} uniqueness differs"
+                    )
+
+            if mode == "legacy-v001":
+                for table in _V001_CHANGED_TABLE_COLUMNS:
+                    target = table_for(table)
+                    count = connection.execute(
+                        select(func.count()).select_from(
+                            # The canonical Table object names the same physical table;
+                            # selecting only COUNT(*) never references drifted columns.
+                            target
+                        )
+                    ).scalar_one()
+                    if count:
+                        raise BootstrapConflict(
+                            f"{table} contains {count} legacy row(s); immutable V001 rows "
+                            "cannot be translated without changing meaning"
+                        )
+
+        self._schema_mode = mode
+
+    def records(
+        self,
+        table: str,
+        *,
+        where: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._schema_mode is None:
+            self.verify_schema()
+        if self._schema_mode == "legacy-v001" and (
+            table in _V001_CHANGED_TABLE_COLUMNS or table in _V001_MISSING_TABLES
+        ):
+            if where:
+                return []
+            return []
+        return super().records(table, where=where)
+
+
 def connect_read_only_catalog(database_url: str, *, artifact_root: Path) -> PostgresCatalog:
     """Open PostgreSQL with both client-side and server-side write denial."""
 
@@ -147,7 +372,7 @@ def connect_read_only_catalog(database_url: str, *, artifact_root: Path) -> Post
         application_name="idea2strategy-legacy-catalog-read-only",
         connect_args={"options": "-c default_transaction_read_only=on"},
     )
-    return PostgresCatalog(
+    return _ImmutableLegacyCatalog(
         engine,
         artifact_root=artifact_root,
         storage_objects=StorageObjectsPolicy.READ_ONLY,
