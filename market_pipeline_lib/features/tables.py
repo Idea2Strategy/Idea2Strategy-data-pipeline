@@ -55,5 +55,18 @@ class FeatureCatalog(Protocol):
     def record_dataset_lineage(self, record: Mapping[str, Any]) -> None:
         """Record one `dataset_lineage` edge, at most once per triple."""
 
+    def stage_object(
+        self,
+        storage_record: Mapping[str, Any],
+        dataset_object_record: Mapping[str, Any],
+    ) -> None:
+        """Register an immutable object receipt and its dataset membership."""
+
+    def publish_manifest(self, record: Mapping[str, Any]) -> None:
+        """Write one BUILDING or AVAILABLE dataset manifest revision."""
+
+    def record_object_lineage(self, record: Mapping[str, Any]) -> None:
+        """Record exact source-object provenance for a derived object."""
+
     def transaction(self) -> Any:
         """A context manager committing every write in the block together."""

@@ -58,6 +58,10 @@ class ObjectReceipt:
     byte_size: int
     local_path: str | None = None
     etag: str | None = None
+    #: True only when this call definitely created the exact returned version.  A
+    #: reconciled duplicate/race is deliberately false so cleanup never deletes an
+    #: object another worker may own.
+    created: bool = False
 
 
 @runtime_checkable
@@ -67,6 +71,10 @@ class ObjectStore(Protocol):
     def exists(self, object_key: str) -> bool: ...
 
     def open(self, object_key: str) -> BinaryIO: ...
+
+    def open_version(self, object_key: str, provider_version_id: str) -> BinaryIO: ...
+
+    def delete(self, receipt: ObjectReceipt) -> None: ...
 
     def verify(
         self,
@@ -119,7 +127,8 @@ class LocalObjectStore:
         byte_size = source.stat().st_size
         destination = self.path_for(object_key)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
+        existed = destination.exists()
+        if existed:
             result = self.verify(object_key, content_hash)
             if not result.ok:
                 raise FileExistsError(
@@ -142,6 +151,7 @@ class LocalObjectStore:
             content_hash=content_hash,
             byte_size=byte_size,
             local_path=str(destination),
+            created=not existed,
         )
 
     def exists(self, object_key: str) -> bool:
@@ -149,6 +159,21 @@ class LocalObjectStore:
 
     def open(self, object_key: str) -> BinaryIO:
         return self.path_for(object_key).open("rb")
+
+    def open_version(self, object_key: str, provider_version_id: str) -> BinaryIO:
+        path = self.path_for(object_key)
+        if sha256_file(path) != provider_version_id:
+            raise FileNotFoundError(
+                f"local object version {provider_version_id} is not available for {object_key}"
+            )
+        return path.open("rb")
+
+    def delete(self, receipt: ObjectReceipt) -> None:
+        if not receipt.created:
+            return
+        path = self.path_for(receipt.object_key)
+        if path.is_file() and sha256_file(path) == receipt.provider_version_id:
+            path.unlink()
 
     def verify(
         self,
@@ -291,6 +316,7 @@ class S3ObjectStore:
         expected_checksum: str,
         head: dict[str, Any],
         conflict: bool,
+        created: bool,
     ) -> ObjectReceipt:
         """Turn a verified HEAD into a receipt, or refuse to issue one.
 
@@ -334,6 +360,7 @@ class S3ObjectStore:
             content_hash=actual_hash,
             byte_size=actual_size,
             etag=etag,
+            created=created,
         )
 
     def put(self, source_path: Path, object_key: str) -> ObjectReceipt:
@@ -356,6 +383,7 @@ class S3ObjectStore:
                 expected_checksum=checksum,
                 head=existing,
                 conflict=True,
+                created=False,
             )
 
         version_id: str | None = None
@@ -394,6 +422,7 @@ class S3ObjectStore:
                         expected_checksum=checksum,
                         head=raced,
                         conflict=True,
+                        created=False,
                     )
                 if attempt == self.max_attempts or not self._is_retryable(exc):
                     raise
@@ -407,6 +436,7 @@ class S3ObjectStore:
             # versioned, so a concurrent overwrite cannot be mistaken for ours.
             head=self._head(key, version_id=version_id),
             conflict=False,
+            created=True,
         )
 
     def exists(self, object_key: str) -> bool:
@@ -425,6 +455,29 @@ class S3ObjectStore:
             Key=self._key(object_key),
         )["Body"]
         return cast(BinaryIO, body)
+
+    def open_version(self, object_key: str, provider_version_id: str) -> BinaryIO:
+        body = self._call_with_retries(
+            self.client.get_object,
+            Bucket=self.bucket,
+            Key=self._key(object_key),
+            VersionId=provider_version_id,
+        )["Body"]
+        return cast(BinaryIO, body)
+
+    def delete(self, receipt: ObjectReceipt) -> None:
+        if not receipt.created:
+            return
+        if not receipt.provider_version_id or receipt.provider_version_id == receipt.etag:
+            raise RuntimeError(
+                "refusing cleanup without an exact S3 VersionId; enable bucket versioning"
+            )
+        self._call_with_retries(
+            self.client.delete_object,
+            Bucket=receipt.bucket_name,
+            Key=receipt.object_key,
+            VersionId=receipt.provider_version_id,
+        )
 
     def verify(
         self,

@@ -81,6 +81,7 @@ from .materialization import (
     SourceObject,
     input_bundle_fingerprint,
 )
+from .output import FEATURE_SERIES_SCHEMA_VERSION, FeatureOutputPublisher
 from .snapshots import (
     FeatureSnapshotBatchBuilder,
     MarketInput,
@@ -100,6 +101,7 @@ __all__ = [
     "FEATURE_DEFINITION_SCHEMA_VERSION",
     "FEATURE_MATERIALIZATIONS",
     "FEATURE_SNAPSHOT_BATCHES",
+    "FEATURE_SERIES_SCHEMA_VERSION",
     "FEATURE_VERSION_PREFIX",
     "INPUT_ADJUSTMENTS",
     "MACD_OUTPUT_LINES",
@@ -119,6 +121,7 @@ __all__ = [
     "FeatureDefinitionRegistry",
     "FeatureError",
     "FeatureMaterializer",
+    "FeatureOutputPublisher",
     "FeatureSnapshotBatchBuilder",
     "FeatureSnapshotValidator",
     "FeatureValue",
