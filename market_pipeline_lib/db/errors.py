@@ -18,6 +18,7 @@ __all__ = [
     "SchemaDriftError",
     "SchemaWriteForbidden",
     "StorageOwnershipUnresolved",
+    "StorageObjectConflict",
     "UnknownCatalogColumn",
     "UnknownCatalogTable",
     "UnsupportedCatalogCapability",
@@ -65,6 +66,10 @@ class StorageOwnershipUnresolved(CatalogError, PermissionError):
     checklist calls it D-owned.  Until that is settled centrally, the caller has to say
     which side it is acting on rather than a default deciding for it.
     """
+
+
+class StorageObjectConflict(CatalogError, RuntimeError):
+    """An immutable storage object identity already exists with different facts."""
 
 
 class DuplicateAvailableManifest(CatalogError, RuntimeError):
