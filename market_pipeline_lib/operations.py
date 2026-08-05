@@ -553,6 +553,7 @@ def apply_catalog_to_postgres(
     database_url: str | None = None,
     rights_attestations: dict[str, RightsAttestation] | None = None,
     rights_attestations_path: Path | None = None,
+    preserve_existing_provider_rights: bool = False,
     storage_objects: StorageObjectsPolicy = StorageObjectsPolicy.WRITE_D_OWNED,
 ) -> dict[str, Any]:
     """Validate the DBML contract and optionally apply it in one transaction.
@@ -569,8 +570,10 @@ def apply_catalog_to_postgres(
     evidence itself.  Rejecting the placeholder without any way to replace it made
     ``--execute`` unreachable for every plan this repository generates.  The gate is now
     a policy with a satisfiable input: supply `RightsAttestation`s here, or point
-    ``$MARKET_DATA_RIGHTS_ATTESTATIONS`` at a JSON file.  Attested providers are written
-    with their attested version; unattested ones block the apply by name.  The
+    ``$MARKET_DATA_RIGHTS_ATTESTATIONS`` at a JSON file.  An explicit preservation mode
+    may instead copy the exact rights version and status from an existing ACTIVE target
+    row with the same provider code and canonical id.  Attested or preserved providers
+    are written with that value; all other placeholders block the apply by name.  The
     placeholder itself is never written.
     """
 
@@ -599,9 +602,49 @@ def apply_catalog_to_postgres(
     attestations = rights_attestations if rights_attestations is not None else load_rights_attestations(
         rights_attestations_path
     )
-    resolved_providers, attested, blocked = rights_review_state(
-        catalog.records("market_data.providers"), attestations
-    )
+    provider_rows = catalog.records("market_data.providers")
+    resolved_providers, attested, blocked = rights_review_state(provider_rows, attestations)
+    preserved: list[str] = []
+    if preserve_existing_provider_rights:
+        if not database_url:
+            raise ValueError("preserving existing provider rights requires DATABASE_URL")
+        rights_source = PostgresCatalog.connect(
+            database_url,
+            artifact_root=catalog.artifact_root,
+            storage_objects=storage_objects,
+        )
+        try:
+            rights_source.verify_schema()
+            existing_by_code = {
+                str(row["code"]): row for row in rights_source.records("market_data.providers")
+            }
+        finally:
+            rights_source.close()
+        local_by_code = {str(row["code"]): row for row in provider_rows}
+        unresolved: list[str] = []
+        for code in blocked:
+            existing = existing_by_code.get(code)
+            local = local_by_code[code]
+            if existing is None or (
+                str(existing.get("rights_version", "")) in PLACEHOLDER_RIGHTS_VERSIONS
+                or existing.get("status") != "ACTIVE"
+            ):
+                unresolved.append(code)
+                continue
+            if str(existing["id"]) != str(local["id"]):
+                raise RuntimeError(
+                    f"provider {code} has a different canonical id in PostgreSQL; "
+                    "refusing to preserve rights across identities"
+                )
+            resolved_providers.append(
+                {
+                    **local,
+                    "rights_version": existing["rights_version"],
+                    "status": existing["status"],
+                }
+            )
+            preserved.append(code)
+        blocked = sorted(unresolved)
 
     report: dict[str, Any] = {
         "status": "FAILED" if errors else "PASSED",
@@ -610,6 +653,7 @@ def apply_catalog_to_postgres(
         "contract_errors": errors,
         "duplicate_dataset_hashes": duplicate_hashes,
         "rights_attested_providers": attested,
+        "rights_preserved_providers": sorted(preserved),
         "rights_review_required_providers": blocked,
         "rights_attestations_env": RIGHTS_ATTESTATIONS_ENV,
     }
@@ -619,8 +663,8 @@ def apply_catalog_to_postgres(
     if blocked:
         raise RightsVersionNotAttested(
             f"provider(s) {blocked} carry a placeholder rights_version. Supply a "
-            f"RightsAttestation for each, or point ${RIGHTS_ATTESTATIONS_ENV} at a JSON "
-            "array of attestations, before applying to PostgreSQL."
+            f"RightsAttestation for each, point ${RIGHTS_ATTESTATIONS_ENV} at a JSON "
+            "array of attestations, or explicitly preserve an ACTIVE attested target row."
         )
     if not database_url:
         raise ValueError("--execute에는 DATABASE_URL이 필요합니다.")
