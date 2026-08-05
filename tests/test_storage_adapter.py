@@ -62,6 +62,30 @@ class FixtureSchemaTests(unittest.TestCase):
 
 
 class LocalObjectStoreTests(unittest.TestCase):
+    def test_verify_version_pins_hash_and_size_to_the_requested_local_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write_small_parquet(root / "source.parquet")
+            store = LocalObjectStore(root / "objects")
+            receipt = store.put(source, "market/source.parquet")
+
+            verified = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size,
+            )
+            wrong_size = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size + 1,
+            )
+
+            self.assertTrue(verified.ok)
+            self.assertFalse(wrong_size.ok)
+            self.assertEqual(wrong_size.message, "byte size mismatch")
+
     def test_path_for_rejects_keys_that_escape_the_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = LocalObjectStore(Path(temporary) / "objects")
@@ -326,6 +350,42 @@ class S3ObjectStoreIntegrityTests(unittest.TestCase):
 
 
 class S3ObjectStoreContractTests(unittest.TestCase):
+    def test_verify_version_uses_the_exact_s3_version_and_all_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = FakeS3Client()
+            store = S3ObjectStore("bucket", client=client)
+            receipt = store.put(source, "market/source.parquet")
+
+            verified = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size,
+            )
+            client.put_object(
+                Bucket="bucket",
+                Key=receipt.object_key,
+                Body=b"newer bytes",
+                ContentLength=len(b"newer bytes"),
+                ContentType="application/vnd.apache.parquet",
+                ServerSideEncryption="AES256",
+                ChecksumAlgorithm="SHA256",
+                ChecksumSHA256=base64_sha256(b"newer bytes"),
+                Metadata={"sha256": "f" * 64},
+            )
+            latest_is_tampered = store.verify(receipt.object_key, receipt.content_hash)
+            exact_version_stays_valid = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size,
+            )
+
+            self.assertTrue(verified.ok)
+            self.assertFalse(latest_is_tampered.ok)
+            self.assertTrue(exact_version_stays_valid.ok)
+
     def test_local_and_s3_publish_the_same_key_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -84,9 +84,7 @@ def _payload(definition: FeatureDefinition) -> dict[str, object]:
     }
 
 
-def test_production_port_materializes_and_reconciles_the_same_immutable_output(
-    tmp_path: Path,
-) -> None:
+def test_production_port_rejects_the_legacy_caller_attested_contract(tmp_path: Path) -> None:
     catalog = LocalCatalog(tmp_path / "catalog")
     definition = FeatureDefinitionRegistry(catalog).publish(_definition())
     port = ProductionFeatureMaterializationPort(
@@ -95,18 +93,11 @@ def test_production_port_materializes_and_reconciles_the_same_immutable_output(
         staging_root=tmp_path / "staging",
     )
 
-    first = port.materialize(_payload(definition))
-    second = port.materialize(_payload(definition))
+    with pytest.raises(MalformedEventError, match="fields mismatch"):
+        port.materialize(_payload(definition), command_id="legacy-contract")
 
-    assert first == second
-    assert first["status"] == "SUCCEEDED"
-    assert first["output_dataset_manifest_id"] == OUTPUT_MANIFEST
-    assert first["output_feed_id"] == FEED
-    assert first["output_revision_number"] == 1
-    assert first["output_content_hash"]
-    assert first["output_provider_version_id"]
-    assert len(catalog.records("storage.objects")) == 1
-    assert len(catalog.records("market_data.feature_materializations")) == 1
+    assert catalog.records("storage.objects") == []
+    assert catalog.records("market_data.feature_materializations") == []
 
 
 @pytest.mark.parametrize(
@@ -126,7 +117,7 @@ def test_production_port_rejects_incomplete_or_unsafe_payload_before_publication
     )
 
     with pytest.raises(MalformedEventError):
-        port.materialize(payload)
+        port.materialize(payload, command_id=f"unsafe-{field}")
 
     assert catalog.records("market_data.feature_materializations") == []
     assert list((tmp_path / "objects").rglob("*.parquet")) == []
@@ -137,8 +128,8 @@ def test_worker_command_routes_to_feature_materialization_port(tmp_path: Path) -
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
 
-        def materialize(self, payload):
-            self.payloads.append(dict(payload))
+        def materialize(self, payload, *, command_id):
+            self.payloads.append({**dict(payload), "observed_command_id": command_id})
             return {"status": "SUCCEEDED", "output_revision_number": 2}
 
     assert "MATERIALIZE_FEATURE_OUTPUT" in SUPPORTED_COMMANDS
@@ -151,7 +142,9 @@ def test_worker_command_routes_to_feature_materialization_port(tmp_path: Path) -
     )
 
     assert executor.execute(command)["output_revision_number"] == 2
-    assert port.payloads == [{"output_revision_number": 2}]
+    assert port.payloads == [
+        {"output_revision_number": 2, "observed_command_id": "feature-1"}
+    ]
 
 
 def test_unconfigured_feature_command_fails_loudly_and_remains_retryable(tmp_path: Path) -> None:
@@ -183,7 +176,7 @@ def test_transient_feature_publication_failure_is_retried_with_the_same_command(
         def __init__(self) -> None:
             self.calls = 0
 
-        def materialize(self, payload):
+        def materialize(self, payload, *, command_id):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("object store unavailable")
