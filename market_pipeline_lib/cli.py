@@ -599,7 +599,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         import boto3
 
         artifact_root = args.artifact_root.expanduser().resolve()
-        source = connect_read_only_catalog(source_url, artifact_root=artifact_root / "source")
+        source = connect_read_only_catalog(
+            source_url,
+            artifact_root=artifact_root / "source",
+            legacy_bucket_name=args.bucket,
+        )
         target = (
             PostgresCatalog.connect(
                 target_url,
