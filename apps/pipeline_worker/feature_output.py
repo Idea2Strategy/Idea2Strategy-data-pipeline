@@ -8,6 +8,7 @@ fail before creating a pipeline run or an output object.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -31,6 +32,7 @@ from market_pipeline_lib.features import (
     MaterializationRequest,
     SourceObject,
 )
+from market_pipeline_lib.features.definitions import OFFICIAL_RSI_14_ID
 from market_pipeline_lib.features.hashing import canonical_sha256, iso_utc
 from market_pipeline_lib.features.output import FeatureOutputPublisher
 from market_pipeline_lib.features.tables import FeatureCatalog
@@ -40,6 +42,10 @@ FEATURE_OUTPUT_FIELDS = frozenset(
     {"definition_hash", "instrument_id", "source_dataset_object_ids", "period_start", "period_end"}
 )
 INTERNAL_PROVIDER_CODE = "IDEA2STRATEGY_INTERNAL"
+MAX_FEATURE_SOURCE_OBJECTS = 512
+MAX_FEATURE_SOURCE_ROWS = 2_000_000
+MAX_FEATURE_SOURCE_BYTES = 512 * 1024 * 1024
+FEATURE_READ_BATCH_ROWS = 65_536
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -107,6 +113,8 @@ def feature_output_feed_id(definition: FeatureDefinition) -> str:
 
 
 def feature_output_feed_code(definition: FeatureDefinition) -> str:
+    if definition.id == OFFICIAL_RSI_14_ID:
+        return "FEATURE_RSI_14_1M_RSI_1_0_0"
     parameters = "_".join(
         str(value) for _, value in sorted(definition.normalized_parameters.items()) if isinstance(value, int)
     )
@@ -123,6 +131,8 @@ def feature_output_feed_code(definition: FeatureDefinition) -> str:
 
 
 def feature_output_feed_version(definition: FeatureDefinition) -> str:
+    if definition.id == OFFICIAL_RSI_14_ID:
+        return "rsi-1.0.0+feature-series.parquet.v1"
     return f"{definition.feature_code.lower()}-{definition.calculator_version}+{FEATURE_SERIES_SCHEMA_VERSION}"
 
 
@@ -162,27 +172,124 @@ class CanonicalFeatureSourceReader:
     ) -> CanonicalFeatureInput:
         if isinstance(object_ids, (str, bytes)) or not object_ids:
             raise MalformedEventError("payload.source_dataset_object_ids must be a non-empty array")
+        if len(object_ids) > MAX_FEATURE_SOURCE_OBJECTS:
+            raise MalformedEventError(
+                f"payload.source_dataset_object_ids accepts at most {MAX_FEATURE_SOURCE_OBJECTS} objects"
+            )
         wanted = tuple(
             _uuid(value, f"payload.source_dataset_object_ids[{index}]") for index, value in enumerate(object_ids)
         )
         if len(set(wanted)) != len(wanted):
             raise MalformedEventError("source dataset object IDs must be unique")
 
-        relations = {str(row["id"]): row for row in self._catalog.records("market_data.dataset_objects")}
-        manifests = {str(row["id"]): row for row in self._catalog.records("market_data.dataset_manifests")}
-        storage = {str(row["id"]): row for row in self._catalog.records("storage.objects")}
+        relations: dict[str, dict[str, Any]] = {}
+        manifests: dict[str, dict[str, Any]] = {}
+        for object_id in wanted:
+            matches = self._catalog.records(
+                "market_data.dataset_objects", where={"id": object_id}
+            )
+            if not matches:
+                raise MalformedEventError(f"canonical dataset object is missing: {object_id}")
+            relations[object_id] = matches[0]
+            manifest_id = str(matches[0]["dataset_manifest_id"])
+            if manifest_id not in manifests:
+                manifest_rows = self._catalog.records(
+                    "market_data.dataset_manifests", where={"id": manifest_id}
+                )
+                if not manifest_rows:
+                    raise MalformedEventError(f"canonical source receipt is incomplete: {object_id}")
+                manifests[manifest_id] = manifest_rows[0]
+
+        selected_manifests = tuple(manifests.values())
+        for object_id, relation in relations.items():
+            manifest = manifests[str(relation["dataset_manifest_id"])]
+            if relation["object_kind"] != "MARKET_BARS":
+                raise MalformedEventError(f"source {object_id} is not MARKET_BARS")
+            if manifest["status"] != "AVAILABLE":
+                raise MalformedEventError(f"source {object_id} is not AVAILABLE")
+            if str(manifest.get("instrument_id")) != instrument_id:
+                raise MalformedEventError(f"source {object_id} belongs to another instrument")
+            if manifest["resolution"] != definition.resolution:
+                raise MalformedEventError(
+                    f"source {object_id} resolution does not match the definition"
+                )
+            if manifest["schema_version"] != SCHEMA_VERSION:
+                raise MalformedEventError(f"source {object_id} schema version is not canonical")
+        feed_ids = {str(row["feed_id"]) for row in selected_manifests}
+        if len(feed_ids) != 1:
+            raise MalformedEventError("canonical sources must belong to one feed")
+        feed_id = next(iter(feed_ids))
+        authoritative_manifests = [
+            row
+            for row in self._catalog.records(
+                "market_data.dataset_manifests", where={"feed_id": feed_id}
+            )
+            if row["status"] == "AVAILABLE"
+            and str(row.get("instrument_id")) == instrument_id
+            and row["resolution"] == definition.resolution
+            and _timestamp(row["period_start"], "manifest.period_start") < period_end
+            and _timestamp(row["period_end"], "manifest.period_end") > period_start
+        ]
+        coverage = sorted(
+            (
+                max(period_start, _timestamp(row["period_start"], "manifest.period_start")),
+                min(period_end, _timestamp(row["period_end"], "manifest.period_end")),
+            )
+            for row in authoritative_manifests
+        )
+        cursor = period_start
+        for start, end in coverage:
+            if start > cursor:
+                break
+            cursor = max(cursor, end)
+        if cursor < period_end:
+            raise MalformedEventError(
+                "canonical source manifest set does not cover the complete requested period"
+            )
+
+        authoritative_ids: set[str] = set()
+        object_coverage: list[tuple[datetime, datetime]] = []
+        for manifest in authoritative_manifests:
+            for relation in self._catalog.records(
+                "market_data.dataset_objects", where={"dataset_manifest_id": str(manifest["id"])}
+            ):
+                if relation["object_kind"] != "MARKET_BARS":
+                    continue
+                relation_start = _timestamp(relation["period_start"], "dataset_object.period_start")
+                relation_end = _timestamp(relation["period_end"], "dataset_object.period_end")
+                if relation_start < period_end and relation_end > period_start:
+                    authoritative_ids.add(str(relation["id"]))
+                    object_coverage.append(
+                        (max(period_start, relation_start), min(period_end, relation_end))
+                    )
+        if set(wanted) != authoritative_ids:
+            raise MalformedEventError(
+                "source IDs must equal the complete authoritative object set for the requested period"
+            )
+        cursor = period_start
+        for start, end in sorted(object_coverage):
+            if start > cursor:
+                break
+            cursor = max(cursor, end)
+        if cursor < period_end:
+            raise MalformedEventError(
+                "canonical source objects contain a period gap in the requested interval"
+            )
         sources: list[SourceObject] = []
         bars: list[BarPoint] = []
         receipts: list[dict[str, Any]] = []
         expected_schema = bar_schema(False)
+        total_rows = 0
+        total_bytes = 0
 
         for object_id in sorted(wanted):
-            relation = relations.get(object_id)
-            if relation is None:
-                raise MalformedEventError(f"canonical dataset object is missing: {object_id}")
-            manifest = manifests.get(str(relation["dataset_manifest_id"]))
-            receipt = storage.get(str(relation["object_id"]))
-            if manifest is None or receipt is None:
+            relation = relations[object_id]
+            manifest = manifests[str(relation["dataset_manifest_id"])]
+            storage_rows = self._catalog.records(
+                "storage.objects", where={"id": str(relation["object_id"])}
+            )
+            receipt = storage_rows[0] if storage_rows else None
+            if receipt is None:
                 raise MalformedEventError(f"canonical source receipt is incomplete: {object_id}")
             if relation["object_kind"] != "MARKET_BARS":
                 raise MalformedEventError(f"source {object_id} is not MARKET_BARS")
@@ -198,16 +305,22 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} is not Parquet")
             if int(relation["row_count"]) != int(receipt["row_count"]):
                 raise MalformedEventError(f"source {object_id} row count receipt mismatch")
-            manifest_start = _timestamp(manifest["period_start"], "manifest.period_start")
-            manifest_end = _timestamp(manifest["period_end"], "manifest.period_end")
+            total_rows += int(receipt["row_count"])
+            total_bytes += int(receipt["byte_size"])
+            if total_rows > MAX_FEATURE_SOURCE_ROWS or total_bytes > MAX_FEATURE_SOURCE_BYTES:
+                raise MalformedEventError(
+                    "canonical source set exceeds the bounded feature materialization budget"
+                )
             relation_start = _timestamp(relation["period_start"], "dataset_object.period_start")
             relation_end = _timestamp(relation["period_end"], "dataset_object.period_end")
             storage_start = _timestamp(receipt["period_start"], "storage_object.period_start")
             storage_end = _timestamp(receipt["period_end"], "storage_object.period_end")
-            if not (manifest_start <= period_start < period_end <= manifest_end):
-                raise MalformedEventError(f"source {object_id} does not cover the requested period")
             if (relation_start, relation_end) != (storage_start, storage_end):
                 raise MalformedEventError(f"source {object_id} period receipt mismatch")
+            if not self._object_store.owns_receipt(
+                str(receipt["storage_provider"]), str(receipt["bucket_name"])
+            ):
+                raise MalformedEventError(f"source {object_id} storage identity does not match the reader")
 
             verified = self._object_store.verify_version(
                 str(receipt["object_key"]),
@@ -221,34 +334,57 @@ class CanonicalFeatureSourceReader:
                 str(receipt["object_key"]), str(receipt["provider_version_id"])
             ) as stream:
                 with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as seekable:
+                    downloaded = hashlib.sha256()
+                    downloaded_size = 0
                     while chunk := stream.read(1024 * 1024):
+                        downloaded.update(chunk)
+                        downloaded_size += len(chunk)
                         seekable.write(chunk)
-                    seekable.seek(0)
-                    table = pq.read_table(seekable)
-            if table.schema != expected_schema:
-                raise MalformedEventError(f"source {object_id} Parquet schema does not match canonical bars")
-            if table.num_rows != int(receipt["row_count"]):
-                raise MalformedEventError(f"source {object_id} decoded row count does not match receipt")
-            rows = table.to_pylist()
-            previous: datetime | None = None
-            for row_index, row in enumerate(rows):
-                if str(row["instrument_id"]) != instrument_id:
-                    raise MalformedEventError(f"source {object_id} row {row_index} belongs to another instrument")
-                moment = _timestamp(row["bar_start_at"], f"source {object_id} row {row_index}.bar_start_at")
-                if previous is not None and moment <= previous:
-                    raise MalformedEventError(f"source {object_id} bars are not strictly ordered and unique")
-                previous = moment
-                if period_start <= moment < period_end:
-                    bars.append(
-                        BarPoint(
-                            bar_start_at=moment,
-                            open=Decimal(str(row["open"])),
-                            high=Decimal(str(row["high"])),
-                            low=Decimal(str(row["low"])),
-                            close=Decimal(str(row["close"])),
-                            volume=int(row["volume"]),
+                    if (
+                        downloaded.hexdigest() != str(receipt["content_hash"])
+                        or downloaded_size != int(receipt["byte_size"])
+                    ):
+                        raise MalformedEventError(
+                            f"source {object_id} downloaded object hash or size mismatch"
                         )
-                    )
+                    seekable.seek(0)
+                    parquet = pq.ParquetFile(seekable)
+                    if parquet.schema_arrow != expected_schema:
+                        raise MalformedEventError(
+                            f"source {object_id} Parquet schema does not match canonical bars"
+                        )
+                    decoded_rows = 0
+                    previous: datetime | None = None
+                    for batch in parquet.iter_batches(batch_size=FEATURE_READ_BATCH_ROWS):
+                        decoded_rows += batch.num_rows
+                        for row_index, row in enumerate(batch.to_pylist(), start=decoded_rows - batch.num_rows):
+                            if str(row["instrument_id"]) != instrument_id:
+                                raise MalformedEventError(
+                                    f"source {object_id} row {row_index} belongs to another instrument"
+                                )
+                            moment = _timestamp(
+                                row["bar_start_at"], f"source {object_id} row {row_index}.bar_start_at"
+                            )
+                            if previous is not None and moment <= previous:
+                                raise MalformedEventError(
+                                    f"source {object_id} bars are not strictly ordered and unique"
+                                )
+                            previous = moment
+                            if period_start <= moment < period_end:
+                                bars.append(
+                                    BarPoint(
+                                        bar_start_at=moment,
+                                        open=Decimal(str(row["open"])),
+                                        high=Decimal(str(row["high"])),
+                                        low=Decimal(str(row["low"])),
+                                        close=Decimal(str(row["close"])),
+                                        volume=int(row["volume"]),
+                                    )
+                                )
+                    if decoded_rows != int(receipt["row_count"]):
+                        raise MalformedEventError(
+                            f"source {object_id} decoded row count does not match receipt"
+                        )
             sources.append(
                 SourceObject(
                     dataset_object_id=object_id,
@@ -290,9 +426,8 @@ class DeterministicFeatureOutputResolver:
 
     def resolve_feed(self, definition: FeatureDefinition) -> str:
         provider_id = feature_output_provider_id()
-        provider = next(
-            (row for row in self._catalog.records("market_data.providers") if str(row["id"]) == provider_id), None
-        )
+        provider_rows = self._catalog.records("market_data.providers", where={"id": provider_id})
+        provider = provider_rows[0] if provider_rows else None
         expected_provider = {
             "code": INTERNAL_PROVIDER_CODE,
             "display_name": "Idea2Strategy Derived Data",
@@ -300,7 +435,8 @@ class DeterministicFeatureOutputResolver:
             "status": "ACTIVE",
         }
         feed_id = feature_output_feed_id(definition)
-        feed = next((row for row in self._catalog.records("market_data.feeds") if str(row["id"]) == feed_id), None)
+        feed_rows = self._catalog.records("market_data.feeds", where={"id": feed_id})
+        feed = feed_rows[0] if feed_rows else None
         expected_feed = {
             "provider_id": provider_id,
             "code": feature_output_feed_code(definition),
@@ -330,25 +466,44 @@ class DeterministicFeatureOutputResolver:
         instrument_id: str,
         resolution: str,
         period_start: datetime,
+        period_end: datetime,
     ) -> FeatureOutputTarget:
         manifest_id = str(
             deterministic_uuid("feature-output-manifest", materialization_id, FEATURE_SERIES_SCHEMA_VERSION)
         )
-        manifests = self._catalog.records("market_data.dataset_manifests")
-        existing = next((row for row in manifests if str(row["id"]) == manifest_id), None)
+        existing_rows = self._catalog.records(
+            "market_data.dataset_manifests", where={"id": manifest_id}
+        )
+        existing = existing_rows[0] if existing_rows else None
         if existing is not None:
-            if (
-                str(existing["feed_id"]) != feed_id
-                or str(existing.get("instrument_id")) != instrument_id
-                or existing["resolution"] != resolution
+            expected_existing = {
+                "feed_id": feed_id,
+                "instrument_id": instrument_id,
+                "data_layer": "DERIVED",
+                "resolution": resolution,
+                "period_start": iso_utc(period_start),
+                "period_end": iso_utc(period_end),
+                "schema_version": FEATURE_SERIES_SCHEMA_VERSION,
+            }
+            if any(
+                (
+                    iso_utc(_timestamp(existing[key], f"manifest.{key}"))
+                    if key.startswith("period_")
+                    else str(existing.get(key))
+                )
+                != value
+                for key, value in expected_existing.items()
             ):
-                raise MalformedEventError("deterministic output manifest identity conflicts with canonical state")
+                raise MalformedEventError(
+                    "deterministic output manifest identity conflicts with immutable canonical state"
+                )
             return FeatureOutputTarget(feed_id, manifest_id, int(existing["revision_number"]))
         siblings = [
             row
-            for row in manifests
-            if str(row["feed_id"]) == feed_id
-            and str(row.get("instrument_id")) == instrument_id
+            for row in self._catalog.records(
+                "market_data.dataset_manifests", where={"feed_id": feed_id}
+            )
+            if str(row.get("instrument_id")) == instrument_id
             and row["data_layer"] == "DERIVED"
             and row["resolution"] == resolution
             and _timestamp(row["period_start"], "manifest.period_start") == period_start
@@ -407,21 +562,7 @@ class ProductionFeatureMaterializationPort:
             period_end=period_end,
         )
         feed_id = self._target_resolver.resolve_feed(definition)
-        input_hash = canonical_sha256(
-            {
-                "command": "MATERIALIZE_FEATURE_OUTPUT",
-                "definition_hash": definition.definition_hash,
-                "instrument_id": instrument_id,
-                "period_start": iso_utc(period_start),
-                "period_end": iso_utc(period_end),
-                "sources": [item.fingerprint_entry() for item in source.sources],
-            }
-        )
         run_id = feature_output_run_id(command_id)
-        existing_run = self._catalog.pipeline_run(run_id)
-        if existing_run is not None and existing_run["input_hash"] != input_hash:
-            raise MalformedEventError(f"command_id {command_id!r} was already used with different input")
-
         provisional = MaterializationRequest(
             definition=definition,
             instrument_id=instrument_id,
@@ -435,12 +576,24 @@ class ProductionFeatureMaterializationPort:
             output_feed_id=feed_id,
             output_revision_number=1,
         )
+        input_hash = provisional.input_dataset_set_hash
+        existing_run = self._catalog.pipeline_run(run_id)
+        existing_materializations = self._catalog.records(
+            "market_data.feature_materializations", where={"pipeline_run_id": run_id}
+        )
+        if (
+            existing_run is not None
+            and existing_run["input_hash"] != input_hash
+            or any(str(row["id"]) != provisional.materialization_id for row in existing_materializations)
+        ):
+            raise MalformedEventError(f"command_id {command_id!r} was already used with different input")
         target = self._target_resolver.resolve_target(
             feed_id=feed_id,
             materialization_id=provisional.materialization_id,
             instrument_id=instrument_id,
             resolution=definition.resolution,
             period_start=period_start,
+            period_end=period_end,
         )
         request = MaterializationRequest(
             definition=definition,
@@ -460,7 +613,7 @@ class ProductionFeatureMaterializationPort:
                 "id": run_id,
                 "pipeline_code": "MATERIALIZE_FEATURE_OUTPUT",
                 "pipeline_version": FEATURE_SERIES_SCHEMA_VERSION,
-                "idempotency_key": command_id,
+                "idempotency_key": run_id,
                 "status": "RUNNING",
                 "input_hash": input_hash,
                 "output_hash": None,

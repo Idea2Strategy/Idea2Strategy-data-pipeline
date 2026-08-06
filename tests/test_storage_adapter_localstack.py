@@ -147,6 +147,10 @@ class LocalStackStorageAdapterIntegrationTests(unittest.TestCase):
             with store.open_version(receipt.object_key, receipt.provider_version_id) as body:
                 self.assertEqual(body.read(), source.read_bytes())
 
+            self.assertTrue(store.owns_receipt("S3_COMPATIBLE", self.bucket))
+            self.assertFalse(store.owns_receipt("S3_COMPATIBLE", f"{self.bucket}-other"))
+            self.assertFalse(store.owns_receipt("LOCAL", self.bucket))
+
             self.client.put_object(
                 Bucket=self.bucket,
                 Key=object_key,

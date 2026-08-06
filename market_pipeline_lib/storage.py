@@ -90,6 +90,8 @@ class ObjectStore(Protocol):
         expected_byte_size: int,
     ) -> VerificationResult: ...
 
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool: ...
+
 
 #: `storage.objects.bucket_name` is ``varchar(160) NOT NULL`` in the applied baseline, so
 #: every published object needs one, including objects published to a filesystem.
@@ -126,6 +128,9 @@ class LocalObjectStore:
         # Containment is checked above, on the plain path, before switching to
         # the extended-length form used for the actual filesystem calls.
         return Path(long_path(candidate))
+
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
+        return storage_provider == "LOCAL" and bucket_name == self.bucket_name
 
     def put(self, source_path: Path, object_key: str) -> ObjectReceipt:
         source = source_path.expanduser().resolve()
@@ -264,6 +269,9 @@ class S3ObjectStore:
         return "/".join(
             part for part in (self.prefix, normalized) if part
         )
+
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
+        return storage_provider == "S3_COMPATIBLE" and bucket_name == self.bucket
 
     @staticmethod
     def _error_details(exc: Exception) -> tuple[str, int | None]:

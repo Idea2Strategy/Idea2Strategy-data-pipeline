@@ -215,3 +215,48 @@ def test_transient_feature_publication_failure_is_retried_with_the_same_command(
     assert worker.health.failed == 1
     assert worker.health.succeeded == 1
     assert source.pending() == 0
+
+
+def test_feature_redelivery_always_reaches_durable_domain_idempotency(tmp_path: Path) -> None:
+    class RecordingPort:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def materialize(self, payload, *, command_id):
+            self.calls.append((command_id, dict(payload)))
+            return {"status": "SUCCEEDED", "revision": payload["revision"]}
+
+    config = WorkerConfig.from_environment(
+        _environment(
+            tmp_path,
+            PIPELINE_WORKER_POLL_INTERVAL_SECONDS="0.01",
+        )
+    )
+    source = InProcessMessageSource()
+    port = RecordingPort()
+    worker = PipelineWorker(
+        config,
+        message_source=source,
+        executor=PipelineCommandExecutor(config, feature_materialization_port=port),
+    )
+    for revision in (1, 2):
+        source.submit(
+            {
+                "command": "MATERIALIZE_FEATURE_OUTPUT",
+                "command_id": "feature-durable-1",
+                "payload": {"revision": revision},
+            }
+        )
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while len(port.calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    worker.request_stop("test")
+    thread.join(timeout=5)
+
+    assert port.calls == [
+        ("feature-durable-1", {"revision": 1}),
+        ("feature-durable-1", {"revision": 2}),
+    ]
+    assert [result["outcome"] for result in worker.results] == ["SUCCEEDED", "SUCCEEDED"]

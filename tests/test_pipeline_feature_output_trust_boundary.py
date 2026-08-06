@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,8 +24,9 @@ from apps.pipeline_worker.feature_output import (
 )
 from market_pipeline_lib.catalog import LocalCatalog
 from market_pipeline_lib.contracts import SCHEMA_VERSION, bar_schema, deterministic_uuid
-from market_pipeline_lib.features import FeatureDefinition, FeatureDefinitionRegistry
-from market_pipeline_lib.storage import LocalObjectStore
+from market_pipeline_lib.features import BarPoint, FeatureDefinition, FeatureDefinitionRegistry
+from market_pipeline_lib.features.definitions import OFFICIAL_RSI_14_HASH, OFFICIAL_RSI_14_PARAMETERS
+from market_pipeline_lib.storage import LocalObjectStore, VerificationResult
 
 CATALOG_VERSION = "10000000-0000-4000-8000-000000000001"
 INSTRUMENT = "20000000-0000-4000-8000-000000000001"
@@ -71,8 +76,9 @@ def seed_catalog(
     *,
     include_output_feed: bool = True,
     relation_row_count: int = 3,
-) -> tuple[LocalCatalog, LocalObjectStore, LocalObjectStore, FeatureDefinition]:
-    catalog = LocalCatalog(tmp_path / "catalog")
+    catalog: Any | None = None,
+) -> tuple[Any, LocalObjectStore, LocalObjectStore, FeatureDefinition]:
+    catalog = catalog or LocalCatalog(tmp_path / "catalog")
     published = FeatureDefinitionRegistry(catalog).publish(definition())
     source_store = LocalObjectStore(tmp_path / "source-objects", bucket_name="market-data")
     output_store = LocalObjectStore(tmp_path / "output-objects", bucket_name="market-data")
@@ -223,7 +229,7 @@ def payload(published: FeatureDefinition) -> dict[str, object]:
 
 def production_port(
     tmp_path: Path,
-    catalog: LocalCatalog,
+    catalog: Any,
     source_store: LocalObjectStore,
     output_store: LocalObjectStore,
 ) -> ProductionFeatureMaterializationPort:
@@ -274,6 +280,9 @@ def test_materialization_derives_every_output_identity_and_owns_the_pipeline_run
     assert run is not None
     assert run["status"] == "SUCCEEDED"
     assert run["output_hash"] == first["result_hash"]
+    materialization = catalog.records("market_data.feature_materializations")[0]
+    assert run["input_hash"] == materialization["input_dataset_set_hash"]
+    assert run["idempotency_key"] == feature_output_run_id("feature-command-1")
     assert len(catalog.records("market_data.pipeline_runs")) == 1
     assert len(catalog.records("market_data.feature_materializations")) == 1
     assert len(catalog.records("storage.objects")) == 2
@@ -505,3 +514,173 @@ def test_untrusted_canonical_source_state_fails_closed(
         port.materialize(payload(published), command_id="untrusted-canonical-source")
 
     assert catalog.records("market_data.pipeline_runs") == []
+
+
+def test_omitted_authoritative_intersecting_object_is_rejected(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    storage = catalog.records("storage.objects")[0]
+    relation = catalog.records("market_data.dataset_objects")[0]
+    catalog.upsert(
+        "storage.objects",
+        {**storage, "id": "70000000-0000-4000-8000-000000000002", "object_key": "market-data/second.parquet"},
+    )
+    catalog.upsert(
+        "market_data.dataset_objects",
+        {
+            **relation,
+            "id": "60000000-0000-4000-8000-000000000002",
+            "object_id": "70000000-0000-4000-8000-000000000002",
+            "part_number": 2,
+        },
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="complete authoritative object set"):
+        port.materialize(payload(published), command_id="omitted-source-object")
+
+
+def test_authoritative_object_period_gap_is_rejected(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    relation = catalog.records("market_data.dataset_objects", where={"id": SOURCE_OBJECT})[0]
+    receipt = catalog.records("storage.objects", where={"id": SOURCE_STORAGE})[0]
+    shortened = (PERIOD_END - timedelta(minutes=5)).isoformat()
+    catalog.upsert("market_data.dataset_objects", {**relation, "period_end": shortened})
+    catalog.upsert("storage.objects", {**receipt, "period_end": shortened})
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="period gap"):
+        port.materialize(payload(published), command_id="source-period-gap")
+
+
+def test_existing_output_manifest_immutable_drift_is_rejected(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+    result = port.materialize(payload(published), command_id="manifest-drift")
+    manifest = catalog.records(
+        "market_data.dataset_manifests", where={"id": result["output_dataset_manifest_id"]}
+    )[0]
+    catalog.upsert("market_data.dataset_manifests", {**manifest, "schema_version": "drifted.v9"})
+
+    with pytest.raises(MalformedEventError, match="immutable canonical state"):
+        port.materialize(payload(published), command_id="manifest-drift")
+
+
+def test_source_receipt_bucket_is_bound_to_the_reader(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    receipt = catalog.records("storage.objects", where={"id": SOURCE_STORAGE})[0]
+    catalog.upsert("storage.objects", {**receipt, "bucket_name": "another-bucket"})
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="storage identity"):
+        port.materialize(payload(published), command_id="wrong-source-bucket")
+
+
+def test_downloaded_source_bytes_are_hashed_instead_of_trusting_head_only(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+
+    class TamperedDownloadStore:
+        def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
+            return source_store.owns_receipt(storage_provider, bucket_name)
+
+        def verify_version(self, *args, **kwargs):
+            receipt = catalog.records("storage.objects", where={"id": SOURCE_STORAGE})[0]
+            return VerificationResult(True, receipt["content_hash"], receipt["byte_size"])
+
+        def open_version(self, *args, **kwargs):
+            return BytesIO(b"tampered after HEAD")
+
+    port = ProductionFeatureMaterializationPort(
+        catalog,
+        output_store,
+        source_reader=CanonicalFeatureSourceReader(catalog, TamperedDownloadStore()),  # type: ignore[arg-type]
+        target_resolver=DeterministicFeatureOutputResolver(catalog),
+        staging_root=tmp_path / "staging",
+    )
+
+    with pytest.raises(MalformedEventError, match="downloaded object hash"):
+        port.materialize(payload(published), command_id="tampered-download")
+
+
+def test_source_object_count_is_bounded_before_catalog_reads(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+    too_many = [str(deterministic_uuid("too-many-source", str(index))) for index in range(513)]
+
+    with pytest.raises(MalformedEventError, match="at most 512"):
+        port.materialize(
+            {**payload(published), "source_dataset_object_ids": too_many},
+            command_id="too-many-source-objects",
+        )
+
+
+def test_approved_official_rsi_row_resolves_exact_feed_and_existing_calculator() -> None:
+    official = FeatureDefinition.from_record(
+        {
+            "id": "0f1b0000-0000-4000-8000-000000000001",
+            "element_catalog_version_id": "0f1a0000-0000-4000-8000-000000000001",
+            "feature_code": "RSI_14",
+            "calculator_version": "rsi:1.0.0",
+            "resolution": "1m",
+            "normalized_parameters": OFFICIAL_RSI_14_PARAMETERS,
+            "output_value_type": "NUMBER",
+            "required_history_points": 15,
+            "definition_hash": OFFICIAL_RSI_14_HASH,
+        }
+    )
+
+    assert feature_output_feed_id(official) == "063f8f27-5c6a-5348-b2bb-abc3c634149c"
+    assert feature_output_feed_code(official) == "FEATURE_RSI_14_1M_RSI_1_0_0"
+    assert feature_output_feed_version(official) == "rsi-1.0.0+feature-series.parquet.v1"
+    bars = tuple(
+        BarPoint(
+            bar_start_at=PERIOD_START + timedelta(minutes=index),
+            open=Decimal(100 + index),
+            high=Decimal(101 + index),
+            low=Decimal(99 + index),
+            close=Decimal(100 + index),
+            volume=1000 + index,
+        )
+        for index in range(15)
+    )
+    assert len(official.calculator().compute(bars, OFFICIAL_RSI_14_PARAMETERS)) == 1
+
+
+@pytest.mark.integration
+def test_production_command_commits_and_reconciles_through_postgres_16(
+    tmp_path: Path, postgres_catalog: Any, admin_engine: Any
+) -> None:
+    from sqlalchemy import text
+
+    with admin_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO strategy.element_catalog_versions "
+                "(id, language_version, schema_version, catalog_version, "
+                " data_requirement_version, definition_hash, published_at) "
+                "VALUES (:id, '248.0.0', '248', '248.0.0', '248.0.0', :digest, "
+                "TIMESTAMPTZ '2026-01-01 00:00:00+00') "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {
+                "id": CATALOG_VERSION,
+                "digest": hashlib.sha256(CATALOG_VERSION.encode("ascii")).hexdigest(),
+            },
+        )
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path, catalog=postgres_catalog
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    first = port.materialize(payload(published), command_id="postgres-production-command")
+    second = port.materialize(payload(published), command_id="postgres-production-command")
+
+    assert first == second
+    assert postgres_catalog.pipeline_run(feature_output_run_id("postgres-production-command"))[
+        "status"
+    ] == "SUCCEEDED"
+    assert len(postgres_catalog.records("market_data.feature_materializations")) == 1
+    assert len(
+        postgres_catalog.records(
+            "market_data.dataset_manifests", where={"id": first["output_dataset_manifest_id"]}
+        )
+    ) == 1

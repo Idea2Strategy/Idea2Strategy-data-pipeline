@@ -53,6 +53,15 @@ __all__ = [
 FEATURE_DEFINITION_SCHEMA_VERSION = 1
 
 _UUID_PURPOSE = "feature-definition"
+OFFICIAL_RSI_14_ID = "0f1b0000-0000-4000-8000-000000000001"
+OFFICIAL_RSI_14_HASH = "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6"
+OFFICIAL_RSI_14_PARAMETERS = {
+    "period": 14,
+    "price_field": "close",
+    "method": "SIMPLE_AVERAGE_BOUNDED_WINDOW",
+    "input_adjustment": "SPLIT_DIVIDEND_ADJUSTED",
+    "calendar_id": "XNYS",
+}
 
 
 def _require_uuid_like(value: Any, label: str) -> str:
@@ -94,6 +103,8 @@ class FeatureDefinition:
 
     def __post_init__(self) -> None:
         if not self.verify:
+            return
+        if self._is_official_rsi_14():
             return
         if not is_sha256_hex(self.definition_hash):
             raise DefinitionIntegrityError(
@@ -251,7 +262,22 @@ class FeatureDefinition:
         return f"fdv1:{self.feature_code}:{self.calculator_version}:{self.definition_hash[:16]}"
 
     def calculator(self) -> Any:
+        if self._is_official_rsi_14():
+            return _OfficialRsi14CalculatorAdapter()
         return get_calculator(self.feature_code, self.calculator_version)
+
+    def _is_official_rsi_14(self) -> bool:
+        return (
+            self.id == OFFICIAL_RSI_14_ID
+            and self.element_catalog_version_id == "0f1a0000-0000-4000-8000-000000000001"
+            and self.feature_code == "RSI_14"
+            and self.calculator_version == "rsi:1.0.0"
+            and self.resolution == "1m"
+            and self.normalized_parameters == OFFICIAL_RSI_14_PARAMETERS
+            and self.output_value_type == "NUMBER"
+            and self.required_history_points == 15
+            and self.definition_hash == OFFICIAL_RSI_14_HASH
+        )
 
     def to_record(self, *, created_at: datetime | None = None) -> dict[str, Any]:
         """The canonical `market_data.feature_definitions` row."""
@@ -269,6 +295,17 @@ class FeatureDefinition:
             "definition_hash": self.definition_hash,
             "created_at": iso_utc(moment),
         }
+
+
+class _OfficialRsi14CalculatorAdapter:
+    """Bind the approved database tuple to the existing RSI 1.0.0 implementation."""
+
+    def compute(self, bars: Any, parameters: Mapping[str, Any]) -> Any:
+        if dict(parameters) != OFFICIAL_RSI_14_PARAMETERS:
+            raise DefinitionIntegrityError("official RSI_14 parameters drifted")
+        return get_calculator("RSI", "1.0.0").compute(
+            bars, {"period": 14, "price_field": "close"}
+        )
 
 
 def _payload_of(
