@@ -1,9 +1,8 @@
 """Fail-closed command adapter for immutable historical feature outputs.
 
-This is an implementation draft for the authority-owned mapping proposed in root PR
-#306.  It intentionally refuses to invent or seed that mapping: until the canonical
-contract is approved and its provider/feed rows are installed, production commands
-fail before creating a pipeline run or an output object.
+The authority-owned mapping is approved in the root canonical contract (PR #320).
+Production commands still fail closed before creating a pipeline run or output object
+when the exact approved provider/feed rows have not been installed.
 """
 
 from __future__ import annotations
@@ -219,23 +218,44 @@ class CanonicalFeatureSourceReader:
         if len(feed_ids) != 1:
             raise MalformedEventError("canonical sources must belong to one feed")
         feed_id = next(iter(feed_ids))
-        authoritative_manifests = [
-            row
-            for row in self._catalog.records(
-                "market_data.dataset_manifests", where={"feed_id": feed_id}
+        feed_manifests = self._catalog.records(
+            "market_data.dataset_manifests", where={"feed_id": feed_id}
+        )
+        for selected in selected_manifests:
+            identity = (
+                str(selected.get("instrument_id")),
+                selected.get("data_layer"),
+                selected.get("resolution"),
+                _timestamp(selected["period_start"], "manifest.period_start"),
+                _timestamp(selected["period_end"], "manifest.period_end"),
             )
-            if row["status"] == "AVAILABLE"
-            and str(row.get("instrument_id")) == instrument_id
-            and row["resolution"] == definition.resolution
-            and _timestamp(row["period_start"], "manifest.period_start") < period_end
-            and _timestamp(row["period_end"], "manifest.period_end") > period_start
-        ]
+            available_revisions = [
+                row
+                for row in feed_manifests
+                if row["status"] == "AVAILABLE"
+                and (
+                    str(row.get("instrument_id")),
+                    row.get("data_layer"),
+                    row.get("resolution"),
+                    _timestamp(row["period_start"], "manifest.period_start"),
+                    _timestamp(row["period_end"], "manifest.period_end"),
+                )
+                == identity
+            ]
+            current_revision = max(int(row["revision_number"]) for row in available_revisions)
+            if int(selected["revision_number"]) != current_revision:
+                raise MalformedEventError(
+                    "source manifest is not the current AVAILABLE revision for its exact identity"
+                )
+
         coverage = sorted(
             (
                 max(period_start, _timestamp(row["period_start"], "manifest.period_start")),
                 min(period_end, _timestamp(row["period_end"], "manifest.period_end")),
             )
-            for row in authoritative_manifests
+            for row in selected_manifests
+            if _timestamp(row["period_start"], "manifest.period_start") < period_end
+            and _timestamp(row["period_end"], "manifest.period_end") > period_start
         )
         cursor = period_start
         for start, end in coverage:
@@ -249,7 +269,7 @@ class CanonicalFeatureSourceReader:
 
         authoritative_ids: set[str] = set()
         object_coverage: list[tuple[datetime, datetime]] = []
-        for manifest in authoritative_manifests:
+        for manifest in selected_manifests:
             for relation in self._catalog.records(
                 "market_data.dataset_objects", where={"dataset_manifest_id": str(manifest["id"])}
             ):

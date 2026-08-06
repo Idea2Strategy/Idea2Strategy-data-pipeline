@@ -35,6 +35,8 @@ SOURCE_FEED = "40000000-0000-4000-8000-000000000001"
 SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000001"
 SOURCE_OBJECT = "60000000-0000-4000-8000-000000000001"
 SOURCE_STORAGE = "70000000-0000-4000-8000-000000000001"
+CURRENT_SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000002"
+CURRENT_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000002"
 PERIOD_START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
 PERIOD_END = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 
@@ -239,6 +241,30 @@ def production_port(
         source_reader=CanonicalFeatureSourceReader(catalog, source_store),
         target_resolver=DeterministicFeatureOutputResolver(catalog),
         staging_root=tmp_path / "staging",
+    )
+
+
+def add_current_source_revision(catalog: Any) -> None:
+    previous = catalog.records(
+        "market_data.dataset_manifests", where={"id": SOURCE_MANIFEST}
+    )[0]
+    relation = catalog.records("market_data.dataset_objects", where={"id": SOURCE_OBJECT})[0]
+    catalog.publish_manifest(
+        {
+            **previous,
+            "id": CURRENT_SOURCE_MANIFEST,
+            "revision_number": 2,
+            "dataset_hash": "b" * 64,
+            "supersedes_manifest_id": SOURCE_MANIFEST,
+        }
+    )
+    catalog.upsert(
+        "market_data.dataset_objects",
+        {
+            **relation,
+            "id": CURRENT_SOURCE_OBJECT,
+            "dataset_manifest_id": CURRENT_SOURCE_MANIFEST,
+        },
     )
 
 
@@ -516,8 +542,27 @@ def test_untrusted_canonical_source_state_fails_closed(
     assert catalog.records("market_data.pipeline_runs") == []
 
 
-def test_omitted_authoritative_intersecting_object_is_rejected(tmp_path: Path) -> None:
+def test_only_the_highest_available_exact_manifest_revision_is_required(tmp_path: Path) -> None:
     catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    add_current_source_revision(catalog)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    result = port.materialize(
+        {**payload(published), "source_dataset_object_ids": [CURRENT_SOURCE_OBJECT]},
+        command_id="current-source-revision",
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert catalog.records(
+        "market_data.dataset_manifests", where={"id": SOURCE_MANIFEST}
+    )[0]["status"] == "AVAILABLE"
+    with pytest.raises(MalformedEventError, match="current AVAILABLE revision"):
+        port.materialize(payload(published), command_id="stale-source-revision")
+
+
+def test_omitted_object_from_current_manifest_revision_is_rejected(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    add_current_source_revision(catalog)
     storage = catalog.records("storage.objects")[0]
     relation = catalog.records("market_data.dataset_objects")[0]
     catalog.upsert(
@@ -528,7 +573,8 @@ def test_omitted_authoritative_intersecting_object_is_rejected(tmp_path: Path) -
         "market_data.dataset_objects",
         {
             **relation,
-            "id": "60000000-0000-4000-8000-000000000002",
+            "id": "60000000-0000-4000-8000-000000000003",
+            "dataset_manifest_id": CURRENT_SOURCE_MANIFEST,
             "object_id": "70000000-0000-4000-8000-000000000002",
             "part_number": 2,
         },
@@ -536,7 +582,10 @@ def test_omitted_authoritative_intersecting_object_is_rejected(tmp_path: Path) -
     port = production_port(tmp_path, catalog, source_store, output_store)
 
     with pytest.raises(MalformedEventError, match="complete authoritative object set"):
-        port.materialize(payload(published), command_id="omitted-source-object")
+        port.materialize(
+            {**payload(published), "source_dataset_object_ids": [CURRENT_SOURCE_OBJECT]},
+            command_id="omitted-source-object",
+        )
 
 
 def test_authoritative_object_period_gap_is_rejected(tmp_path: Path) -> None:
