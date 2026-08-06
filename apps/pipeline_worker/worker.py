@@ -319,7 +319,10 @@ class PipelineWorker:
         # idempotency identity. They must reach that verifier on every delivery:
         # suppressing by command_id here would hide a tampered redelivery as a
         # harmless duplicate and skip its refusal audit.
-        durable_domain_idempotency = command.command == "APPLY_CORPORATE_ACTION_APPROVAL"
+        durable_domain_idempotency = command.command in {
+            "APPLY_CORPORATE_ACTION_APPROVAL",
+            "MATERIALIZE_FEATURE_OUTPUT",
+        }
         if not durable_domain_idempotency and not self._idempotency.claim(command.command_id):
             visibility.stop()
             self._record(

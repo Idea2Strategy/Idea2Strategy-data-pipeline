@@ -14,6 +14,10 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
+from market_pipeline_lib.contracts import deterministic_uuid
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VALIDATOR_PATH = CONTRIBUTION_ROOT / "validate_contribution.py"
@@ -109,6 +113,32 @@ class ContributionContractTests(unittest.TestCase):
         checked = validator.check_migration_directory(self.contribution)
         for name in checked:
             self.assertRegex(name, self.contribution.filename_regex)
+
+    def test_official_feature_output_seed_is_forward_only_and_pins_exact_identities(self) -> None:
+        migration = self.contribution.migrations_directory / (
+            "V20260806120000__pipeline_seed_official_feature_output_feed.sql"
+        )
+        sql = migration.read_text(encoding="utf-8")
+        self.assertEqual(
+            deterministic_uuid("provider", "IDEA2STRATEGY_INTERNAL"),
+            "b9146ed9-dbb0-5323-93e3-8518f3851236",
+        )
+        self.assertEqual(
+            deterministic_uuid(
+                "feature-output-feed",
+                "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6",
+                "rsi:1.0.0",
+                "1m",
+                "feature-series.parquet.v1",
+            ),
+            "063f8f27-5c6a-5348-b2bb-abc3c634149c",
+        )
+        self.assertIn("063f8f27-5c6a-5348-b2bb-abc3c634149c", sql)
+        self.assertIn("sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6", sql)
+        self.assertIn("RAISE EXCEPTION 'official RSI_14 definition identity drift'", sql)
+        self.assertIn("RAISE EXCEPTION 'IDEA2STRATEGY_INTERNAL provider identity drift'", sql)
+        self.assertIn("RAISE EXCEPTION 'official RSI_14 feature feed identity drift'", sql)
+        self.assertNotIn("UPDATE MARKET_DATA.", sql.upper())
 
     def test_only_sql_and_gitkeep_live_under_migrations(self) -> None:
         allowed = {".sql"}
@@ -295,6 +325,37 @@ class ValidatorCliTests(unittest.TestCase):
 
     def test_cli_reports_failure_for_a_missing_root(self) -> None:
         self.assertEqual(validator.main([str(REPO_ROOT / "does-not-exist")]), 1)
+
+
+@pytest.mark.integration
+def test_official_feature_output_seed_replays_and_refuses_drift(admin_engine: object) -> None:
+    migration = CONTRIBUTION_ROOT / "migrations" / (
+        "V20260806120000__pipeline_seed_official_feature_output_feed.sql"
+    )
+    sql = migration.read_text(encoding="utf-8")
+    engine = admin_engine
+    with engine.begin() as connection:  # type: ignore[attr-defined]
+        connection.exec_driver_sql(sql)
+        connection.exec_driver_sql(sql)
+        provider = connection.exec_driver_sql(
+            "SELECT code, rights_version, status FROM market_data.providers "
+            "WHERE id = 'b9146ed9-dbb0-5323-93e3-8518f3851236'"
+        ).one()
+        feed = connection.exec_driver_sql(
+            "SELECT code, feed_version, retired_at FROM market_data.feeds "
+            "WHERE id = '063f8f27-5c6a-5348-b2bb-abc3c634149c'"
+        ).one()
+    assert tuple(provider) == ("IDEA2STRATEGY_INTERNAL", "internal-derived-v1", "ACTIVE")
+    assert tuple(feed) == ("FEATURE_RSI_14_1M_RSI_1_0_0", "rsi-1.0.0+feature-series.parquet.v1", None)
+
+    with engine.begin() as connection:  # type: ignore[attr-defined]
+        connection.exec_driver_sql(
+            "UPDATE market_data.providers SET rights_version = 'drifted' "
+            "WHERE id = 'b9146ed9-dbb0-5323-93e3-8518f3851236'"
+        )
+    with pytest.raises(Exception, match="provider identity drift"):
+        with engine.begin() as connection:  # type: ignore[attr-defined]
+            connection.exec_driver_sql(sql)
 
 
 if __name__ == "__main__":  # pragma: no cover

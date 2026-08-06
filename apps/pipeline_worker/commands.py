@@ -111,11 +111,15 @@ class UnconfiguredCorporateActionApprovalPort:
 
 @runtime_checkable
 class FeatureMaterializationPort(Protocol):
-    def materialize(self, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    def materialize(
+        self, payload: Mapping[str, Any], *, command_id: str
+    ) -> Mapping[str, Any]: ...
 
 
 class UnconfiguredFeatureMaterializationPort:
-    def materialize(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    def materialize(
+        self, payload: Mapping[str, Any], *, command_id: str
+    ) -> Mapping[str, Any]:
         raise PortNotConfiguredError(
             "MATERIALIZE_FEATURE_OUTPUT requires PIPELINE_WORKER_FEATURE_OUTPUT and "
             "PIPELINE_WORKER_DATABASE_URL; refusing an unwired feature publisher"
@@ -181,14 +185,21 @@ class PipelineCommandExecutor:
             artifact_root=config.catalog_root,
             storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
         )
-        store = S3ObjectStore(
+        output_store = S3ObjectStore(
             settings.object_bucket,
             prefix=settings.object_prefix,
             endpoint_url=config.aws_endpoint_url,
         )
+        source_store = S3ObjectStore(
+            settings.object_bucket,
+            endpoint_url=config.aws_endpoint_url,
+        )
+        from apps.pipeline_worker.feature_output import CanonicalFeatureSourceReader
+
         return ProductionFeatureMaterializationPort(
             catalog,
-            store,
+            output_store,
+            source_reader=CanonicalFeatureSourceReader(catalog, source_store),
             staging_root=settings.staging_root,
         )
 
@@ -276,7 +287,9 @@ class PipelineCommandExecutor:
         if command.command == "APPLY_CORPORATE_ACTION_APPROVAL":
             return self._corporate_action_approval_port.apply(command.payload)
         if command.command == "MATERIALIZE_FEATURE_OUTPUT":
-            return self._feature_materialization_port.materialize(command.payload)
+            return self._feature_materialization_port.materialize(
+                command.payload, command_id=command.command_id
+            )
         raise UnknownCommandError(f"no executor for command {command.command!r}")
 
     def _ingest_realtime_bars(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:

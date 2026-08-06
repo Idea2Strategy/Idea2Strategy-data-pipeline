@@ -46,8 +46,10 @@ class FeatureCatalog(Protocol):
     definition immutability and batch completeness are enforced.
     """
 
-    def records(self, table: str) -> list[dict[str, Any]]:
-        """Every row of `table`, in the canonical JSON-compatible record shape."""
+    def records(
+        self, table: str, *, where: Mapping[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Rows of `table`, optionally narrowed by exact canonical field values."""
 
     def upsert(self, table: str, record: Mapping[str, Any]) -> None:
         """Insert or replace one row of an `id`-keyed table."""
@@ -70,3 +72,16 @@ class FeatureCatalog(Protocol):
 
     def transaction(self) -> Any:
         """A context manager committing every write in the block together."""
+
+    def begin_pipeline_run(self, record: Mapping[str, Any]) -> None: ...
+
+    def pipeline_run(self, pipeline_run_id: str) -> dict[str, Any] | None: ...
+
+    def finish_pipeline_run(
+        self,
+        pipeline_run_id: str,
+        *,
+        status: str,
+        output_hash: str | None,
+        failure_code: str | None = None,
+    ) -> None: ...

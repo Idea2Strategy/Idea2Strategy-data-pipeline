@@ -82,6 +82,16 @@ class ObjectStore(Protocol):
         expected_sha256: str,
     ) -> VerificationResult: ...
 
+    def verify_version(
+        self,
+        object_key: str,
+        provider_version_id: str,
+        expected_sha256: str,
+        expected_byte_size: int,
+    ) -> VerificationResult: ...
+
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool: ...
+
 
 #: `storage.objects.bucket_name` is ``varchar(160) NOT NULL`` in the applied baseline, so
 #: every published object needs one, including objects published to a filesystem.
@@ -118,6 +128,9 @@ class LocalObjectStore:
         # Containment is checked above, on the plain path, before switching to
         # the extended-length form used for the actual filesystem calls.
         return Path(long_path(candidate))
+
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
+        return storage_provider == "LOCAL" and bucket_name == self.bucket_name
 
     def put(self, source_path: Path, object_key: str) -> ObjectReceipt:
         source = source_path.expanduser().resolve()
@@ -191,6 +204,26 @@ class LocalObjectStore:
             "" if actual == expected_sha256 else "sha256 mismatch",
         )
 
+    def verify_version(
+        self,
+        object_key: str,
+        provider_version_id: str,
+        expected_sha256: str,
+        expected_byte_size: int,
+    ) -> VerificationResult:
+        path = self.path_for(object_key)
+        if not path.is_file():
+            return VerificationResult(False, "", 0, "object missing")
+        actual = sha256_file(path)
+        size = path.stat().st_size
+        if actual != provider_version_id:
+            return VerificationResult(False, actual, size, "version mismatch")
+        if actual != expected_sha256:
+            return VerificationResult(False, actual, size, "sha256 mismatch")
+        if size != expected_byte_size:
+            return VerificationResult(False, actual, size, "byte size mismatch")
+        return VerificationResult(True, actual, size)
+
 
 class S3ObjectStore:
     """S3-compatible implementation with receipt and SHA metadata verification."""
@@ -236,6 +269,9 @@ class S3ObjectStore:
         return "/".join(
             part for part in (self.prefix, normalized) if part
         )
+
+    def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
+        return storage_provider == "S3_COMPATIBLE" and bucket_name == self.bucket
 
     @staticmethod
     def _error_details(exc: Exception) -> tuple[str, int | None]:
@@ -497,3 +533,34 @@ class S3ObjectStore:
             int(head["ContentLength"]),
             "" if actual == expected_sha256 else "sha256 metadata mismatch",
         )
+
+    def verify_version(
+        self,
+        object_key: str,
+        provider_version_id: str,
+        expected_sha256: str,
+        expected_byte_size: int,
+    ) -> VerificationResult:
+        key = self._key(object_key)
+        try:
+            head = self._head(key, version_id=provider_version_id)
+        except Exception as exc:
+            if self._is_missing(exc):
+                return VerificationResult(False, "", 0, "object version missing")
+            raise
+        metadata = head.get("Metadata", {})
+        actual_hash = metadata.get("sha256", "") if isinstance(metadata, dict) else ""
+        actual_size = int(head.get("ContentLength", 0))
+        if str(head.get("VersionId", "")) != provider_version_id:
+            return VerificationResult(False, actual_hash, actual_size, "version mismatch")
+        if actual_hash != expected_sha256:
+            return VerificationResult(False, actual_hash, actual_size, "sha256 metadata mismatch")
+        if actual_size != expected_byte_size:
+            return VerificationResult(False, actual_hash, actual_size, "byte size mismatch")
+        if head.get("ServerSideEncryption") != SSE_ALGORITHM:
+            return VerificationResult(False, actual_hash, actual_size, "SSE-S3 mismatch")
+        checksum = head.get("ChecksumSHA256")
+        expected_checksum = base64.b64encode(bytes.fromhex(expected_sha256)).decode("ascii")
+        if checksum is not None and checksum != expected_checksum:
+            return VerificationResult(False, actual_hash, actual_size, "ChecksumSHA256 mismatch")
+        return VerificationResult(True, actual_hash, actual_size)
