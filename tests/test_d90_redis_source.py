@@ -3,7 +3,7 @@
 Why this file exists
 --------------------
 C's market gateway publishes every market event with
-``RedisMarketEventPublisher`` (Redis Streams, one Lua script, three keys).  D's
+``RedisMarketEventPublisher`` (Redis Streams, one Lua script, five keys).  D's
 realtime ingest consumed **SQS**.  The two halves were never connected: no event
 C emits could reach D, by construction, whatever either side's tests said.
 
@@ -80,10 +80,12 @@ from market_pipeline_lib.redis_ingest import (
     C_STREAM_FIELDS,
     RedisMarketEventSource,
     RedisStreamDecodeError,
+    bar_updates_channel,
     decode_stream_entry,
     deduplication_key,
     latest_key,
     market_key_base,
+    recent_bars_key,
     stream_key,
 )
 from market_pipeline_lib.warmup_gate import WarmupCoverage, WarmupReadinessGate
@@ -116,6 +118,12 @@ end
 type_error = assert_type(KEYS[3], 'set')
 if type_error ~= nil then
   return type_error
+end
+if ARGV[6] == 'BAR_1M' then
+  type_error = assert_type(KEYS[4], 'zset')
+  if type_error ~= nil then
+    return type_error
+  end
 end
 
 if redis.call('SADD', KEYS[3], ARGV[1]) == 0 then
@@ -164,6 +172,17 @@ if ARGV[14] == '1' then
       'streamEntryId', stream_id)
     latest_updated = 1
   end
+end
+
+if ARGV[6] == 'BAR_1M' then
+  redis.call('ZREMRANGEBYSCORE', KEYS[4], ARGV[10], ARGV[10])
+  redis.call('ZADD', KEYS[4], ARGV[10], ARGV[16])
+  local bar_count = redis.call('ZCARD', KEYS[4])
+  local capacity = tonumber(ARGV[15])
+  if bar_count > capacity then
+    redis.call('ZREMRANGEBYRANK', KEYS[4], 0, bar_count - capacity - 1)
+  end
+  redis.call('PUBLISH', KEYS[5], ARGV[16])
 end
 
 return {1, stream_id, latest_updated}
@@ -356,6 +375,8 @@ class CPublisher:
             stream_key(self._prefix),
             latest_key(self._prefix, event["instrumentId"], event["eventType"]),
             deduplication_key(self._prefix),
+            recent_bars_key(self._prefix, event["instrumentId"]),
+            bar_updates_channel(self._prefix),
         ]
         argv = [
             event["eventId"],
@@ -372,8 +393,31 @@ class CPublisher:
             event["correctionOfEventId"] or "",
             event["valuesJson"],
             "1" if update_latest else "0",
+            "1000",
+            self._bar_update_json(event),
         ]
         return list(self._client.eval(C_PUBLISH_SCRIPT, len(keys), *keys, *argv))
+
+    @staticmethod
+    def _bar_update_json(event: Mapping[str, Any]) -> str:
+        fields = [
+            ("schemaVersion", event["schemaVersion"]),
+            ("eventId", event["eventId"]),
+            ("instrumentId", event["instrumentId"]),
+            ("provider", event["provider"]),
+            ("feed", event["feed"]),
+            ("eventType", event["eventType"]),
+            ("occurredAt", event["occurredAt"]),
+            ("receivedAt", event["receivedAt"]),
+            ("sequence", event["sequence"]),
+            ("revision", event["revision"]),
+        ]
+        prefix = ",".join(
+            f"{json.dumps(name)}:{json.dumps(value, separators=(',', ':'))}"
+            for name, value in fields
+        )
+        values = str(event["valuesJson"])[1:-1]
+        return "{" + prefix + ("," + values if values else "") + "}"
 
 
 def c_event(
@@ -552,13 +596,18 @@ class TestCsKeyContract(unittest.TestCase):
     def test_the_key_base_is_cs_hash_tagged_base(self) -> None:
         self.assertEqual(market_key_base("i2s"), "{i2s:market}")
 
-    def test_the_three_keys_are_cs_three_keys(self) -> None:
+    def test_the_five_keys_are_cs_five_keys(self) -> None:
         self.assertEqual(stream_key("i2s"), "{i2s:market}:events")
         self.assertEqual(deduplication_key("i2s"), "{i2s:market}:seen")
         self.assertEqual(
             latest_key("i2s", C_INSTRUMENT_ID, "QUOTE"),
             "{i2s:market}:latest:8a35e6b5-cf84-4f63-920d-57c1f1b95df0:QUOTE",
         )
+        self.assertEqual(
+            recent_bars_key("i2s", C_INSTRUMENT_ID),
+            "{i2s:market}:bars:8a35e6b5-cf84-4f63-920d-57c1f1b95df0:1m",
+        )
+        self.assertEqual(bar_updates_channel("i2s"), "{i2s:market}:bar-updates")
 
     def test_the_keys_share_one_hash_slot_so_cs_lua_stays_atomic_in_cluster_mode(self) -> None:
         tag = re.compile(r"\{([^}]*)\}")
@@ -568,6 +617,8 @@ class TestCsKeyContract(unittest.TestCase):
                 stream_key("i2s"),
                 deduplication_key("i2s"),
                 latest_key("i2s", C_INSTRUMENT_ID, "BAR_1M"),
+                recent_bars_key("i2s", C_INSTRUMENT_ID),
+                bar_updates_channel("i2s"),
             )
         }
         self.assertEqual(tags, {"i2s:market"})
@@ -582,10 +633,10 @@ class TestCsKeyContract(unittest.TestCase):
             with self.assertRaisesRegex(RealtimeIngestError, "blank"):
                 market_key_base(bad)
 
-    def test_the_key_roles_are_cs_three_lua_keys_in_cs_order(self) -> None:
-        """KEYS[1] stream, KEYS[2] hash, KEYS[3] set -- `RedisMarketEventPublisher.java:33-44`."""
+    def test_the_key_roles_are_cs_five_lua_keys_in_cs_order(self) -> None:
+        """C's stream, latest, dedup, recent-bars and notification roles stay ordered."""
 
-        self.assertEqual(C_PUBLISH_KEY_ROLES, ("stream", "hash", "set"))
+        self.assertEqual(C_PUBLISH_KEY_ROLES, ("stream", "hash", "set", "zset", "channel"))
 
     def test_the_stream_fields_are_cs_xadd_fields_in_cs_order(self) -> None:
         self.assertEqual(

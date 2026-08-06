@@ -3,7 +3,7 @@
 The gap this closes
 -------------------
 C's market gateway publishes every market event through
-``RedisMarketEventPublisher`` -- Redis Streams, one Lua script, three keys.  D's
+``RedisMarketEventPublisher`` -- Redis Streams, one Lua script, five keys.  D's
 realtime ingest (:mod:`market_pipeline_lib.realtime_ingest`) consumed **SQS**.
 No event C emits could ever reach D; the two halves of D90 were never connected,
 whatever either side's tests said.
@@ -101,18 +101,26 @@ __all__ = [
     "RedisStreamDecodeError",
     "decode_stream_entry",
     "deduplication_key",
+    "bar_updates_channel",
     "latest_key",
     "market_key_base",
+    "recent_bars_key",
     "stream_key",
 ]
 
 LOGGER = logging.getLogger("market_pipeline_lib.redis_ingest")
 
-#: The three ``KEYS`` of C's publish script and the Redis type each must have
-#: (``RedisMarketEventPublisher.java:33-44``).  Pinned because the script asserts
+#: The five ``KEYS`` of C's publish script and their Redis roles
+#: (``RedisMarketEventPublisher.java:36-53``).  Pinned because the script asserts
 #: the types before it writes anything, so a D-side helper that built the keys in
 #: another order would make C's own script fail closed against its own data.
-C_PUBLISH_KEY_ROLES: tuple[str, str, str] = ("stream", "hash", "set")
+C_PUBLISH_KEY_ROLES: tuple[str, str, str, str, str] = (
+    "stream",
+    "hash",
+    "set",
+    "zset",
+    "channel",
+)
 
 #: Every field C's ``XADD`` writes, in C's order
 #: (``RedisMarketEventPublisher.java:50-64``).  These are also the wire names of
@@ -173,7 +181,7 @@ def market_key_base(key_prefix: str) -> str:
     if "{" in key_prefix or "}" in key_prefix:
         raise RealtimeIngestError(
             f"key_prefix {key_prefix!r} must not contain Redis hash-tag braces: C adds the "
-            "hash tag itself, and a second one would split its three keys across cluster "
+            "hash tag itself, and a second one would split its five keys across cluster "
             "slots and break the atomicity of its publish script"
         )
     return "{" + key_prefix + ":market}"
@@ -199,6 +207,20 @@ def latest_key(key_prefix: str, instrument_id: str, event_type: str) -> str:
     if not str(event_type).strip():
         raise RealtimeIngestError("event_type must not be blank")
     return f"{market_key_base(key_prefix)}:latest:{instrument_id}:{event_type}"
+
+
+def recent_bars_key(key_prefix: str, instrument_id: str) -> str:
+    """C's bounded one-minute bar projection -- ``RedisMarketEventPublisher.java:363-366``."""
+
+    if not str(instrument_id).strip():
+        raise RealtimeIngestError("instrument_id must not be blank")
+    return f"{market_key_base(key_prefix)}:bars:{instrument_id}:1m"
+
+
+def bar_updates_channel(key_prefix: str) -> str:
+    """C's one-minute bar notification channel -- ``RedisMarketEventPublisher.java:368-370``."""
+
+    return f"{market_key_base(key_prefix)}:bar-updates"
 
 
 # --------------------------------------------------------------------------------------
