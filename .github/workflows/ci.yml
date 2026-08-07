@@ -343,8 +343,11 @@ jobs:
         uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
         with:
           path: ./
-          base: ""
-          head: HEAD
+          # PRs scan only commits introduced by the head branch; develop pushes
+          # scan only the pushed range. Scanning from an empty base traverses
+          # unrelated historical fixtures and repeatedly reports old secrets.
+          base: "${{ github.event.pull_request.base.sha || github.event.before }}"
+          head: "${{ github.event.pull_request.head.sha || github.sha }}"
           # No `--fail` here: the action already passes it, and trufflehog
           # rejects the repeated flag with
           # "flag 'fail' cannot be repeated", which fails the gate on argument
