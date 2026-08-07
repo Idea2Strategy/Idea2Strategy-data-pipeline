@@ -49,8 +49,10 @@ from .catalog import (
 )
 from .definitions import (
     FEATURE_DEFINITION_SCHEMA_VERSION,
+    PRODUCTION_RSI_14_RESOLUTIONS,
     FeatureDefinition,
     FeatureDefinitionRegistry,
+    production_rsi_14_definition,
 )
 from .errors import (
     DefinitionIntegrityError,
@@ -108,6 +110,7 @@ __all__ = [
     "OFFICIAL_FEATURE_CATALOG_HASH",
     "OFFICIAL_FEATURE_CATALOG_VERSION",
     "PRECISION_RULES_VERSION",
+    "PRODUCTION_RSI_14_RESOLUTIONS",
     "PRICE_FIELDS",
     "QUANTUM",
     "BarPoint",
@@ -148,5 +151,6 @@ __all__ = [
     "known_calculators",
     "materialization_version",
     "parse_feature_materialization_version",
+    "production_rsi_14_definition",
     "quantize",
 ]

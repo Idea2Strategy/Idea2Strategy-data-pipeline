@@ -31,7 +31,11 @@ from market_pipeline_lib.features import (
     MaterializationRequest,
     SourceObject,
 )
-from market_pipeline_lib.features.definitions import OFFICIAL_RSI_14_ID
+from market_pipeline_lib.features.definitions import (
+    OFFICIAL_RSI_14_ID,
+    PRODUCTION_ELEMENT_CATALOG_ID,
+    PRODUCTION_RSI_14_RESOLUTIONS,
+)
 from market_pipeline_lib.features.hashing import canonical_sha256, iso_utc
 from market_pipeline_lib.features.output import FeatureOutputPublisher
 from market_pipeline_lib.features.tables import FeatureCatalog
@@ -114,6 +118,13 @@ def feature_output_feed_id(definition: FeatureDefinition) -> str:
 def feature_output_feed_code(definition: FeatureDefinition) -> str:
     if definition.id == OFFICIAL_RSI_14_ID:
         return "FEATURE_RSI_14_1M_RSI_1_0_0"
+    if (
+        definition.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+        and definition.feature_code == "RSI_14"
+        and definition.calculator_version == "rsi:1.0.0"
+        and definition.resolution in PRODUCTION_RSI_14_RESOLUTIONS
+    ):
+        return f"FEATURE_RSI_14_{_token(definition.resolution)}_RSI_1_0_0"
     parameters = "_".join(
         str(value) for _, value in sorted(definition.normalized_parameters.items()) if isinstance(value, int)
     )
@@ -130,7 +141,12 @@ def feature_output_feed_code(definition: FeatureDefinition) -> str:
 
 
 def feature_output_feed_version(definition: FeatureDefinition) -> str:
-    if definition.id == OFFICIAL_RSI_14_ID:
+    if definition.id == OFFICIAL_RSI_14_ID or (
+        definition.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+        and definition.feature_code == "RSI_14"
+        and definition.calculator_version == "rsi:1.0.0"
+        and definition.resolution in PRODUCTION_RSI_14_RESOLUTIONS
+    ):
         return "rsi-1.0.0+feature-series.parquet.v1"
     return f"{definition.feature_code.lower()}-{definition.calculator_version}+{FEATURE_SERIES_SCHEMA_VERSION}"
 

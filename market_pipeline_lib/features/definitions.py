@@ -43,8 +43,10 @@ from .tables import FEATURE_DEFINITIONS, FeatureCatalog
 
 __all__ = [
     "FEATURE_DEFINITION_SCHEMA_VERSION",
+    "PRODUCTION_RSI_14_RESOLUTIONS",
     "FeatureDefinition",
     "FeatureDefinitionRegistry",
+    "production_rsi_14_definition",
 ]
 
 
@@ -62,6 +64,26 @@ OFFICIAL_RSI_14_PARAMETERS = {
     "input_adjustment": "SPLIT_DIVIDEND_ADJUSTED",
     "calendar_id": "XNYS",
 }
+PRODUCTION_RSI_14_RESOLUTIONS = ("30m", "1h", "4h", "1d")
+PRODUCTION_ELEMENT_CATALOG_ID = "0f4a0000-0000-4000-8000-000000000001"
+
+
+def production_rsi_14_definition(resolution: str) -> FeatureDefinition:
+    """The immutable RSI_14 definition for one selectable backtest resolution."""
+
+    if resolution not in PRODUCTION_RSI_14_RESOLUTIONS:
+        raise InvalidFeatureParameters(
+            f"production RSI_14 resolution must be one of {PRODUCTION_RSI_14_RESOLUTIONS}"
+        )
+    return FeatureDefinition._assemble(
+        element_catalog_version_id=PRODUCTION_ELEMENT_CATALOG_ID,
+        feature_code="RSI_14",
+        calculator_version="rsi:1.0.0",
+        resolution=resolution,
+        normalized_parameters=OFFICIAL_RSI_14_PARAMETERS,
+        output_value_type="NUMBER",
+        required_history_points=15,
+    )
 
 
 def _require_uuid_like(value: Any, label: str) -> str:
@@ -248,7 +270,7 @@ class FeatureDefinition:
     def canonical_payload(self) -> str:
         """The exact bytes `definition_hash` is taken over."""
 
-        return canonical_json(self._payload())
+        return str(canonical_json(self._payload()))
 
     @property
     def feature_definition_version(self) -> str:
@@ -262,9 +284,20 @@ class FeatureDefinition:
         return f"fdv1:{self.feature_code}:{self.calculator_version}:{self.definition_hash[:16]}"
 
     def calculator(self) -> Any:
-        if self._is_official_rsi_14():
+        if self._uses_rsi_14_adapter():
             return _OfficialRsi14CalculatorAdapter()
         return get_calculator(self.feature_code, self.calculator_version)
+
+    def _uses_rsi_14_adapter(self) -> bool:
+        return self._is_official_rsi_14() or (
+            self.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+            and self.feature_code == "RSI_14"
+            and self.calculator_version == "rsi:1.0.0"
+            and self.resolution in PRODUCTION_RSI_14_RESOLUTIONS
+            and self.normalized_parameters == OFFICIAL_RSI_14_PARAMETERS
+            and self.output_value_type == "NUMBER"
+            and self.required_history_points == 15
+        )
 
     def _is_official_rsi_14(self) -> bool:
         return (
@@ -382,7 +415,7 @@ class FeatureDefinitionRegistry:
     def _row_by_id(self, definition_id: str) -> dict[str, Any] | None:
         for row in self._catalog.records(FEATURE_DEFINITIONS):
             if str(row.get("id")) == definition_id:
-                return row
+                return dict(row)
         return None
 
     def get(self, definition_hash: str) -> FeatureDefinition:
