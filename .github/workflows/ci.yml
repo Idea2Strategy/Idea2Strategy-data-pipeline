@@ -21,7 +21,7 @@ on:
   pull_request:
     branches: [develop]
   push:
-    branches: [develop]
+    branches: [develop, main]
 
 permissions:
   contents: read
@@ -239,6 +239,8 @@ jobs:
       - name: Build the production ARM64 image
         run: >-
           docker buildx build --platform linux/arm64 --load
+          --cache-from type=gha,scope=pipeline-worker-arm64
+          --cache-to type=gha,mode=max,scope=pipeline-worker-arm64
           --tag idea2strategy-pipeline-worker:ci .
       - name: Verify image architecture, imports and removed Perl runtime
         run: |
@@ -369,6 +371,7 @@ jobs:
   # ---------------------------------------------------------------- gate 8
   gate8-db-integration:
     name: gate8-db-integration (PostgreSQL 16 + LocalStack)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # PostgreSQL is NOT a service here: `tests/conftest.py` starts its own
@@ -464,6 +467,7 @@ jobs:
   # ---------------------------------------------------------------- gate 9
   gate9-localstack-storage:
     name: gate9-localstack-storage (S3 object store + SQS)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # Covers BOTH LocalStack-backed surfaces, because they share one endpoint
