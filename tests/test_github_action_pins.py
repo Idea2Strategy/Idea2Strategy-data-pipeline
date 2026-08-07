@@ -38,3 +38,12 @@ def test_workflow_actions_use_reviewed_immutable_pins() -> None:
             )
             observed += 1
     assert observed > 0
+
+
+def test_trufflehog_scans_only_the_pull_request_commit_range() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert 'base: "${{ github.event.pull_request.base.sha || github.event.before }}"' in workflow
+    assert 'head: "${{ github.event.pull_request.head.sha || github.sha }}"' in workflow
+    assert 'base: ""' not in workflow
