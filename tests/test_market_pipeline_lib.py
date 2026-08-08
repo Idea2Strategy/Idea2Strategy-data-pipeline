@@ -48,6 +48,7 @@ from market_pipeline_lib.processing import (
     normalize_provider_frame,
 )
 from market_pipeline_lib.storage import LocalObjectStore, S3ObjectStore
+from market_pipeline_lib.watermarks import InMemoryWatermarkRepository
 from pipeline_state import PipelineStateStore
 from d_storage_testkit import FakeS3Client
 
@@ -920,7 +921,15 @@ def write_instrument_map(root: Path) -> Path:
     return path
 
 
-def build_engine(root: Path, catalog=None, *, sessions=(), revision=None, dry_run=False):
+def build_engine(
+    root: Path,
+    catalog=None,
+    *,
+    sessions=(),
+    revision=None,
+    dry_run=False,
+    watermark_repository=None,
+):
     """A `MarketPipelineEngine` bound to whichever catalog the caller supplies."""
 
     config = PipelineConfig(
@@ -933,7 +942,12 @@ def build_engine(root: Path, catalog=None, *, sessions=(), revision=None, dry_ru
         revision=revision,
         dry_run=dry_run,
     )
-    return MarketPipelineEngine(config, catalog=catalog, source=FakeSource(list(sessions)))
+    return MarketPipelineEngine(
+        config,
+        catalog=catalog,
+        source=FakeSource(list(sessions)),
+        watermark_repository=watermark_repository,
+    )
 
 
 def day_group(engine, session: str, *, symbol: str = "AAPL", bars: int = 13):
@@ -1050,6 +1064,20 @@ def _publish_two_days(engine, contract):
         contract,
         2025,
         [day_group(engine, "2025-01-06"), day_group(engine, "2025-01-07")],
+    )
+
+
+def test_available_publication_advances_durable_feed_watermark():
+    repository = InMemoryWatermarkRepository()
+    with temporary_root() as temporary:
+        engine = build_engine(Path(temporary), watermark_repository=repository)
+        contract = DATASET_CONTRACTS[("raw", "RAW", "30m")]
+        _publish_two_days(engine, contract)
+
+    watermark = repository.load(engine.feed_ids[contract.feed_code])
+    assert watermark is not None
+    assert watermark.position.source_event_at == datetime(
+        2025, 1, 7, 21, 0, tzinfo=timezone.utc
     )
 
 
