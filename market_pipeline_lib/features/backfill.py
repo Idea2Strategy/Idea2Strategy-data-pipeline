@@ -31,6 +31,8 @@ undeclared holes in it is worse than a backfill that refuses to start.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,12 +80,20 @@ class BackfillCommand:
 
         The worker derives the pipeline run and the materialization row from this, and
         rejects a reused id whose inputs changed. Deriving it from the request's own
-        identity is therefore what makes an interrupted backfill safe to resume.
+        identity is therefore what makes an interrupted backfill safe to resume. Hashing
+        the canonical identity also keeps the envelope inside the worker's 128-character
+        identifier contract.
         """
-        return (
-            f"feature-backfill:{self.definition_hash}:{self.instrument_id}"
-            f":{_stamp(self.period_start)}:{_stamp(self.period_end)}"
-        )
+        identity = json.dumps(
+            [
+                self.definition_hash,
+                self.instrument_id,
+                _stamp(self.period_start),
+                _stamp(self.period_end),
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"feature-backfill:{hashlib.sha256(identity).hexdigest()}"
 
     def payload(self) -> dict[str, Any]:
         """The command payload, with exactly the fields the worker accepts."""

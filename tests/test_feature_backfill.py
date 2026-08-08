@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 from apps.pipeline_worker.backfill_features import _catalog, _instant, _summary, main, run
+from apps.pipeline_worker.commands import Command
 from market_pipeline_lib.catalog import StorageObjectsPolicy
 from market_pipeline_lib.contracts import ADJUSTED_FEED, stable_shard_key
 from market_pipeline_lib.features.backfill import (
@@ -358,6 +360,15 @@ class TestTheCommandIsResumable:
         ).commands[0]
 
         assert whole.command_id != clamped.command_id
+
+    def test_the_command_id_fits_the_worker_identifier_contract(self) -> None:
+        command = plan_feature_backfill(_one_month(), [_definition("30m")]).commands[0]
+
+        assert len(command.command_id) <= 128
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", command.command_id)
+        assert Command.parse(command.message(), fallback_command_id="fallback").command_id == (
+            command.command_id
+        )
 
     def test_the_message_names_the_worker_command(self) -> None:
         message = plan_feature_backfill(_one_month(), [_definition("30m")]).commands[0].message()
