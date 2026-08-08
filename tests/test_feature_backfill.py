@@ -11,6 +11,7 @@ import pytest
 
 from apps.pipeline_worker.backfill_features import _catalog, _instant, _summary, main, run
 from market_pipeline_lib.catalog import StorageObjectsPolicy
+from market_pipeline_lib.contracts import ADJUSTED_FEED, stable_shard_key
 from market_pipeline_lib.features.backfill import (
     MAX_SOURCE_OBJECTS_PER_COMMAND,
     plan_feature_backfill,
@@ -22,7 +23,10 @@ from market_pipeline_lib.features.definitions import (
 
 INSTRUMENT = "00000000-0000-4000-8000-000000000301"
 OTHER_INSTRUMENT = "00000000-0000-4000-8000-000000000302"
+UNRELATED_SHARD_INSTRUMENT = "00000000-0000-4000-8000-000000000303"
 CATALOG_VERSION = "0f4a0000-0000-4000-8000-000000000001"
+ADJUSTED_FEED_ID = "00000000-0000-4000-8000-000000000401"
+RAW_FEED_ID = "00000000-0000-4000-8000-000000000402"
 
 def _definition(resolution: str) -> FeatureDefinition:
     """The real production RSI_14 definition at one of the four strategy clocks.
@@ -41,6 +45,15 @@ class FakeCatalog:
     """Only the two reads the planner performs, so the plan is tested and not the catalog."""
 
     def __init__(self) -> None:
+        self.feeds: list[dict[str, Any]] = [
+            {"id": ADJUSTED_FEED_ID, "code": ADJUSTED_FEED},
+            {"id": RAW_FEED_ID, "code": "ALPACA_SIP_RAW_30M"},
+        ]
+        self.instruments: list[dict[str, Any]] = [
+            {"id": INSTRUMENT},
+            {"id": OTHER_INSTRUMENT},
+            {"id": UNRELATED_SHARD_INSTRUMENT},
+        ]
         self.manifests: list[dict[str, Any]] = []
         self.objects: list[dict[str, Any]] = []
         self.materializations: list[dict[str, Any]] = []
@@ -52,15 +65,18 @@ class FakeCatalog:
         resolution: str,
         start: str,
         end: str,
-        instrument_id: str = INSTRUMENT,
+        instrument_id: str | None = INSTRUMENT,
+        feed_id: str = ADJUSTED_FEED_ID,
+        data_layer: str = "ADJUSTED",
         status: str = "AVAILABLE",
         revision_number: int = 1,
     ) -> str:
         self.manifests.append({
             "id": manifest_id,
+            "feed_id": feed_id,
             "instrument_id": instrument_id,
             "resolution": resolution,
-            "data_layer": "ADJUSTED",
+            "data_layer": data_layer,
             "status": status,
             "revision_number": revision_number,
             "period_start": _utc(start),
@@ -76,6 +92,9 @@ class FakeCatalog:
         start: str,
         end: str,
         object_kind: str = "MARKET_BARS",
+        shard_key: str | None = None,
+        min_instrument_id: str | None = None,
+        max_instrument_id: str | None = None,
     ) -> str:
         self.objects.append({
             "id": object_id,
@@ -83,6 +102,9 @@ class FakeCatalog:
             "object_kind": object_kind,
             "period_start": _utc(start),
             "period_end": _utc(end),
+            "shard_key": shard_key or INSTRUMENT,
+            "min_instrument_id": min_instrument_id,
+            "max_instrument_id": max_instrument_id,
         })
         return object_id
 
@@ -90,6 +112,8 @@ class FakeCatalog:
         self, table: str, *, where: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         source = {
+            "market_data.feeds": self.feeds,
+            "market_data.instruments": self.instruments,
             "market_data.dataset_manifests": self.manifests,
             "market_data.dataset_objects": self.objects,
             "market_data.feature_materializations": self.materializations,
@@ -199,6 +223,68 @@ class TestOneCommandPerInstrumentAndDefinition:
 
         assert command.period_start == _utc("2016-01-10T00:00:00+00:00")
         assert command.period_end == _utc("2016-01-20T00:00:00+00:00")
+
+
+class TestCanonicalShardedHistoricalManifests:
+    @staticmethod
+    def _catalog() -> FakeCatalog:
+        catalog = FakeCatalog()
+        catalog.add_manifest(
+            "manifest-sharded",
+            resolution="30m",
+            instrument_id=None,
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+        )
+        for shard in ("s00-of-2", "s01-of-2"):
+            catalog.add_object(
+                f"object-{shard}",
+                manifest_id="manifest-sharded",
+                start="2016-01-01T00:00:00+00:00",
+                end="2016-02-01T00:00:00+00:00",
+                shard_key=shard,
+            )
+        return catalog
+
+    def test_catalog_instruments_are_planned_from_multi_instrument_manifests(self) -> None:
+        plan = plan_feature_backfill(self._catalog(), [_definition("30m")])
+
+        assert {command.instrument_id for command in plan.commands} == {
+            INSTRUMENT,
+            OTHER_INSTRUMENT,
+            UNRELATED_SHARD_INSTRUMENT,
+        }
+        assert plan.warnings == ()
+
+    def test_each_instrument_receives_only_its_stable_shard(self) -> None:
+        plan = plan_feature_backfill(self._catalog(), [_definition("30m")])
+
+        for command in plan.commands:
+            expected = stable_shard_key(command.instrument_id, 2)
+            assert command.source_dataset_object_ids == (f"object-{expected}",)
+
+    def test_raw_manifests_are_not_mixed_into_adjusted_feature_inputs(self) -> None:
+        catalog = self._catalog()
+        catalog.add_manifest(
+            "manifest-raw",
+            resolution="30m",
+            instrument_id=None,
+            feed_id=RAW_FEED_ID,
+            data_layer="RAW",
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+        )
+        catalog.add_object(
+            "object-raw",
+            manifest_id="manifest-raw",
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+            shard_key="s00-of-2",
+        )
+
+        plan = plan_feature_backfill(catalog, [_definition("30m")])
+
+        assert all("object-raw" not in item.source_dataset_object_ids for item in plan.commands)
 
 
 class TestTheCommandIsResumable:

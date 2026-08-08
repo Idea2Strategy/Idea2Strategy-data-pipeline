@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from market_pipeline_lib.contracts import ADJUSTED_FEED, stable_shard_key
 from market_pipeline_lib.features.definitions import FeatureDefinition
 from market_pipeline_lib.features.tables import FeatureCatalog
 
@@ -156,7 +157,7 @@ def plan_feature_backfill(
     for definition in definitions:
         manifests = _available_bar_manifests(catalog, definition.resolution)
         instruments = sorted(
-            {str(row["instrument_id"]) for row in manifests}
+            _covered_instruments(catalog, manifests)
             if wanted_instruments is None
             else wanted_instruments
         )
@@ -173,7 +174,12 @@ def plan_feature_backfill(
             continue
 
         for instrument_id in instruments:
-            owned = [row for row in manifests if str(row["instrument_id"]) == instrument_id]
+            owned = [
+                row
+                for row in manifests
+                if row.get("instrument_id") is None
+                or str(row["instrument_id"]) == instrument_id
+            ]
             if not owned:
                 warnings.append(BackfillWarning(
                     code="NO_COVERAGE",
@@ -202,7 +208,7 @@ def plan_feature_backfill(
                 ))
                 continue
 
-            objects = _authoritative_objects(catalog, owned, start, end)
+            objects = _authoritative_objects(catalog, owned, instrument_id, start, end)
             if not objects:
                 warnings.append(BackfillWarning(
                     code="NO_SOURCE_OBJECTS",
@@ -267,10 +273,16 @@ def _available_bar_manifests(catalog: FeatureCatalog, resolution: str) -> list[d
     manifest that is not the current AVAILABLE revision, so planning against a superseded
     one would produce a command that can only fail.
     """
+    adjusted_feed_ids = {
+        str(row["id"])
+        for row in catalog.records("market_data.feeds")
+        if row.get("code") == ADJUSTED_FEED
+    }
     rows = [
         row
         for row in catalog.records("market_data.dataset_manifests", where={"resolution": resolution})
-        if row.get("status") == _AVAILABLE and row.get("instrument_id") is not None
+        if row.get("status") == _AVAILABLE
+        and str(row.get("feed_id")) in adjusted_feed_ids
     ]
     current: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
@@ -287,9 +299,48 @@ def _available_bar_manifests(catalog: FeatureCatalog, resolution: str) -> list[d
     return list(current.values())
 
 
+def _covered_instruments(
+    catalog: FeatureCatalog, manifests: Sequence[Mapping[str, Any]]
+) -> set[str]:
+    covered = {
+        str(row["instrument_id"])
+        for row in manifests
+        if row.get("instrument_id") is not None
+    }
+    multi_instrument = [row for row in manifests if row.get("instrument_id") is None]
+    if not multi_instrument:
+        return covered
+    sharded_objects = [
+        relation
+        for manifest in multi_instrument
+        for relation in catalog.records(
+            "market_data.dataset_objects", where={"dataset_manifest_id": str(manifest["id"])}
+        )
+        if relation.get("object_kind") == _MARKET_BARS
+    ]
+    for instrument in catalog.records("market_data.instruments"):
+        instrument_id = str(instrument["id"])
+        if any(
+            _object_targets_instrument(relation, instrument_id)
+            for relation in sharded_objects
+        ):
+            covered.add(instrument_id)
+    return covered
+
+
+def _object_targets_instrument(row: Mapping[str, Any], instrument_id: str) -> bool:
+    shard_key = str(row.get("shard_key", ""))
+    head, separator, count_text = shard_key.rpartition("-of-")
+    if not separator or not head.startswith("s") or not count_text.isdigit():
+        return False
+    shard_count = int(count_text)
+    return shard_count > 0 and stable_shard_key(instrument_id, shard_count) == shard_key
+
+
 def _authoritative_objects(
     catalog: FeatureCatalog,
     manifests: Sequence[Mapping[str, Any]],
+    instrument_id: str,
     start: datetime,
     end: datetime,
 ) -> tuple[tuple[datetime, datetime, str], ...]:
@@ -304,6 +355,10 @@ def _authoritative_objects(
             "market_data.dataset_objects", where={"dataset_manifest_id": str(manifest["id"])}
         ):
             if row.get("object_kind") != _MARKET_BARS:
+                continue
+            if manifest.get("instrument_id") is None and not _object_targets_instrument(
+                row, instrument_id
+            ):
                 continue
             row_start = _time(row["period_start"])
             row_end = _time(row["period_end"])

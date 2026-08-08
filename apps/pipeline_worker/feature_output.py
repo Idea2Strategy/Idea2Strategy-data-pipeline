@@ -21,7 +21,12 @@ from uuid import UUID
 import pyarrow.parquet as pq
 
 from apps.common.errors import MalformedEventError, PortNotConfiguredError
-from market_pipeline_lib.contracts import SCHEMA_VERSION, bar_schema, deterministic_uuid
+from market_pipeline_lib.contracts import (
+    SCHEMA_VERSION,
+    bar_schema,
+    deterministic_uuid,
+    stable_shard_key,
+)
 from market_pipeline_lib.features import (
     FEATURE_SERIES_SCHEMA_VERSION,
     BarPoint,
@@ -97,6 +102,22 @@ def _uuid(value: Any, label: str) -> str:
 
 def _token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
+
+
+def _source_targets_instrument(
+    manifest: Mapping[str, Any], relation: Mapping[str, Any], instrument_id: str
+) -> bool:
+    manifest_instrument = manifest.get("instrument_id")
+    if manifest_instrument is not None:
+        return str(manifest_instrument) == instrument_id
+    shard_key = str(relation.get("shard_key", ""))
+    match = re.fullmatch(r"s\d+-of-(\d+)", shard_key)
+    if match is None or int(match.group(1)) < 1:
+        raise MalformedEventError(
+            "multi-instrument source must declare a canonical stable shard key"
+        )
+    expected_shard: str = stable_shard_key(instrument_id, int(match.group(1)))
+    return expected_shard == shard_key
 
 
 def feature_output_provider_id() -> str:
@@ -222,8 +243,8 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} is not MARKET_BARS")
             if manifest["status"] != "AVAILABLE":
                 raise MalformedEventError(f"source {object_id} is not AVAILABLE")
-            if str(manifest.get("instrument_id")) != instrument_id:
-                raise MalformedEventError(f"source {object_id} belongs to another instrument")
+            if not _source_targets_instrument(manifest, relation, instrument_id):
+                raise MalformedEventError(f"source {object_id} belongs to another instrument shard")
             if manifest["resolution"] != definition.resolution:
                 raise MalformedEventError(
                     f"source {object_id} resolution does not match the definition"
@@ -291,6 +312,8 @@ class CanonicalFeatureSourceReader:
             ):
                 if relation["object_kind"] != "MARKET_BARS":
                     continue
+                if not _source_targets_instrument(manifest, relation, instrument_id):
+                    continue
                 relation_start = _timestamp(relation["period_start"], "dataset_object.period_start")
                 relation_end = _timestamp(relation["period_end"], "dataset_object.period_end")
                 if relation_start < period_end and relation_end > period_start:
@@ -331,8 +354,8 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} is not MARKET_BARS")
             if manifest["status"] != "AVAILABLE" or receipt["status"] != "AVAILABLE":
                 raise MalformedEventError(f"source {object_id} is not AVAILABLE")
-            if str(manifest.get("instrument_id")) != instrument_id:
-                raise MalformedEventError(f"source {object_id} belongs to another instrument")
+            if not _source_targets_instrument(manifest, relation, instrument_id):
+                raise MalformedEventError(f"source {object_id} belongs to another instrument shard")
             if manifest["resolution"] != definition.resolution:
                 raise MalformedEventError(f"source {object_id} resolution does not match the definition")
             if manifest["schema_version"] != SCHEMA_VERSION or receipt["schema_version"] != SCHEMA_VERSION:
@@ -395,9 +418,7 @@ class CanonicalFeatureSourceReader:
                         decoded_rows += batch.num_rows
                         for row_index, row in enumerate(batch.to_pylist(), start=decoded_rows - batch.num_rows):
                             if str(row["instrument_id"]) != instrument_id:
-                                raise MalformedEventError(
-                                    f"source {object_id} row {row_index} belongs to another instrument"
-                                )
+                                continue
                             moment = _timestamp(
                                 row["bar_start_at"], f"source {object_id} row {row_index}.bar_start_at"
                             )
