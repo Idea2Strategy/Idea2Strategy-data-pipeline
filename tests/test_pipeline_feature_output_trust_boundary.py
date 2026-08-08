@@ -50,6 +50,7 @@ CURRENT_SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000002"
 CURRENT_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000002"
 PERIOD_START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
 PERIOD_END = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+LEGACY_LOADER_SCHEMA_VERSION = "market-bars/1"
 
 
 def definition() -> FeatureDefinition:
@@ -84,6 +85,43 @@ def canonical_bar_table() -> pa.Table:
     )
 
 
+def legacy_loader_bar_table(*, derived: bool) -> pa.Table:
+    canonical = canonical_bar_table()
+    fields = list(canonical.schema.remove_metadata())
+    arrays = list(canonical.columns)
+    if derived:
+        fields.extend(
+            [
+                pa.field("source_bar_count", pa.int16(), nullable=False),
+                pa.field("source_minutes", pa.int16(), nullable=False),
+            ]
+        )
+        arrays.extend(
+            [
+                pa.array([1, 1, 1], type=pa.int16()),
+                pa.array([60, 60, 60], type=pa.int16()),
+            ]
+        )
+    schema = pa.schema(
+        fields,
+        metadata={
+            b"schema_version": LEGACY_LOADER_SCHEMA_VERSION.encode("ascii"),
+            b"processing_version": b"market-loader/1.0.0",
+            b"provider": b"alpaca",
+            b"feed": b"sip",
+            b"adjustment": b"raw",
+            b"session_scope": b"regular",
+            b"resolution": b"1m",
+            b"period_start": b"2026-01-05",
+            b"period_end": b"2026-01-06",
+            b"revision": b"1",
+            b"manifest_id": SOURCE_MANIFEST.encode("ascii"),
+            b"created_at": b"2026-01-05T15:00:00+00:00",
+        },
+    )
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def sharded_bar_table() -> pa.Table:
     target = canonical_bar_table()
     moments = [PERIOD_START + timedelta(minutes=offset) for offset in range(3)]
@@ -116,6 +154,7 @@ def seed_catalog(
     source_table: pa.Table | None = None,
     manifest_instrument_id: str | None = INSTRUMENT,
     relation_shard_key: str = INSTRUMENT,
+    source_schema_version: str = SCHEMA_VERSION,
     catalog: Any | None = None,
 ) -> tuple[Any, LocalObjectStore, LocalObjectStore, FeatureDefinition]:
     catalog = catalog or LocalCatalog(tmp_path / "catalog")
@@ -204,7 +243,7 @@ def seed_catalog(
             "status": "AVAILABLE",
             "period_start": PERIOD_START.isoformat(),
             "period_end": PERIOD_END.isoformat(),
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": source_schema_version,
             "dataset_hash": "a" * 64,
             "supersedes_manifest_id": None,
             "created_at": PERIOD_END.isoformat(),
@@ -224,7 +263,7 @@ def seed_catalog(
             "file_format": "PARQUET",
             "compression_codec": "ZSTD",
             "media_type": "application/vnd.apache.parquet",
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": source_schema_version,
             "row_count": table.num_rows,
             "period_start": PERIOD_START.isoformat(),
             "period_end": PERIOD_END.isoformat(),
@@ -373,6 +412,50 @@ def test_multi_instrument_shard_materializes_only_the_requested_instrument(
     result = port.materialize(payload(published), command_id="feature-command-sharded")
 
     assert result["row_count"] == 2
+
+
+@pytest.mark.parametrize("derived", [False, True])
+def test_exact_legacy_loader_bar_schemas_are_accepted(tmp_path: Path, derived: bool) -> None:
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=legacy_loader_bar_table(derived=derived),
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    result = port.materialize(payload(published), command_id=f"legacy-loader-{derived}")
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["row_count"] == 2
+
+
+def test_legacy_loader_schema_with_an_unknown_field_is_rejected(tmp_path: Path) -> None:
+    table = legacy_loader_bar_table(derived=True).append_column(
+        "unexpected", pa.array([1, 1, 1], type=pa.int8())
+    )
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=table,
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="Parquet schema"):
+        port.materialize(payload(published), command_id="legacy-loader-unknown-field")
+
+
+def test_legacy_loader_schema_requires_matching_producer_metadata(tmp_path: Path) -> None:
+    table = legacy_loader_bar_table(derived=False)
+    metadata = {**(table.schema.metadata or {}), b"provider": b"unknown"}
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=table.replace_schema_metadata(metadata),
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="Parquet schema"):
+        port.materialize(payload(published), command_id="legacy-loader-wrong-metadata")
 
 
 def test_multi_instrument_manifest_rejects_an_unrelated_shard(tmp_path: Path) -> None:

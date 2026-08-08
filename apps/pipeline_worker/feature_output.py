@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from apps.common.errors import MalformedEventError, PortNotConfiguredError
@@ -54,6 +55,50 @@ MAX_FEATURE_SOURCE_OBJECTS = 512
 MAX_FEATURE_SOURCE_ROWS = 2_000_000
 MAX_FEATURE_SOURCE_BYTES = 512 * 1024 * 1024
 FEATURE_READ_BATCH_ROWS = 65_536
+LEGACY_LOADER_SCHEMA_VERSION = "market-bars/1"
+SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS = frozenset(
+    {SCHEMA_VERSION, LEGACY_LOADER_SCHEMA_VERSION}
+)
+
+
+def _legacy_loader_bar_schemas() -> tuple[pa.Schema, pa.Schema]:
+    base = bar_schema(False).remove_metadata()
+    derived = pa.schema(
+        [
+            *base,
+            pa.field("source_bar_count", pa.int16(), nullable=False),
+            pa.field("source_minutes", pa.int16(), nullable=False),
+        ]
+    )
+    return base, derived
+
+
+def _matches_source_parquet_schema(
+    actual: pa.Schema,
+    *,
+    manifest: Mapping[str, Any],
+) -> bool:
+    schema_version = str(manifest["schema_version"])
+    if schema_version == SCHEMA_VERSION:
+        return bool(actual.equals(bar_schema(False), check_metadata=False))
+    if schema_version != LEGACY_LOADER_SCHEMA_VERSION:
+        return False
+    if not any(
+        actual.equals(candidate, check_metadata=False)
+        for candidate in _legacy_loader_bar_schemas()
+    ):
+        return False
+    metadata = actual.metadata or {}
+    expected_metadata = {
+        b"schema_version": LEGACY_LOADER_SCHEMA_VERSION.encode("ascii"),
+        b"provider": b"alpaca",
+        b"feed": b"sip",
+        b"adjustment": b"raw",
+        b"session_scope": b"regular",
+        b"resolution": str(manifest["resolution"]).encode("ascii"),
+        b"manifest_id": str(manifest["id"]).encode("ascii"),
+    }
+    return all(metadata.get(key) == value for key, value in expected_metadata.items())
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -249,7 +294,7 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(
                     f"source {object_id} resolution does not match the definition"
                 )
-            if manifest["schema_version"] != SCHEMA_VERSION:
+            if manifest["schema_version"] not in SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS:
                 raise MalformedEventError(f"source {object_id} schema version is not canonical")
         feed_ids = {str(row["feed_id"]) for row in selected_manifests}
         if len(feed_ids) != 1:
@@ -337,7 +382,6 @@ class CanonicalFeatureSourceReader:
         sources: list[SourceObject] = []
         bars: list[BarPoint] = []
         receipts: list[dict[str, Any]] = []
-        expected_schema = bar_schema(False)
         total_rows = 0
         total_bytes = 0
 
@@ -358,7 +402,10 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} belongs to another instrument shard")
             if manifest["resolution"] != definition.resolution:
                 raise MalformedEventError(f"source {object_id} resolution does not match the definition")
-            if manifest["schema_version"] != SCHEMA_VERSION or receipt["schema_version"] != SCHEMA_VERSION:
+            if (
+                manifest["schema_version"] not in SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS
+                or receipt["schema_version"] != manifest["schema_version"]
+            ):
                 raise MalformedEventError(f"source {object_id} schema version is not canonical")
             if receipt["file_format"] != "PARQUET":
                 raise MalformedEventError(f"source {object_id} is not Parquet")
@@ -408,7 +455,10 @@ class CanonicalFeatureSourceReader:
                         )
                     seekable.seek(0)
                     parquet = pq.ParquetFile(seekable)
-                    if parquet.schema_arrow != expected_schema:
+                    if not _matches_source_parquet_schema(
+                        parquet.schema_arrow,
+                        manifest=manifest,
+                    ):
                         raise MalformedEventError(
                             f"source {object_id} Parquet schema does not match canonical bars"
                         )
