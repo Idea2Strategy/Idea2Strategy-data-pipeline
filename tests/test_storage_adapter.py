@@ -233,6 +233,14 @@ class S3ObjectStoreConstructionTests(unittest.TestCase):
 
         self.assertEqual(store.bucket, "bucket")
 
+    def test_owns_both_canonical_and_loader_s3_receipts_for_its_exact_bucket(self) -> None:
+        store = S3ObjectStore("bucket", client=FakeS3Client())
+
+        self.assertTrue(store.owns_receipt("S3_COMPATIBLE", "bucket"))
+        self.assertTrue(store.owns_receipt("S3", "bucket"))
+        self.assertFalse(store.owns_receipt("S3", "another-bucket"))
+        self.assertFalse(store.owns_receipt("LOCAL", "bucket"))
+
 
 class S3ObjectStorePrefixTests(unittest.TestCase):
     def test_prefix_is_applied_once_and_is_idempotent(self) -> None:

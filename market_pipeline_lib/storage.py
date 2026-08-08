@@ -22,6 +22,10 @@ _ResultT = TypeVar("_ResultT")
 # receipt for an object whose HEAD does not report it, so an unencrypted
 # object can never be registered in `storage.objects` as published.
 SSE_ALGORITHM = "AES256"
+# The operating market-loader writes ``S3`` while the canonical adapter writes
+# ``S3_COMPATIBLE``. Both identify the same version-pinned S3 API; the exact
+# configured bucket remains part of the ownership boundary.
+S3_RECEIPT_PROVIDERS = frozenset({"S3", "S3_COMPATIBLE"})
 
 
 def sha256_hex_and_base64(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, str]:
@@ -271,7 +275,7 @@ class S3ObjectStore:
         )
 
     def owns_receipt(self, storage_provider: str, bucket_name: str) -> bool:
-        return storage_provider == "S3_COMPATIBLE" and bucket_name == self.bucket
+        return storage_provider in S3_RECEIPT_PROVIDERS and bucket_name == self.bucket
 
     @staticmethod
     def _error_details(exc: Exception) -> tuple[str, int | None]:
