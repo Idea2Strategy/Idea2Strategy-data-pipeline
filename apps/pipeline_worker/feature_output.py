@@ -382,7 +382,6 @@ class CanonicalFeatureSourceReader:
         sources: list[SourceObject] = []
         bars: list[BarPoint] = []
         receipts: list[dict[str, Any]] = []
-        total_rows = 0
         total_bytes = 0
 
         for object_id in sorted(wanted):
@@ -411,9 +410,8 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} is not Parquet")
             if int(relation["row_count"]) != int(receipt["row_count"]):
                 raise MalformedEventError(f"source {object_id} row count receipt mismatch")
-            total_rows += int(receipt["row_count"])
             total_bytes += int(receipt["byte_size"])
-            if total_rows > MAX_FEATURE_SOURCE_ROWS or total_bytes > MAX_FEATURE_SOURCE_BYTES:
+            if total_bytes > MAX_FEATURE_SOURCE_BYTES:
                 raise MalformedEventError(
                     "canonical source set exceeds the bounded feature materialization budget"
                 )
@@ -478,6 +476,11 @@ class CanonicalFeatureSourceReader:
                                 )
                             previous = moment
                             if period_start <= moment < period_end:
+                                if len(bars) >= MAX_FEATURE_SOURCE_ROWS:
+                                    raise MalformedEventError(
+                                        "canonical source set exceeds the bounded feature "
+                                        "materialization budget"
+                                    )
                                 bars.append(
                                     BarPoint(
                                         bar_start_at=moment,

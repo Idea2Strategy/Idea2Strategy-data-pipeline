@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -151,6 +152,31 @@ def test_feature_values_are_published_as_a_version_pinned_strict_parquet_dataset
     assert catalog.events.index(("manifest", "AVAILABLE")) < catalog.events.index(
         ("materialization", "SUCCEEDED")
     )
+
+
+def test_version_pinned_readback_supports_an_unseekable_object_stream(tmp_path: Path) -> None:
+    class UnseekableBytesIO(io.BytesIO):
+        def seekable(self) -> bool:
+            return False
+
+        def seek(self, *_args, **_kwargs):
+            raise io.UnsupportedOperation("seek")
+
+    class StreamingLocalObjectStore(LocalObjectStore):
+        def open_version(self, object_key: str, provider_version_id: str):
+            with super().open_version(object_key, provider_version_id) as stream:
+                return UnseekableBytesIO(stream.read())
+
+    catalog = TracingCatalog(tmp_path / "catalog")
+    registry = FeatureDefinitionRegistry(catalog)
+    published = registry.publish(definition())
+    store = StreamingLocalObjectStore(tmp_path / "objects")
+    publisher = FeatureOutputPublisher(catalog, store, staging_root=tmp_path / "staging")
+    materializer = FeatureMaterializer(catalog, registry, output_publisher=publisher)
+
+    result = materializer.materialize(request(published))
+
+    assert result.status == "SUCCEEDED"
 
 
 def test_duplicate_retry_reuses_identical_bytes_and_catalog_rows(tmp_path: Path) -> None:
