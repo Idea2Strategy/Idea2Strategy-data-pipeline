@@ -47,6 +47,8 @@ SOURCE_FEED = "40000000-0000-4000-8000-000000000001"
 SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000001"
 SOURCE_OBJECT = "60000000-0000-4000-8000-000000000001"
 SOURCE_STORAGE = "70000000-0000-4000-8000-000000000001"
+OVERLAP_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000003"
+OVERLAP_SOURCE_STORAGE = "70000000-0000-4000-8000-000000000003"
 CURRENT_SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000002"
 CURRENT_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000002"
 PERIOD_START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
@@ -327,6 +329,91 @@ def production_port(
     )
 
 
+def add_overlapping_source_object(
+    tmp_path: Path,
+    catalog: Any,
+    source_store: LocalObjectStore,
+    *,
+    conflicting: bool = False,
+) -> None:
+    canonical = canonical_bar_table()
+    duplicate = canonical.slice(2, 1)
+    if conflicting:
+        duplicate = duplicate.set_column(
+            duplicate.schema.get_field_index("close"),
+            duplicate.schema.field("close"),
+            pa.array([102.5], type=duplicate.schema.field("close").type),
+        )
+    moments = [PERIOD_START + timedelta(minutes=offset) for offset in (3, 4)]
+    values = {
+        "instrument_id": [INSTRUMENT] * 2,
+        "provider_symbol": ["AAPL"] * 2,
+        "bar_start_at": moments,
+        "session_date_et": [date(2026, 1, 5)] * 2,
+        "open": [103.0, 104.0],
+        "high": [104.0, 105.0],
+        "low": [102.0, 103.0],
+        "close": [103.0, 104.0],
+        "volume": [1003, 1004],
+        "trade_count": [13, 14],
+        "vwap": [103.0, 104.0],
+    }
+    schema = bar_schema(False)
+    tail = pa.Table.from_arrays(
+        [pa.array(values[field.name], type=field.type) for field in schema],
+        schema=schema,
+    )
+    table = pa.concat_tables([duplicate, tail])
+    path = tmp_path / "overlap-bars.parquet"
+    pq.write_table(table, path, compression="zstd", version="2.6")
+    receipt = source_store.put(path, "market-data/overlap-source.parquet")
+    overlap_start = PERIOD_START + timedelta(minutes=2)
+    catalog.stage_object(
+        {
+            "id": OVERLAP_SOURCE_STORAGE,
+            "status": "AVAILABLE",
+            "storage_provider": receipt.storage_provider,
+            "bucket_name": receipt.bucket_name,
+            "object_key": receipt.object_key,
+            "provider_version_id": receipt.provider_version_id,
+            "content_hash": receipt.content_hash,
+            "byte_size": receipt.byte_size,
+            "file_format": "PARQUET",
+            "compression_codec": "ZSTD",
+            "media_type": "application/vnd.apache.parquet",
+            "schema_version": SCHEMA_VERSION,
+            "row_count": table.num_rows,
+            "period_start": overlap_start.isoformat(),
+            "period_end": PERIOD_END.isoformat(),
+            "encryption_key_ref": None,
+            "retention_policy_version": "UNSPECIFIED",
+            "retention_until": None,
+            "legal_hold": False,
+            "created_at": PERIOD_END.isoformat(),
+            "verified_at": PERIOD_END.isoformat(),
+            "quarantined_at": None,
+            "superseded_at": None,
+            "deleted_at": None,
+        },
+        {
+            "id": OVERLAP_SOURCE_OBJECT,
+            "dataset_manifest_id": SOURCE_MANIFEST,
+            "object_id": OVERLAP_SOURCE_STORAGE,
+            "object_kind": "MARKET_BARS",
+            "partition_granularity": "DAY",
+            "partition_start": "2026-01-05",
+            "partition_end": "2026-01-06",
+            "period_start": overlap_start.isoformat(),
+            "period_end": PERIOD_END.isoformat(),
+            "shard_key": INSTRUMENT,
+            "part_number": 2,
+            "row_count": table.num_rows,
+            "min_instrument_id": INSTRUMENT,
+            "max_instrument_id": INSTRUMENT,
+        },
+    )
+
+
 def add_current_source_revision(catalog: Any) -> None:
     previous = catalog.records(
         "market_data.dataset_manifests", where={"id": SOURCE_MANIFEST}
@@ -413,6 +500,33 @@ def test_multi_instrument_shard_materializes_only_the_requested_instrument(
     result = port.materialize(payload(published), command_id="feature-command-sharded")
 
     assert result["row_count"] == 2
+
+
+def test_identical_bars_at_source_object_boundaries_are_materialized_once(
+    tmp_path: Path,
+) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    add_overlapping_source_object(tmp_path, catalog, source_store)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+    request = payload(published)
+    request["source_dataset_object_ids"] = [SOURCE_OBJECT, OVERLAP_SOURCE_OBJECT]
+
+    result = port.materialize(request, command_id="feature-command-identical-overlap")
+
+    assert result["row_count"] == 4
+
+
+def test_conflicting_bars_at_source_object_boundaries_are_rejected(
+    tmp_path: Path,
+) -> None:
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    add_overlapping_source_object(tmp_path, catalog, source_store, conflicting=True)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+    request = payload(published)
+    request["source_dataset_object_ids"] = [SOURCE_OBJECT, OVERLAP_SOURCE_OBJECT]
+
+    with pytest.raises(MalformedEventError, match="conflicting canonical source bars overlap"):
+        port.materialize(request, command_id="feature-command-conflicting-overlap")
 
 
 def test_shard_row_budget_counts_only_the_requested_instrument(

@@ -380,7 +380,7 @@ class CanonicalFeatureSourceReader:
                 "canonical source objects contain a period gap in the requested interval"
             )
         sources: list[SourceObject] = []
-        bars: list[BarPoint] = []
+        bars_by_start: dict[datetime, BarPoint] = {}
         receipts: list[dict[str, Any]] = []
         total_bytes = 0
 
@@ -476,21 +476,27 @@ class CanonicalFeatureSourceReader:
                                 )
                             previous = moment
                             if period_start <= moment < period_end:
-                                if len(bars) >= MAX_FEATURE_SOURCE_ROWS:
+                                bar = BarPoint(
+                                    bar_start_at=moment,
+                                    open=Decimal(str(row["open"])),
+                                    high=Decimal(str(row["high"])),
+                                    low=Decimal(str(row["low"])),
+                                    close=Decimal(str(row["close"])),
+                                    volume=int(row["volume"]),
+                                )
+                                existing = bars_by_start.get(moment)
+                                if existing is not None:
+                                    if existing != bar:
+                                        raise MalformedEventError(
+                                            "conflicting canonical source bars overlap"
+                                        )
+                                    continue
+                                if len(bars_by_start) >= MAX_FEATURE_SOURCE_ROWS:
                                     raise MalformedEventError(
                                         "canonical source set exceeds the bounded feature "
                                         "materialization budget"
                                     )
-                                bars.append(
-                                    BarPoint(
-                                        bar_start_at=moment,
-                                        open=Decimal(str(row["open"])),
-                                        high=Decimal(str(row["high"])),
-                                        low=Decimal(str(row["low"])),
-                                        close=Decimal(str(row["close"])),
-                                        volume=int(row["volume"]),
-                                    )
-                                )
+                                bars_by_start[moment] = bar
                     if decoded_rows != int(receipt["row_count"]):
                         raise MalformedEventError(
                             f"source {object_id} decoded row count does not match receipt"
@@ -514,13 +520,9 @@ class CanonicalFeatureSourceReader:
                     "row_count": receipt["row_count"],
                 }
             )
-        bars.sort(key=lambda item: item.bar_start_at)
+        bars = sorted(bars_by_start.values(), key=lambda item: item.bar_start_at)
         if not bars:
             raise MalformedEventError("canonical sources contain no bars in the requested period")
-        if any(
-            current.bar_start_at <= previous.bar_start_at for previous, current in zip(bars, bars[1:], strict=False)
-        ):
-            raise MalformedEventError("canonical source bars overlap or are out of order")
         return CanonicalFeatureInput(
             sources=tuple(sources),
             bars=tuple(bars),
