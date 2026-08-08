@@ -23,7 +23,12 @@ from apps.pipeline_worker.feature_output import (
     feature_output_run_id,
 )
 from market_pipeline_lib.catalog import LocalCatalog
-from market_pipeline_lib.contracts import SCHEMA_VERSION, bar_schema, deterministic_uuid
+from market_pipeline_lib.contracts import (
+    SCHEMA_VERSION,
+    bar_schema,
+    deterministic_uuid,
+    stable_shard_key,
+)
 from market_pipeline_lib.features import (
     BarPoint,
     FeatureDefinition,
@@ -35,6 +40,7 @@ from market_pipeline_lib.storage import LocalObjectStore, VerificationResult
 
 CATALOG_VERSION = "10000000-0000-4000-8000-000000000001"
 INSTRUMENT = "20000000-0000-4000-8000-000000000001"
+OTHER_INSTRUMENT_SAME_SHARD = "20000000-0000-4000-8000-000000000003"
 SOURCE_PROVIDER = "30000000-0000-4000-8000-000000000001"
 SOURCE_FEED = "40000000-0000-4000-8000-000000000001"
 SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000001"
@@ -78,11 +84,38 @@ def canonical_bar_table() -> pa.Table:
     )
 
 
+def sharded_bar_table() -> pa.Table:
+    target = canonical_bar_table()
+    moments = [PERIOD_START + timedelta(minutes=offset) for offset in range(3)]
+    values = {
+        "instrument_id": [OTHER_INSTRUMENT_SAME_SHARD] * 3,
+        "provider_symbol": ["MSFT"] * 3,
+        "bar_start_at": moments,
+        "session_date_et": [date(2026, 1, 5)] * 3,
+        "open": [200.0, 201.0, 202.0],
+        "high": [201.0, 202.0, 203.0],
+        "low": [199.0, 200.0, 201.0],
+        "close": [200.0, 201.0, 202.0],
+        "volume": [2000, 2001, 2002],
+        "trade_count": [20, 21, 22],
+        "vwap": [200.0, 201.0, 202.0],
+    }
+    schema = bar_schema(False)
+    other = pa.Table.from_arrays(
+        [pa.array(values[field.name], type=field.type) for field in schema],
+        schema=schema,
+    )
+    return pa.concat_tables([target, other])
+
+
 def seed_catalog(
     tmp_path: Path,
     *,
     include_output_feed: bool = True,
-    relation_row_count: int = 3,
+    relation_row_count: int | None = None,
+    source_table: pa.Table | None = None,
+    manifest_instrument_id: str | None = INSTRUMENT,
+    relation_shard_key: str = INSTRUMENT,
     catalog: Any | None = None,
 ) -> tuple[Any, LocalObjectStore, LocalObjectStore, FeatureDefinition]:
     catalog = catalog or LocalCatalog(tmp_path / "catalog")
@@ -156,14 +189,15 @@ def seed_catalog(
         },
     )
 
+    table = source_table or canonical_bar_table()
     path = tmp_path / "bars.parquet"
-    pq.write_table(canonical_bar_table(), path, compression="zstd", version="2.6")
+    pq.write_table(table, path, compression="zstd", version="2.6")
     receipt = source_store.put(path, "market-data/source.parquet")
     catalog.publish_manifest(
         {
             "id": SOURCE_MANIFEST,
             "feed_id": SOURCE_FEED,
-            "instrument_id": INSTRUMENT,
+            "instrument_id": manifest_instrument_id,
             "data_layer": "RAW",
             "resolution": "1m",
             "revision_number": 1,
@@ -191,7 +225,7 @@ def seed_catalog(
             "compression_codec": "ZSTD",
             "media_type": "application/vnd.apache.parquet",
             "schema_version": SCHEMA_VERSION,
-            "row_count": 3,
+            "row_count": table.num_rows,
             "period_start": PERIOD_START.isoformat(),
             "period_end": PERIOD_END.isoformat(),
             "encryption_key_ref": None,
@@ -214,11 +248,15 @@ def seed_catalog(
             "partition_end": "2026-01-06",
             "period_start": PERIOD_START.isoformat(),
             "period_end": PERIOD_END.isoformat(),
-            "shard_key": INSTRUMENT,
+            "shard_key": relation_shard_key,
             "part_number": 1,
-            "row_count": relation_row_count,
+            "row_count": table.num_rows if relation_row_count is None else relation_row_count,
             "min_instrument_id": INSTRUMENT,
-            "max_instrument_id": INSTRUMENT,
+            "max_instrument_id": (
+                OTHER_INSTRUMENT_SAME_SHARD
+                if manifest_instrument_id is None
+                else INSTRUMENT
+            ),
         },
     )
     return catalog, source_store, output_store, published
@@ -317,6 +355,36 @@ def test_materialization_derives_every_output_identity_and_owns_the_pipeline_run
     assert len(catalog.records("market_data.pipeline_runs")) == 1
     assert len(catalog.records("market_data.feature_materializations")) == 1
     assert len(catalog.records("storage.objects")) == 2
+
+
+def test_multi_instrument_shard_materializes_only_the_requested_instrument(
+    tmp_path: Path,
+) -> None:
+    shard = stable_shard_key(INSTRUMENT, 2)
+    assert shard == stable_shard_key(OTHER_INSTRUMENT_SAME_SHARD, 2)
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=sharded_bar_table(),
+        manifest_instrument_id=None,
+        relation_shard_key=shard,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    result = port.materialize(payload(published), command_id="feature-command-sharded")
+
+    assert result["row_count"] == 2
+
+
+def test_multi_instrument_manifest_rejects_an_unrelated_shard(tmp_path: Path) -> None:
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        manifest_instrument_id=None,
+        relation_shard_key="s01-of-2",
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="shard"):
+        port.materialize(payload(published), command_id="feature-command-wrong-shard")
 
 
 @pytest.mark.parametrize(
