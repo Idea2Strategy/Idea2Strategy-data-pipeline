@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 
-from apps.pipeline_worker.backfill_features import _instant, _summary, main, run
+from apps.pipeline_worker.backfill_features import _catalog, _instant, _summary, main, run
+from market_pipeline_lib.catalog import StorageObjectsPolicy
 from market_pipeline_lib.features.backfill import (
     MAX_SOURCE_OBJECTS_PER_COMMAND,
     plan_feature_backfill,
@@ -554,6 +555,46 @@ class TestTheEntryPointRefusesToHideHoles:
 
 
 class TestTheEntryPointArguments:
+    def test_the_operating_catalog_connects_with_read_only_storage_objects(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        observed: dict[str, Any] = {}
+        expected = object()
+
+        class CapturingPostgresCatalog:
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                raise AssertionError("the planner must use the guarded connect factory")
+
+            @staticmethod
+            def connect(
+                database_url: str,
+                *,
+                artifact_root: Any,
+                storage_objects: StorageObjectsPolicy,
+            ) -> object:
+                observed.update(
+                    database_url=database_url,
+                    artifact_root=artifact_root,
+                    storage_objects=storage_objects,
+                )
+                return expected
+
+        monkeypatch.setattr(
+            "market_pipeline_lib.catalog.PostgresCatalog",
+            CapturingPostgresCatalog,
+        )
+        arguments = argparse.Namespace(
+            database_url="postgresql://planner:secret@db/idea2strategy",
+            artifact_root=tmp_path,
+        )
+
+        assert _catalog(arguments) is expected
+        assert observed == {
+            "database_url": arguments.database_url,
+            "artifact_root": tmp_path,
+            "storage_objects": StorageObjectsPolicy.READ_ONLY,
+        }
+
     def test_send_without_a_queue_is_rejected_before_any_work(self) -> None:
         assert main(["--database-url", "postgresql://unused", "--send"]) == 2
 

@@ -163,12 +163,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _catalog(arguments: argparse.Namespace) -> FeatureCatalog:  # pragma: no cover - needs a database
     # Imported here so planning stays importable without the database extras installed.
-    from sqlalchemy import create_engine
+    from market_pipeline_lib.catalog import PostgresCatalog, StorageObjectsPolicy
 
-    from market_pipeline_lib.catalog import PostgresCatalog
-
-    engine = create_engine(arguments.database_url)
-    return PostgresCatalog(engine, artifact_root=arguments.artifact_root)
+    return PostgresCatalog.connect(
+        arguments.database_url,
+        artifact_root=arguments.artifact_root,
+        storage_objects=StorageObjectsPolicy.READ_ONLY,
+    )
 
 
 def _sqs_sender() -> Callable[[str, str], None]:  # pragma: no cover - needs a queue
