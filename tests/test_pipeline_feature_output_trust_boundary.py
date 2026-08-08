@@ -109,7 +109,7 @@ def legacy_loader_bar_table(*, derived: bool) -> pa.Table:
             b"processing_version": b"market-loader/1.0.0",
             b"provider": b"alpaca",
             b"feed": b"sip",
-            b"adjustment": b"raw",
+            b"adjustment": b"all",
             b"session_scope": b"regular",
             b"resolution": b"1m",
             b"period_start": b"2026-01-05",
@@ -456,6 +456,20 @@ def test_legacy_loader_schema_requires_matching_producer_metadata(tmp_path: Path
 
     with pytest.raises(MalformedEventError, match="Parquet schema"):
         port.materialize(payload(published), command_id="legacy-loader-wrong-metadata")
+
+
+def test_legacy_loader_schema_rejects_raw_bars_for_adjusted_features(tmp_path: Path) -> None:
+    table = legacy_loader_bar_table(derived=False)
+    metadata = {**(table.schema.metadata or {}), b"adjustment": b"raw"}
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=table.replace_schema_metadata(metadata),
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="Parquet schema"):
+        port.materialize(payload(published), command_id="legacy-loader-raw-bars")
 
 
 def test_multi_instrument_manifest_rejects_an_unrelated_shard(tmp_path: Path) -> None:

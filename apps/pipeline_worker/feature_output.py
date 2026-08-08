@@ -93,7 +93,7 @@ def _matches_source_parquet_schema(
         b"schema_version": LEGACY_LOADER_SCHEMA_VERSION.encode("ascii"),
         b"provider": b"alpaca",
         b"feed": b"sip",
-        b"adjustment": b"raw",
+        b"adjustment": b"all",
         b"session_scope": b"regular",
         b"resolution": str(manifest["resolution"]).encode("ascii"),
         b"manifest_id": str(manifest["id"]).encode("ascii"),
