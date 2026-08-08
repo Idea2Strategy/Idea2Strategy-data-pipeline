@@ -9,6 +9,7 @@ before that integration is treated as releasable.
 from __future__ import annotations
 
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -108,7 +109,10 @@ class FeatureOutputPublisher:
             with self.object_store.open_version(
                 receipt.object_key, receipt.provider_version_id
             ) as stream:
-                decoded = pq.read_table(stream)
+                with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as seekable:
+                    shutil.copyfileobj(stream, seekable, length=1024 * 1024)
+                    seekable.seek(0)
+                    decoded = pq.read_table(seekable)
             if decoded.schema != FEATURE_SERIES_SCHEMA:
                 raise ValueError(
                     f"published feature schema mismatch: {decoded.schema} != {FEATURE_SERIES_SCHEMA}"

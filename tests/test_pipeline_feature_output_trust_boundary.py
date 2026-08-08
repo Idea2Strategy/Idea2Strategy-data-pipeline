@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import apps.pipeline_worker.feature_output as feature_output_module
 from apps.common.errors import MalformedEventError, PortNotConfiguredError
 from apps.pipeline_worker.feature_output import (
     CanonicalFeatureSourceReader,
@@ -412,6 +413,35 @@ def test_multi_instrument_shard_materializes_only_the_requested_instrument(
     result = port.materialize(payload(published), command_id="feature-command-sharded")
 
     assert result["row_count"] == 2
+
+
+def test_shard_row_budget_counts_only_the_requested_instrument(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(feature_output_module, "MAX_FEATURE_SOURCE_ROWS", 3)
+    shard = stable_shard_key(INSTRUMENT, 2)
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=sharded_bar_table(),
+        manifest_instrument_id=None,
+        relation_shard_key=shard,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    result = port.materialize(payload(published), command_id="feature-command-shard-budget")
+
+    assert result["row_count"] == 2
+
+
+def test_requested_instrument_rows_still_obey_the_row_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(feature_output_module, "MAX_FEATURE_SOURCE_ROWS", 2)
+    catalog, source_store, output_store, published = seed_catalog(tmp_path)
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="bounded feature materialization budget"):
+        port.materialize(payload(published), command_id="feature-command-target-budget")
 
 
 @pytest.mark.parametrize("derived", [False, True])
