@@ -28,6 +28,17 @@ SSE_ALGORITHM = "AES256"
 S3_RECEIPT_PROVIDERS = frozenset({"S3", "S3_COMPATIBLE"})
 
 
+def _s3_metadata_sha256(metadata: object) -> str:
+    """Read either canonical S3 SHA key without accepting contradictory claims."""
+    if not isinstance(metadata, dict):
+        return ""
+    adapter_hash = str(metadata.get("sha256") or "")
+    loader_hash = str(metadata.get("content-sha256") or "")
+    if adapter_hash and loader_hash and adapter_hash != loader_hash:
+        return ""
+    return adapter_hash or loader_hash
+
+
 def sha256_hex_and_base64(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, str]:
     """Return (hex, base64) SHA-256 digests of one file in a single read.
 
@@ -367,8 +378,7 @@ class S3ObjectStore:
         *different* object already owns the immutable key; anything else means
         our own write cannot be trusted.
         """
-        metadata = head.get("Metadata", {})
-        actual_hash = metadata.get("sha256", "") if isinstance(metadata, dict) else ""
+        actual_hash = _s3_metadata_sha256(head.get("Metadata"))
         actual_size = int(head.get("ContentLength", 0))
         if actual_hash != expected_hash or actual_size != expected_size:
             if conflict:
@@ -530,7 +540,7 @@ class S3ObjectStore:
             if self._is_missing(exc):
                 return VerificationResult(False, "", 0, "object missing")
             raise
-        actual = head.get("Metadata", {}).get("sha256", "")
+        actual = _s3_metadata_sha256(head.get("Metadata"))
         return VerificationResult(
             actual == expected_sha256,
             actual,
@@ -552,8 +562,7 @@ class S3ObjectStore:
             if self._is_missing(exc):
                 return VerificationResult(False, "", 0, "object version missing")
             raise
-        metadata = head.get("Metadata", {})
-        actual_hash = metadata.get("sha256", "") if isinstance(metadata, dict) else ""
+        actual_hash = _s3_metadata_sha256(head.get("Metadata"))
         actual_size = int(head.get("ContentLength", 0))
         if str(head.get("VersionId", "")) != provider_version_id:
             return VerificationResult(False, actual_hash, actual_size, "version mismatch")
