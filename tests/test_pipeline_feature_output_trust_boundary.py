@@ -24,7 +24,12 @@ from apps.pipeline_worker.feature_output import (
 )
 from market_pipeline_lib.catalog import LocalCatalog
 from market_pipeline_lib.contracts import SCHEMA_VERSION, bar_schema, deterministic_uuid
-from market_pipeline_lib.features import BarPoint, FeatureDefinition, FeatureDefinitionRegistry
+from market_pipeline_lib.features import (
+    BarPoint,
+    FeatureDefinition,
+    FeatureDefinitionRegistry,
+    production_rsi_14_definition,
+)
 from market_pipeline_lib.features.definitions import OFFICIAL_RSI_14_HASH, OFFICIAL_RSI_14_PARAMETERS
 from market_pipeline_lib.storage import LocalObjectStore, VerificationResult
 
@@ -692,6 +697,47 @@ def test_approved_official_rsi_row_resolves_exact_feed_and_existing_calculator()
         for index in range(15)
     )
     assert len(official.calculator().compute(bars, OFFICIAL_RSI_14_PARAMETERS)) == 1
+
+
+@pytest.mark.parametrize(
+    ("resolution", "definition_id", "feed_id", "feed_code"),
+    [
+        (
+            "30m",
+            "4b1c6801-0259-5176-a857-0e5ea923d898",
+            "57794d8c-2254-53e4-966e-44f97edd9e6a",
+            "FEATURE_RSI_14_30M_RSI_1_0_0",
+        ),
+        (
+            "1h",
+            "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e",
+            "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+            "FEATURE_RSI_14_1H_RSI_1_0_0",
+        ),
+        (
+            "4h",
+            "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9",
+            "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+            "FEATURE_RSI_14_4H_RSI_1_0_0",
+        ),
+        (
+            "1d",
+            "eddfb2d4-8586-5260-8fc9-9c8125990270",
+            "6d2647f8-5caf-55ee-8821-869dc693f68a",
+            "FEATURE_RSI_14_1D_RSI_1_0_0",
+        ),
+    ],
+)
+def test_production_rsi_definition_and_feed_follow_the_selected_resolution(
+    resolution: str, definition_id: str, feed_id: str, feed_code: str,
+) -> None:
+    definition = production_rsi_14_definition(resolution)
+
+    assert definition.id == definition_id
+    assert definition.resolution == resolution
+    assert feature_output_feed_id(definition) == feed_id
+    assert feature_output_feed_code(definition) == feed_code
+    assert feature_output_feed_version(definition) == "rsi-1.0.0+feature-series.parquet.v1"
 
 
 @pytest.mark.integration

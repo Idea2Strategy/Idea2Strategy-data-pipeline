@@ -82,6 +82,12 @@ def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def canonical_sql_sha256(path: Path) -> str:
+    """Compare SQL content independently of Git's platform checkout conversion."""
+
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def superproject_root() -> Path | None:
     """Best-effort location of the Idea2Strategy superproject, or `None`.
 
@@ -217,7 +223,7 @@ def _cross_check(vendored: list[Path], upstream: list[Path]) -> None:
         copy = by_name.get(path.name)
         if copy is None:
             raise AssertionError(f"central bundle has {path.name} but the vendored copy does not")
-        if sha256_of(copy) != sha256_of(path):
+        if canonical_sql_sha256(copy) != canonical_sql_sha256(path):
             raise AssertionError(f"vendored {copy.name} differs from the central {path.name}")
     extra = sorted(set(by_name) - {path.name for path in upstream})
     if extra:

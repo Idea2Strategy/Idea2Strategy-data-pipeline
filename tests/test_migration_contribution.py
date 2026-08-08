@@ -140,6 +140,20 @@ class ContributionContractTests(unittest.TestCase):
         self.assertIn("RAISE EXCEPTION 'official RSI_14 feature feed identity drift'", sql)
         self.assertNotIn("UPDATE MARKET_DATA.", sql.upper())
 
+    def test_production_rsi_seed_covers_only_the_four_selected_resolutions(self) -> None:
+        migration = self.contribution.migrations_directory / (
+            "V20260808120100__pipeline_seed_production_rsi_timeframes.sql"
+        )
+        sql = migration.read_text(encoding="utf-8")
+
+        for resolution in ("30m", "1h", "4h", "1d"):
+            self.assertIn(f"('{resolution}'", sql)
+        self.assertNotIn("('1m'", sql)
+        self.assertNotIn("('5m'", sql)
+        self.assertNotIn("('15m'", sql)
+        self.assertIn("production RSI_14 definition identity drift", sql)
+        self.assertIn("production RSI_14 feed identity drift", sql)
+
     def test_only_sql_and_gitkeep_live_under_migrations(self) -> None:
         allowed = {".sql"}
         for path in self.contribution.migrations_directory.iterdir():
