@@ -44,6 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print every environment variable this app reads, then exit.",
     )
+    parser.add_argument(
+        "--publish-manifest-watermarks",
+        action="store_true",
+        help=(
+            "Advance active-feed watermarks from AVAILABLE manifests and exit. "
+            "Requires PIPELINE_WORKER_DATABASE_URL."
+        ),
+    )
     return parser
 
 
@@ -55,6 +63,17 @@ def main(
 
     if arguments.print_env:
         print(environment_variable_help())
+        return EXIT_OK
+
+    if arguments.publish_manifest_watermarks:
+        from apps.pipeline_worker.publish_manifest_watermarks import execute
+
+        try:
+            result = execute([], environment)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"publish-manifest-watermarks failed: {error}", file=sys.stderr)
+            return EXIT_RUNTIME_FAILURE
+        print(json.dumps(result, indent=2, sort_keys=True))
         return EXIT_OK
 
     try:

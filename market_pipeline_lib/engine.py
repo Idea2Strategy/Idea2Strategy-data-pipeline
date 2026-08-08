@@ -63,6 +63,11 @@ from .quality import (
     record_quality_incidents,
 )
 from .storage import LocalObjectStore, ObjectStore
+from .watermarks import (
+    StreamPosition,
+    StreamWatermark,
+    WatermarkRepository,
+)
 
 
 def legacy_staging_filename(source_path: Path, batch_number: int) -> str:
@@ -274,6 +279,7 @@ class MarketPipelineEngine:
         object_store: ObjectStore | None = None,
         catalog: MarketDataCatalog | None = None,
         source: BarSource | None = None,
+        watermark_repository: WatermarkRepository | None = None,
     ) -> None:
         config.validate()
         self.config = config
@@ -283,6 +289,7 @@ class MarketPipelineEngine:
             create=not config.dry_run,
         )
         self.source = source
+        self.watermark_repository = watermark_repository
         self.mappings = load_instrument_map(config.instrument_map_path)
         self.feed_ids = {
             code: deterministic_uuid("feed", PROVIDER_CODE, code)
@@ -813,6 +820,21 @@ class MarketPipelineEngine:
                         "relation_type": relation_type,
                     }
                 )
+        # AVAILABLE is the commit point for real ingestion.  Project it to the
+        # durable preflight watermark only after the catalog transaction commits;
+        # a scheduled manifest reconciliation retries this independently if the
+        # database connection is interrupted between the two writes.
+        if status == "AVAILABLE" and self.watermark_repository is not None:
+            observed_end_at = _parse_iso(observed_end)
+            available_at = _parse_iso(now)
+            self.watermark_repository.advance(
+                StreamWatermark(
+                    feed_id=self.feed_ids[contract.feed_code],
+                    position=StreamPosition(observed_end_at),
+                    ingested_at=available_at,
+                    updated_at=available_at,
+                )
+            )
         return {
             "manifest": manifest,
             "new_object_count": len(new_objects),
@@ -1914,6 +1936,7 @@ class MarketPipelineEngine:
                         object_store=self.object_store,
                         catalog=self.catalog,
                         source=self.source,
+                        watermark_repository=self.watermark_repository,
                     )
                     correction_start = datetime(
                         retained_years[0],
