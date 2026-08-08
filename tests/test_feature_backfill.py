@@ -27,6 +27,7 @@ UNRELATED_SHARD_INSTRUMENT = "00000000-0000-4000-8000-000000000303"
 CATALOG_VERSION = "0f4a0000-0000-4000-8000-000000000001"
 ADJUSTED_FEED_ID = "00000000-0000-4000-8000-000000000401"
 RAW_FEED_ID = "00000000-0000-4000-8000-000000000402"
+LOADER_FEED_ID = "00000000-0000-4000-8000-000000000403"
 
 def _definition(resolution: str) -> FeatureDefinition:
     """The real production RSI_14 definition at one of the four strategy clocks.
@@ -285,6 +286,61 @@ class TestCanonicalShardedHistoricalManifests:
         plan = plan_feature_backfill(catalog, [_definition("30m")])
 
         assert all("object-raw" not in item.source_dataset_object_ids for item in plan.commands)
+
+    @pytest.mark.parametrize("resolution", ["30m", "1h", "4h", "1d"])
+    def test_market_loader_all_feed_is_the_adjusted_source(self, resolution: str) -> None:
+        catalog = FakeCatalog()
+        catalog.feeds.append(
+            {"id": LOADER_FEED_ID, "code": f"ALPACA_SIP_ALL_{resolution.upper()}"}
+        )
+        catalog.add_manifest(
+            "manifest-loader",
+            resolution=resolution,
+            instrument_id=None,
+            feed_id=LOADER_FEED_ID,
+            data_layer="ADJUSTED" if resolution == "30m" else "DERIVED",
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+        )
+        catalog.add_object(
+            "object-loader",
+            manifest_id="manifest-loader",
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+            shard_key="s00-of-1",
+        )
+
+        plan = plan_feature_backfill(catalog, [_definition(resolution)])
+
+        assert len(plan.commands) == 3
+        assert {item.source_dataset_object_ids for item in plan.commands} == {
+            ("object-loader",)
+        }
+
+    def test_loader_feed_wins_when_the_legacy_adjusted_feed_also_exists(self) -> None:
+        catalog = self._catalog()
+        catalog.feeds.append({"id": LOADER_FEED_ID, "code": "ALPACA_SIP_ALL_30M"})
+        catalog.add_manifest(
+            "manifest-loader",
+            resolution="30m",
+            instrument_id=None,
+            feed_id=LOADER_FEED_ID,
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+        )
+        catalog.add_object(
+            "object-loader",
+            manifest_id="manifest-loader",
+            start="2016-01-01T00:00:00+00:00",
+            end="2016-02-01T00:00:00+00:00",
+            shard_key="s00-of-1",
+        )
+
+        plan = plan_feature_backfill(catalog, [_definition("30m")])
+
+        assert {item.source_dataset_object_ids for item in plan.commands} == {
+            ("object-loader",)
+        }
 
 
 class TestTheCommandIsResumable:

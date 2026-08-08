@@ -273,11 +273,22 @@ def _available_bar_manifests(catalog: FeatureCatalog, resolution: str) -> list[d
     manifest that is not the current AVAILABLE revision, so planning against a superseded
     one would produce a command that can only fail.
     """
+    feeds = catalog.records("market_data.feeds")
+    loader_feed_code = f"ALPACA_SIP_ALL_{resolution.upper()}"
     adjusted_feed_ids = {
         str(row["id"])
-        for row in catalog.records("market_data.feeds")
-        if row.get("code") == ADJUSTED_FEED
+        for row in feeds
+        if row.get("code") == loader_feed_code
     }
+    # The historical loader publishes one explicit ``ALL`` feed per resolution.
+    # Older catalog fixtures used the shared ADJUSTED 30m feed for derived clocks;
+    # retain that fallback only when the loader-native feed is absent, never mix both.
+    if not adjusted_feed_ids:
+        adjusted_feed_ids = {
+            str(row["id"])
+            for row in feeds
+            if row.get("code") == ADJUSTED_FEED
+        }
     rows = [
         row
         for row in catalog.records("market_data.dataset_manifests", where={"resolution": resolution})
