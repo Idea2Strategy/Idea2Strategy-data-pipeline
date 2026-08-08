@@ -358,6 +358,44 @@ class S3ObjectStoreIntegrityTests(unittest.TestCase):
 
 
 class S3ObjectStoreContractTests(unittest.TestCase):
+    def test_verify_version_accepts_the_loader_content_sha256_metadata_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = FakeS3Client()
+            store = S3ObjectStore("bucket", client=client)
+            receipt = store.put(source, "market/source.parquet")
+            stored = client.versions[("bucket", receipt.object_key, receipt.provider_version_id)]
+            stored["Metadata"] = {"content-sha256": receipt.content_hash}
+
+            verified = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size,
+            )
+
+            self.assertTrue(verified.ok)
+            self.assertEqual(verified.content_hash, receipt.content_hash)
+
+    def test_verify_version_rejects_conflicting_sha256_metadata_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write_small_parquet(Path(temporary) / "source.parquet")
+            client = FakeS3Client()
+            store = S3ObjectStore("bucket", client=client)
+            receipt = store.put(source, "market/source.parquet")
+            stored = client.versions[("bucket", receipt.object_key, receipt.provider_version_id)]
+            stored["Metadata"]["content-sha256"] = "f" * 64
+
+            verified = store.verify_version(
+                receipt.object_key,
+                receipt.provider_version_id,
+                receipt.content_hash,
+                receipt.byte_size,
+            )
+
+            self.assertFalse(verified.ok)
+            self.assertEqual(verified.message, "sha256 metadata mismatch")
+
     def test_verify_version_uses_the_exact_s3_version_and_all_attestations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = write_small_parquet(Path(temporary) / "source.parquet")
