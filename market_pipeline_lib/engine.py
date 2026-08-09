@@ -280,6 +280,7 @@ class MarketPipelineEngine:
         catalog: MarketDataCatalog | None = None,
         source: BarSource | None = None,
         watermark_repository: WatermarkRepository | None = None,
+        ensure_provider_metadata: bool = True,
     ) -> None:
         config.validate()
         self.config = config
@@ -290,12 +291,13 @@ class MarketPipelineEngine:
         )
         self.source = source
         self.watermark_repository = watermark_repository
+        self.ensure_provider_metadata = ensure_provider_metadata
         self.mappings = load_instrument_map(config.instrument_map_path)
         self.feed_ids = {
             code: deterministic_uuid("feed", PROVIDER_CODE, code)
             for code in FEED_METADATA
         }
-        if not config.dry_run:
+        if not config.dry_run and ensure_provider_metadata:
             self._ensure_provider_metadata()
 
     def _ensure_provider_metadata(self) -> None:
@@ -1937,6 +1939,7 @@ class MarketPipelineEngine:
                         catalog=self.catalog,
                         source=self.source,
                         watermark_repository=self.watermark_repository,
+                        ensure_provider_metadata=self.ensure_provider_metadata,
                     )
                     correction_start = datetime(
                         retained_years[0],
