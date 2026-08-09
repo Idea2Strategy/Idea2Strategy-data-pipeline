@@ -52,6 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Requires PIPELINE_WORKER_DATABASE_URL."
         ),
     )
+    parser.add_argument(
+        "--sync-market-history",
+        action="store_true",
+        help=(
+            "Publish missing adjusted daily history, project recent AVAILABLE "
+            "bars to Redis, advance watermarks, and exit."
+        ),
+    )
     return parser
 
 
@@ -66,12 +74,25 @@ def main(
         return EXIT_OK
 
     if arguments.publish_manifest_watermarks:
-        from apps.pipeline_worker.publish_manifest_watermarks import execute
+        from apps.pipeline_worker.publish_manifest_watermarks import (
+            execute as publish_manifest_watermarks,
+        )
 
         try:
-            result = execute([], environment)
+            result = publish_manifest_watermarks([], environment)
         except (OSError, RuntimeError, ValueError) as error:
             print(f"publish-manifest-watermarks failed: {error}", file=sys.stderr)
+            return EXIT_RUNTIME_FAILURE
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return EXIT_OK
+
+    if arguments.sync_market_history:
+        from apps.pipeline_worker.sync_market_history import execute as sync_market_history
+
+        try:
+            result = sync_market_history(environment)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"sync-market-history failed: {error}", file=sys.stderr)
             return EXIT_RUNTIME_FAILURE
         print(json.dumps(result, indent=2, sort_keys=True))
         return EXIT_OK

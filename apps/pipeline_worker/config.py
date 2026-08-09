@@ -89,6 +89,30 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
         "in-memory repository for development only.",
     ),
     (
+        "PIPELINE_WORKER_MARKET_HISTORY_REDIS_URI",
+        False,
+        "",
+        "TLS Redis URI used only by --sync-market-history for the read-model projection.",
+    ),
+    (
+        "PIPELINE_WORKER_MARKET_HISTORY_REDIS_KEY_PREFIX",
+        False,
+        "i2s",
+        "Plain Redis hash-tag prefix shared with backend market-data reads.",
+    ),
+    (
+        "PIPELINE_WORKER_MARKET_HISTORY_LIMIT",
+        False,
+        "400",
+        "Recent adjusted bars retained per instrument and strategy timeframe.",
+    ),
+    (
+        "MARKET_DATA_BUCKET",
+        False,
+        "",
+        "Versioned canonical S3 bucket used by scheduled market-history sync.",
+    ),
+    (
         "PIPELINE_WORKER_CORPORATE_ACTION_APPROVAL",
         False,
         "",
