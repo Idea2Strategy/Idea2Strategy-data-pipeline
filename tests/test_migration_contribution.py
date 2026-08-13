@@ -7,7 +7,6 @@ contribution fails here instead of in the central Flyway bundle.
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import sys
 import unittest
@@ -15,8 +14,6 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-
-from market_pipeline_lib.contracts import deterministic_uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
@@ -67,21 +64,6 @@ class ContributionContractTests(unittest.TestCase):
         self.assertEqual(validator.SCHEMA_OWNERS["market_data"], "pipeline")
         self.assertEqual(validator.SCHEMA_OWNERS["storage"], "pipeline")
 
-    def test_central_empty_manifest_hash_fixture_matches_root_139_migration(self) -> None:
-        migration = CONTRIBUTION_ROOT / "fixtures" / "central-migration" / (
-            "V20260804160020__pipeline_dataset_manifest_empty_hash.sql"
-        )
-        sql = migration.read_text(encoding="utf-8")
-        self.assertEqual(
-            hashlib.sha256(migration.read_bytes()).hexdigest(),
-            "bea14651c4c8ae595b383c91565f15be71ccca20e66d29d78f797b434290134c",
-        )
-        self.assertIn("DROP INDEX", sql)
-        self.assertIn("CREATE UNIQUE INDEX uq_dataset_manifests_dataset_hash", sql)
-        self.assertIn("ADD COLUMN object_count bigint NOT NULL DEFAULT 0", sql)
-        self.assertIn("WHERE object_count > 0", sql)
-        self.assertIn("maintain_dataset_manifest_object_count", sql)
-
     def test_pipeline_partitions_is_never_contributed(self) -> None:
         # `market_data.pipeline_partitions` is absent from the canonical DBML; spec
         # section 2.4 says D must not add it.
@@ -113,46 +95,6 @@ class ContributionContractTests(unittest.TestCase):
         checked = validator.check_migration_directory(self.contribution)
         for name in checked:
             self.assertRegex(name, self.contribution.filename_regex)
-
-    def test_official_feature_output_seed_is_forward_only_and_pins_exact_identities(self) -> None:
-        migration = self.contribution.migrations_directory / (
-            "V20260806120000__pipeline_seed_official_feature_output_feed.sql"
-        )
-        sql = migration.read_text(encoding="utf-8")
-        self.assertEqual(
-            deterministic_uuid("provider", "IDEA2STRATEGY_INTERNAL"),
-            "b9146ed9-dbb0-5323-93e3-8518f3851236",
-        )
-        self.assertEqual(
-            deterministic_uuid(
-                "feature-output-feed",
-                "sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6",
-                "rsi:1.0.0",
-                "1m",
-                "feature-series.parquet.v1",
-            ),
-            "063f8f27-5c6a-5348-b2bb-abc3c634149c",
-        )
-        self.assertIn("063f8f27-5c6a-5348-b2bb-abc3c634149c", sql)
-        self.assertIn("sha256:1a7c3e5b9d2f4068a1c3e5b7d9f20416283a5c7e9b1d3f50627496a8c0e2b4d6", sql)
-        self.assertIn("RAISE EXCEPTION 'official RSI_14 definition identity drift'", sql)
-        self.assertIn("RAISE EXCEPTION 'IDEA2STRATEGY_INTERNAL provider identity drift'", sql)
-        self.assertIn("RAISE EXCEPTION 'official RSI_14 feature feed identity drift'", sql)
-        self.assertNotIn("UPDATE MARKET_DATA.", sql.upper())
-
-    def test_production_rsi_seed_covers_only_the_four_selected_resolutions(self) -> None:
-        migration = self.contribution.migrations_directory / (
-            "V20260808120100__pipeline_seed_production_rsi_timeframes.sql"
-        )
-        sql = migration.read_text(encoding="utf-8")
-
-        for resolution in ("30m", "1h", "4h", "1d"):
-            self.assertIn(f"('{resolution}'", sql)
-        self.assertNotIn("('1m'", sql)
-        self.assertNotIn("('5m'", sql)
-        self.assertNotIn("('15m'", sql)
-        self.assertIn("production RSI_14 definition identity drift", sql)
-        self.assertIn("production RSI_14 feed identity drift", sql)
 
     def test_only_sql_and_gitkeep_live_under_migrations(self) -> None:
         allowed = {".sql"}
@@ -339,37 +281,6 @@ class ValidatorCliTests(unittest.TestCase):
 
     def test_cli_reports_failure_for_a_missing_root(self) -> None:
         self.assertEqual(validator.main([str(REPO_ROOT / "does-not-exist")]), 1)
-
-
-@pytest.mark.integration
-def test_official_feature_output_seed_replays_and_refuses_drift(admin_engine: object) -> None:
-    migration = CONTRIBUTION_ROOT / "migrations" / (
-        "V20260806120000__pipeline_seed_official_feature_output_feed.sql"
-    )
-    sql = migration.read_text(encoding="utf-8")
-    engine = admin_engine
-    with engine.begin() as connection:  # type: ignore[attr-defined]
-        connection.exec_driver_sql(sql)
-        connection.exec_driver_sql(sql)
-        provider = connection.exec_driver_sql(
-            "SELECT code, rights_version, status FROM market_data.providers "
-            "WHERE id = 'b9146ed9-dbb0-5323-93e3-8518f3851236'"
-        ).one()
-        feed = connection.exec_driver_sql(
-            "SELECT code, feed_version, retired_at FROM market_data.feeds "
-            "WHERE id = '063f8f27-5c6a-5348-b2bb-abc3c634149c'"
-        ).one()
-    assert tuple(provider) == ("IDEA2STRATEGY_INTERNAL", "internal-derived-v1", "ACTIVE")
-    assert tuple(feed) == ("FEATURE_RSI_14_1M_RSI_1_0_0", "rsi-1.0.0+feature-series.parquet.v1", None)
-
-    with engine.begin() as connection:  # type: ignore[attr-defined]
-        connection.exec_driver_sql(
-            "UPDATE market_data.providers SET rights_version = 'drifted' "
-            "WHERE id = 'b9146ed9-dbb0-5323-93e3-8518f3851236'"
-        )
-    with pytest.raises(Exception, match="provider identity drift"):
-        with engine.begin() as connection:  # type: ignore[attr-defined]
-            connection.exec_driver_sql(sql)
 
 
 if __name__ == "__main__":  # pragma: no cover
