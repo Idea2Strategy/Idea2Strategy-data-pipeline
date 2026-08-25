@@ -49,6 +49,8 @@ _SUPERPROJECT_SEARCH_DEPTH = 6
 _CENTRAL_MIGRATION_RELATIVE = Path("backend/db-migration/src/main/resources/db/migration")
 
 _VERSION = re.compile(r"^V(?P<version>[0-9]+)__")
+_COPY_FROM_STDIN = re.compile(r"(?m)^COPY [^\r\n]+ FROM stdin;\r?\n")
+_COPY_TERMINATOR = re.compile(r"(?m)^\\\.\r?\n")
 
 #: Emptied between Docker tests, child tables first.  `storage.objects` is included
 #: because `stage_object` writes it; see the ownership note in `db/tables.py`.
@@ -267,11 +269,15 @@ def postgres_url() -> Iterator[str]:
 
 
 def _execute_scripts(url: str, scripts: list[str]) -> None:
-    """Run whole SQL scripts through the raw driver cursor.
+    """Run central SQL scripts through the raw driver cursor.
 
     Not `exec_driver_sql`: SQLAlchemy hands psycopg an empty parameter tuple, which
     turns on client-side placeholder parsing, and `V1__initial_schema.sql` contains `%`
-    inside Korean `COMMENT` strings.  Passing no parameters at all avoids that entirely.
+    inside Korean `COMMENT` strings. Passing no parameters at all avoids that entirely.
+
+    The canonical V1 is a pg_dump and therefore contains psql COPY data blocks ending
+    in ``\\.``. Those are not SQL and cannot be sent to ``cursor.execute``. Feed them
+    through psycopg's COPY protocol while preserving every other byte as ordinary SQL.
     """
 
     engine = create_engine(url, future=True)
@@ -280,7 +286,7 @@ def _execute_scripts(url: str, scripts: list[str]) -> None:
         try:
             cursor = raw.cursor()
             for script in scripts:
-                cursor.execute(script)
+                _execute_script(cursor, script)
                 # Flyway commits each versioned migration independently. This is
                 # observable for PostgreSQL enum additions, whose new values
                 # cannot be referenced until the ALTER TYPE transaction commits.
@@ -289,6 +295,31 @@ def _execute_scripts(url: str, scripts: list[str]) -> None:
             raw.close()
     finally:
         engine.dispose()
+
+
+def _execute_script(cursor: Any, script: str) -> None:
+    """Execute SQL around any pg_dump ``COPY ... FROM stdin`` data blocks."""
+
+    position = 0
+    while copy_start := _COPY_FROM_STDIN.search(script, position):
+        sql_before = script[position : copy_start.start()]
+        if sql_before.strip():
+            cursor.execute(sql_before)
+
+        copy_end = _COPY_TERMINATOR.search(script, copy_start.end())
+        if copy_end is None:
+            raise ValueError("COPY FROM stdin block is missing its \\. terminator")
+
+        statement = copy_start.group(0).rstrip("\r\n")
+        payload = script[copy_start.end() : copy_end.start()]
+        with cursor.copy(statement) as copy:
+            if payload:
+                copy.write(payload)
+        position = copy_end.end()
+
+    sql_after = script[position:]
+    if sql_after.strip():
+        cursor.execute(sql_after)
 
 
 @pytest.fixture(scope="session")
