@@ -103,7 +103,7 @@ ENVIRONMENT_VARIABLES: tuple[tuple[str, bool, str, str], ...] = (
     (
         "PIPELINE_WORKER_MARKET_HISTORY_LIMIT",
         False,
-        "400",
+        "1000",
         "Recent adjusted bars retained per instrument and strategy timeframe.",
     ),
     (

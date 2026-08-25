@@ -43,7 +43,7 @@ def test_history_sync_config_parses_and_bounds_the_projection() -> None:
 
     config = HistorySyncConfig.from_environment(environment)
 
-    assert config.limit == 400
+    assert config.limit == 1000
     assert config.redis_key_prefix == "market"
     assert config.state_root == Path("state")
     with pytest.raises(ValueError, match="plain"):

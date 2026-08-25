@@ -63,7 +63,7 @@ class HistorySyncConfig:
         if not prefix or "{" in prefix or "}" in prefix:
             raise ValueError("market history Redis key prefix must be plain and non-empty")
         try:
-            limit = int(values.get("PIPELINE_WORKER_MARKET_HISTORY_LIMIT", "400"))
+            limit = int(values.get("PIPELINE_WORKER_MARKET_HISTORY_LIMIT", "1000"))
         except ValueError as error:
             raise ValueError("PIPELINE_WORKER_MARKET_HISTORY_LIMIT must be an integer") from error
         if limit < 1 or limit > 1_000:
