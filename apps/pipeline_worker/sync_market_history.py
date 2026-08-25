@@ -211,19 +211,24 @@ def _publish_missing_history(
 
 
 def _verified_parquet(
-    object_store: S3ObjectStore, relation: Mapping[str, Any], temporary_root: Path
+    object_store: S3ObjectStore,
+    relation: Mapping[str, Any],
+    temporary_root: Path,
+    *,
+    require_storage_metadata: bool = True,
 ) -> Path:
     storage = relation["storage"]
-    verification = object_store.verify_version(
-        str(storage["object_key"]),
-        str(storage["provider_version_id"]),
-        str(storage["content_hash"]),
-        int(storage["byte_size"]),
-    )
-    if not verification.ok:
-        raise RuntimeError(
-            f"canonical S3 object failed verification: {storage['object_key']} ({verification.message})"
+    if require_storage_metadata:
+        verification = object_store.verify_version(
+            str(storage["object_key"]),
+            str(storage["provider_version_id"]),
+            str(storage["content_hash"]),
+            int(storage["byte_size"]),
         )
+        if not verification.ok:
+            raise RuntimeError(
+                f"canonical S3 object failed verification: {storage['object_key']} ({verification.message})"
+            )
     path = temporary_root / f"{storage['id']}.parquet"
     digest = hashlib.sha256()
     size = 0
@@ -270,6 +275,7 @@ def _project_history(
     now: datetime,
     *,
     manifest_selector: Callable[[Any, str, str], list[dict[str, Any]]] = _adjusted_manifests,
+    require_storage_metadata: bool = True,
 ) -> dict[str, Any]:
     counts: dict[str, int] = {}
     manifest_ids: list[str] = []
@@ -306,7 +312,12 @@ def _project_history(
                 )
             )
             for relation in relations:
-                path = _verified_parquet(object_store, relation, temporary_root)
+                path = _verified_parquet(
+                    object_store,
+                    relation,
+                    temporary_root,
+                    require_storage_metadata=require_storage_metadata,
+                )
                 table = pq.read_table(
                     path,
                     columns=[
