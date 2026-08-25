@@ -26,7 +26,9 @@ dependencies = [
   "pandas>=3,<4",
   "pandas-market-calendars>=5.4,<6",
   "psycopg[binary]>=3.2,<4",
-  "pyarrow>=25,<26",
+  # Parquet contract fixtures include the producer version in their metadata.
+  # Keep the writer exact so byte-for-byte determinism is portable across CI and local runs.
+  "pyarrow==25.0.0",
   "python-dotenv>=1,<2",
   # D90: C's market gateway publishes market events on Redis Streams
   # (`RedisMarketEventPublisher`), so `market_pipeline_lib.redis_ingest` is the
