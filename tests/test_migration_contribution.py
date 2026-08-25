@@ -13,8 +13,6 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRIBUTION_ROOT = REPO_ROOT / "db" / "migration-contributions"
 VALIDATOR_PATH = CONTRIBUTION_ROOT / "validate_contribution.py"
