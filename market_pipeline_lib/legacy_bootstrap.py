@@ -714,6 +714,7 @@ def _translate_legacy_v001(
                         if str(row["status"]) in {"AVAILABLE", "SUPERSEDED"}
                         else None
                     ),
+                    "object_count": len(linked),
                 },
             )
         )

@@ -334,6 +334,7 @@ dataset_manifests = Table(
     ),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")),
     Column("available_at", TIMESTAMP(timezone=True)),
+    Column("object_count", BigInteger, nullable=False, server_default=text("0")),
     Index(
         "uq_dataset_manifests_feed_instrument_layer_resolution_start_rev",
         "feed_id",
