@@ -131,10 +131,9 @@ def test_postgres_localstack_approval_publishes_queryable_registered_revision(
     with admin_engine.begin() as connection:
         connection.execute(text("""
             insert into operations.operator_accounts
-              (id, external_identity_key_hmac, external_identity_key_version,
-               status, mfa_enrolled_at, created_at)
-            values (:id, :identity, 1, 'ACTIVE', now(), now())
-        """), {"id": ACTOR, "identity": "d15-" + str(ACTOR)})
+              (id, status, created_at)
+            values (:id, 'ACTIVE', now())
+        """), {"id": ACTOR})
         connection.execute(text("""
             insert into operations.audit_events
               (id, actor_type, actor_id, action_type, target_domain, target_id, reason_code,

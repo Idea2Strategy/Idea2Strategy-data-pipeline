@@ -264,7 +264,10 @@ def test_exact_empty_v001_shape_is_read_without_mutating_it(tmp_path: Path) -> N
         catalog = connect_read_only_catalog(url, artifact_root=tmp_path)
         try:
             catalog.verify_schema()
-            assert [row["code"] for row in catalog.records("market_data.providers")] == ["ALPACA"]
+            assert {row["code"] for row in catalog.records("market_data.providers")} == {
+                "ALPACA",
+                "IDEA2STRATEGY_INTERNAL",
+            }
             assert catalog.records("market_data.dataset_objects") == []
             assert catalog.records("market_data.dataset_lineage") == []
             assert catalog.records("market_data.quality_incidents") == []
@@ -396,6 +399,7 @@ def test_populated_market_loader_v001_maps_768_objects_and_96_manifests_determin
     assert relation["part_number"] == 1
     assert manifest["schema_version"] == "market-bars/1"
     assert manifest["dataset_hash"]
+    assert manifest["object_count"] == 8
 
 
 def test_populated_market_loader_v001_requires_deployment_bucket_and_known_partition() -> None:
