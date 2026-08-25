@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -268,6 +268,8 @@ def _project_history(
     redis_client: Any,
     config: HistorySyncConfig,
     now: datetime,
+    *,
+    manifest_selector: Callable[[Any, str, str], list[dict[str, Any]]] = _adjusted_manifests,
 ) -> dict[str, Any]:
     counts: dict[str, int] = {}
     manifest_ids: list[str] = []
@@ -276,7 +278,7 @@ def _project_history(
     with tempfile.TemporaryDirectory(prefix="i2s-history-") as temporary:
         temporary_root = Path(temporary)
         for timeframe, (layer, lookback_days) in TIMEFRAMES.items():
-            manifests = _adjusted_manifests(catalog, timeframe, layer)
+            manifests = manifest_selector(catalog, timeframe, layer)
             if not manifests:
                 raise RuntimeError(f"no AVAILABLE adjusted history for {timeframe}")
             historical_through = max(_timestamp(row["period_end"]) for row in manifests)
