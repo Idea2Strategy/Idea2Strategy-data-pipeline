@@ -115,18 +115,19 @@ type_error = assert_type(KEYS[2], 'hash')
 if type_error ~= nil then
   return type_error
 end
-type_error = assert_type(KEYS[3], 'set')
+type_error = assert_type(KEYS[3], 'zset')
 if type_error ~= nil then
   return type_error
 end
-if ARGV[6] == 'BAR_1M' then
+if string.sub(ARGV[6], 1, 4) == 'BAR_' then
   type_error = assert_type(KEYS[4], 'zset')
   if type_error ~= nil then
     return type_error
   end
 end
 
-if redis.call('SADD', KEYS[3], ARGV[1]) == 0 then
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[18])
+if redis.call('ZADD', KEYS[3], 'NX', ARGV[17], ARGV[1]) == 0 then
   return {0, '', 0}
 end
 
@@ -145,6 +146,7 @@ local stream_id = redis.call(
   'revision', ARGV[11],
   'correctionOfEventId', ARGV[12],
   'values', ARGV[13])
+redis.call('XTRIM', KEYS[1], 'MAXLEN', '=', tonumber(ARGV[19]))
 
 local latest_updated = 0
 if ARGV[14] == '1' then
@@ -174,7 +176,7 @@ if ARGV[14] == '1' then
   end
 end
 
-if ARGV[6] == 'BAR_1M' then
+if string.sub(ARGV[6], 1, 4) == 'BAR_' then
   redis.call('ZREMRANGEBYSCORE', KEYS[4], ARGV[10], ARGV[10])
   redis.call('ZADD', KEYS[4], ARGV[10], ARGV[16])
   local bar_count = redis.call('ZCARD', KEYS[4])
@@ -182,7 +184,6 @@ if ARGV[6] == 'BAR_1M' then
   if bar_count > capacity then
     redis.call('ZREMRANGEBYRANK', KEYS[4], 0, bar_count - capacity - 1)
   end
-  redis.call('PUBLISH', KEYS[5], ARGV[16])
 end
 
 return {1, stream_id, latest_updated}
@@ -371,12 +372,15 @@ class CPublisher:
         return stream_key(self._prefix)
 
     def publish(self, event: Mapping[str, Any], *, update_latest: bool = True) -> list[Any]:
+        received_at_ms = int(
+            datetime.fromisoformat(str(event["receivedAt"]).replace("Z", "+00:00")).timestamp()
+            * 1000
+        )
         keys = [
             stream_key(self._prefix),
             latest_key(self._prefix, event["instrumentId"], event["eventType"]),
             deduplication_key(self._prefix),
             recent_bars_key(self._prefix, event["instrumentId"]),
-            bar_updates_channel(self._prefix),
         ]
         argv = [
             event["eventId"],
@@ -395,6 +399,9 @@ class CPublisher:
             "1" if update_latest else "0",
             "1000",
             self._bar_update_json(event),
+            str(received_at_ms),
+            str(received_at_ms - 86_400_000),
+            "10000",
         ]
         return list(self._client.eval(C_PUBLISH_SCRIPT, len(keys), *keys, *argv))
 
@@ -598,7 +605,7 @@ class TestCsKeyContract(unittest.TestCase):
 
     def test_the_five_keys_are_cs_five_keys(self) -> None:
         self.assertEqual(stream_key("i2s"), "{i2s:market}:events")
-        self.assertEqual(deduplication_key("i2s"), "{i2s:market}:seen")
+        self.assertEqual(deduplication_key("i2s"), "{i2s:market}:seen:v2")
         self.assertEqual(
             latest_key("i2s", C_INSTRUMENT_ID, "QUOTE"),
             "{i2s:market}:latest:8a35e6b5-cf84-4f63-920d-57c1f1b95df0:QUOTE",
@@ -636,7 +643,7 @@ class TestCsKeyContract(unittest.TestCase):
     def test_the_key_roles_are_cs_five_lua_keys_in_cs_order(self) -> None:
         """C's stream, latest, dedup, recent-bars and notification roles stay ordered."""
 
-        self.assertEqual(C_PUBLISH_KEY_ROLES, ("stream", "hash", "set", "zset", "channel"))
+        self.assertEqual(C_PUBLISH_KEY_ROLES, ("stream", "hash", "zset", "zset"))
 
     def test_the_stream_fields_are_cs_xadd_fields_in_cs_order(self) -> None:
         self.assertEqual(
@@ -1386,7 +1393,7 @@ class TestOrderingAndDedupAgainstCsKeys:
         assert first[2] == 1
         assert duplicate[0] == 0
         assert redis_client.xlen(stream_key(key_prefix)) == 1
-        assert redis_client.scard(deduplication_key(key_prefix)) == 1
+        assert redis_client.zcard(deduplication_key(key_prefix)) == 1
 
         source = build_source(redis_client, key_prefix)
         deliveries = source.poll(max_messages=10, wait_seconds=0.1)
@@ -1459,7 +1466,7 @@ class TestOrderingAndDedupAgainstCsKeys:
             publisher.publish(event)
 
         assert redis_client.xlen(stream_key(key_prefix)) == 0
-        assert redis_client.scard(deduplication_key(key_prefix)) == 0
+        assert redis_client.zcard(deduplication_key(key_prefix)) == 0
 
     def test_events_are_consumed_in_cs_publish_order_across_several_polls(
         self, redis_client: Any, key_prefix: str

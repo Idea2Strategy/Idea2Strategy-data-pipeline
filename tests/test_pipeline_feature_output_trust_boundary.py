@@ -47,6 +47,8 @@ SOURCE_FEED = "40000000-0000-4000-8000-000000000001"
 SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000001"
 SOURCE_OBJECT = "60000000-0000-4000-8000-000000000001"
 SOURCE_STORAGE = "70000000-0000-4000-8000-000000000001"
+COMPOSITE_MANIFEST = "50000000-0000-4000-8000-000000000004"
+COMPOSITE_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000004"
 OVERLAP_SOURCE_OBJECT = "60000000-0000-4000-8000-000000000003"
 OVERLAP_SOURCE_STORAGE = "70000000-0000-4000-8000-000000000003"
 CURRENT_SOURCE_MANIFEST = "50000000-0000-4000-8000-000000000002"
@@ -88,7 +90,7 @@ def canonical_bar_table() -> pa.Table:
     )
 
 
-def legacy_loader_bar_table(*, derived: bool) -> pa.Table:
+def legacy_loader_bar_table(*, derived: bool, manifest_id: str = SOURCE_MANIFEST) -> pa.Table:
     canonical = canonical_bar_table()
     fields = list(canonical.schema.remove_metadata())
     arrays = list(canonical.columns)
@@ -118,7 +120,7 @@ def legacy_loader_bar_table(*, derived: bool) -> pa.Table:
             b"period_start": b"2026-01-05",
             b"period_end": b"2026-01-06",
             b"revision": b"1",
-            b"manifest_id": SOURCE_MANIFEST.encode("ascii"),
+            b"manifest_id": manifest_id.encode("ascii"),
             b"created_at": b"2026-01-05T15:00:00+00:00",
         },
     )
@@ -294,11 +296,7 @@ def seed_catalog(
             "part_number": 1,
             "row_count": table.num_rows if relation_row_count is None else relation_row_count,
             "min_instrument_id": INSTRUMENT,
-            "max_instrument_id": (
-                OTHER_INSTRUMENT_SAME_SHARD
-                if manifest_instrument_id is None
-                else INSTRUMENT
-            ),
+            "max_instrument_id": (OTHER_INSTRUMENT_SAME_SHARD if manifest_instrument_id is None else INSTRUMENT),
         },
     )
     return catalog, source_store, output_store, published
@@ -415,9 +413,7 @@ def add_overlapping_source_object(
 
 
 def add_current_source_revision(catalog: Any) -> None:
-    previous = catalog.records(
-        "market_data.dataset_manifests", where={"id": SOURCE_MANIFEST}
-    )[0]
+    previous = catalog.records("market_data.dataset_manifests", where={"id": SOURCE_MANIFEST})[0]
     relation = catalog.records("market_data.dataset_objects", where={"id": SOURCE_OBJECT})[0]
     catalog.publish_manifest(
         {
@@ -529,9 +525,7 @@ def test_conflicting_bars_at_source_object_boundaries_are_rejected(
         port.materialize(request, command_id="feature-command-conflicting-overlap")
 
 
-def test_shard_row_budget_counts_only_the_requested_instrument(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_shard_row_budget_counts_only_the_requested_instrument(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(feature_output_module, "MAX_FEATURE_SOURCE_ROWS", 3)
     shard = stable_shard_key(INSTRUMENT, 2)
     catalog, source_store, output_store, published = seed_catalog(
@@ -547,9 +541,7 @@ def test_shard_row_budget_counts_only_the_requested_instrument(
     assert result["row_count"] == 2
 
 
-def test_requested_instrument_rows_still_obey_the_row_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_requested_instrument_rows_still_obey_the_row_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(feature_output_module, "MAX_FEATURE_SOURCE_ROWS", 2)
     catalog, source_store, output_store, published = seed_catalog(tmp_path)
     port = production_port(tmp_path, catalog, source_store, output_store)
@@ -573,10 +565,70 @@ def test_exact_legacy_loader_bar_schemas_are_accepted(tmp_path: Path, derived: b
     assert result["row_count"] == 2
 
 
-def test_legacy_loader_schema_with_an_unknown_field_is_rejected(tmp_path: Path) -> None:
-    table = legacy_loader_bar_table(derived=True).append_column(
-        "unexpected", pa.array([1, 1, 1], type=pa.int8())
+def test_composite_manifest_accepts_a_reused_object_from_its_recorded_source(
+    tmp_path: Path,
+) -> None:
+    """Dropping the lineage/object-membership check must reject a valid composite source."""
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=legacy_loader_bar_table(derived=False),
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
     )
+    source_manifest = catalog.records("market_data.dataset_manifests", where={"id": SOURCE_MANIFEST})[0]
+    source_relation = catalog.records("market_data.dataset_objects", where={"id": SOURCE_OBJECT})[0]
+    catalog.publish_manifest(
+        {
+            **source_manifest,
+            "id": COMPOSITE_MANIFEST,
+            "revision_number": 2,
+            "dataset_hash": "c" * 64,
+            "supersedes_manifest_id": SOURCE_MANIFEST,
+        }
+    )
+    catalog.upsert(
+        "market_data.dataset_objects",
+        {
+            **source_relation,
+            "id": COMPOSITE_SOURCE_OBJECT,
+            "dataset_manifest_id": COMPOSITE_MANIFEST,
+        },
+    )
+    catalog.record_dataset_lineage(
+        {
+            "derived_manifest_id": COMPOSITE_MANIFEST,
+            "source_manifest_id": SOURCE_MANIFEST,
+            "relation_type": "COMPOSED_FROM",
+        }
+    )
+    request = payload(published)
+    request["source_dataset_object_ids"] = [COMPOSITE_SOURCE_OBJECT]
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    result = port.materialize(request, command_id="legacy-loader-composite-source")
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["row_count"] == 2
+
+
+def test_composite_manifest_rejects_an_object_metadata_id_without_lineage(
+    tmp_path: Path,
+) -> None:
+    catalog, source_store, output_store, published = seed_catalog(
+        tmp_path,
+        source_table=legacy_loader_bar_table(
+            derived=False,
+            manifest_id="50000000-0000-4000-8000-000000000099",
+        ),
+        source_schema_version=LEGACY_LOADER_SCHEMA_VERSION,
+    )
+    port = production_port(tmp_path, catalog, source_store, output_store)
+
+    with pytest.raises(MalformedEventError, match="Parquet schema"):
+        port.materialize(payload(published), command_id="legacy-loader-untrusted-source")
+
+
+def test_legacy_loader_schema_with_an_unknown_field_is_rejected(tmp_path: Path) -> None:
+    table = legacy_loader_bar_table(derived=True).append_column("unexpected", pa.array([1, 1, 1], type=pa.int8()))
     catalog, source_store, output_store, published = seed_catalog(
         tmp_path,
         source_table=table,
@@ -867,9 +919,7 @@ def test_only_the_highest_available_exact_manifest_revision_is_required(tmp_path
     )
 
     assert result["status"] == "SUCCEEDED"
-    assert catalog.records(
-        "market_data.dataset_manifests", where={"id": SOURCE_MANIFEST}
-    )[0]["status"] == "AVAILABLE"
+    assert catalog.records("market_data.dataset_manifests", where={"id": SOURCE_MANIFEST})[0]["status"] == "AVAILABLE"
     with pytest.raises(MalformedEventError, match="current AVAILABLE revision"):
         port.materialize(payload(published), command_id="stale-source-revision")
 
@@ -919,9 +969,7 @@ def test_existing_output_manifest_immutable_drift_is_rejected(tmp_path: Path) ->
     catalog, source_store, output_store, published = seed_catalog(tmp_path)
     port = production_port(tmp_path, catalog, source_store, output_store)
     result = port.materialize(payload(published), command_id="manifest-drift")
-    manifest = catalog.records(
-        "market_data.dataset_manifests", where={"id": result["output_dataset_manifest_id"]}
-    )[0]
+    manifest = catalog.records("market_data.dataset_manifests", where={"id": result["output_dataset_manifest_id"]})[0]
     catalog.upsert("market_data.dataset_manifests", {**manifest, "schema_version": "drifted.v9"})
 
     with pytest.raises(MalformedEventError, match="immutable canonical state"):
@@ -1009,40 +1057,50 @@ def test_approved_official_rsi_row_resolves_exact_feed_and_existing_calculator()
 
 
 @pytest.mark.parametrize(
-    ("resolution", "definition_id", "feed_id", "feed_code"),
+    ("resolution", "definition_id", "definition_hash", "feed_id", "feed_code"),
     [
         (
             "30m",
-            "4b1c6801-0259-5176-a857-0e5ea923d898",
+            "ec37984b-6605-5560-8ea0-774c5b8e9626",
+            "sha256:250df12e46d233e7b8ece86c64df7a3941f0d70436aebe522b1387f15fb346dc",
             "57794d8c-2254-53e4-966e-44f97edd9e6a",
             "FEATURE_RSI_14_30M_RSI_1_0_0",
         ),
         (
             "1h",
-            "2e18c093-5d4e-5d9a-bd22-b7e5679f1a3e",
+            "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f",
+            "sha256:7e8c5600ff2bf07a043f797a50d6467f86fbdb56ee532c87929df97f246af2de",
             "28012549-4f45-56d3-8bb6-329e4c7a9d77",
             "FEATURE_RSI_14_1H_RSI_1_0_0",
         ),
         (
             "4h",
-            "1b2785bd-20f0-50a2-ae96-6a1f7bad74b9",
+            "65a5aaf5-f536-820f-119a-239b0aec0de7",
+            "sha256:42e28b02a1552eb2aa42e0d89b1ea3dd909ee8d34c3bc290c4ce0234c6d705da",
             "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
             "FEATURE_RSI_14_4H_RSI_1_0_0",
         ),
         (
             "1d",
-            "eddfb2d4-8586-5260-8fc9-9c8125990270",
+            "647a5fd6-98ed-0617-d4b2-844748d54fac",
+            "sha256:64dbbcda7352d0add9a4a6a6ed94a780603880891684dc32cf39e0a3d1167422",
             "6d2647f8-5caf-55ee-8821-869dc693f68a",
             "FEATURE_RSI_14_1D_RSI_1_0_0",
         ),
     ],
 )
 def test_production_rsi_definition_and_feed_follow_the_selected_resolution(
-    resolution: str, definition_id: str, feed_id: str, feed_code: str,
+    resolution: str,
+    definition_id: str,
+    definition_hash: str,
+    feed_id: str,
+    feed_code: str,
 ) -> None:
     definition = production_rsi_14_definition(resolution)
 
     assert definition.id == definition_id
+    assert definition.element_catalog_version_id == "0f5a0000-0000-4000-8000-000000000001"
+    assert definition.definition_hash == definition_hash
     assert definition.resolution == resolution
     assert feature_output_feed_id(definition) == feed_id
     assert feature_output_feed_code(definition) == feed_code
@@ -1070,21 +1128,18 @@ def test_production_command_commits_and_reconciles_through_postgres_16(
                 "digest": hashlib.sha256(CATALOG_VERSION.encode("ascii")).hexdigest(),
             },
         )
-    catalog, source_store, output_store, published = seed_catalog(
-        tmp_path, catalog=postgres_catalog
-    )
+    catalog, source_store, output_store, published = seed_catalog(tmp_path, catalog=postgres_catalog)
     port = production_port(tmp_path, catalog, source_store, output_store)
 
     first = port.materialize(payload(published), command_id="postgres-production-command")
     second = port.materialize(payload(published), command_id="postgres-production-command")
 
     assert first == second
-    assert postgres_catalog.pipeline_run(feature_output_run_id("postgres-production-command"))[
-        "status"
-    ] == "SUCCEEDED"
+    assert postgres_catalog.pipeline_run(feature_output_run_id("postgres-production-command"))["status"] == "SUCCEEDED"
     assert len(postgres_catalog.records("market_data.feature_materializations")) == 1
-    assert len(
-        postgres_catalog.records(
-            "market_data.dataset_manifests", where={"id": first["output_dataset_manifest_id"]}
+    assert (
+        len(
+            postgres_catalog.records("market_data.dataset_manifests", where={"id": first["output_dataset_manifest_id"]})
         )
-    ) == 1
+        == 1
+    )

@@ -65,17 +65,37 @@ OFFICIAL_RSI_14_PARAMETERS = {
     "calendar_id": "XNYS",
 }
 PRODUCTION_RSI_14_RESOLUTIONS = ("30m", "1h", "4h", "1d")
-PRODUCTION_ELEMENT_CATALOG_ID = "0f4a0000-0000-4000-8000-000000000001"
+LEGACY_PRODUCTION_ELEMENT_CATALOG_ID = "0f4a0000-0000-4000-8000-000000000001"
+PRODUCTION_ELEMENT_CATALOG_ID = "0f5a0000-0000-4000-8000-000000000001"
+PRODUCTION_ELEMENT_CATALOG_IDS = frozenset({LEGACY_PRODUCTION_ELEMENT_CATALOG_ID, PRODUCTION_ELEMENT_CATALOG_ID})
+PRODUCTION_RSI_14_IDENTITIES = {
+    "30m": (
+        "ec37984b-6605-5560-8ea0-774c5b8e9626",
+        "sha256:250df12e46d233e7b8ece86c64df7a3941f0d70436aebe522b1387f15fb346dc",
+    ),
+    "1h": (
+        "85f4f80f-be4e-d9dc-bd52-d4781ba5f30f",
+        "sha256:7e8c5600ff2bf07a043f797a50d6467f86fbdb56ee532c87929df97f246af2de",
+    ),
+    "4h": (
+        "65a5aaf5-f536-820f-119a-239b0aec0de7",
+        "sha256:42e28b02a1552eb2aa42e0d89b1ea3dd909ee8d34c3bc290c4ce0234c6d705da",
+    ),
+    "1d": (
+        "647a5fd6-98ed-0617-d4b2-844748d54fac",
+        "sha256:64dbbcda7352d0add9a4a6a6ed94a780603880891684dc32cf39e0a3d1167422",
+    ),
+}
 
 
 def production_rsi_14_definition(resolution: str) -> FeatureDefinition:
     """The immutable RSI_14 definition for one selectable backtest resolution."""
 
     if resolution not in PRODUCTION_RSI_14_RESOLUTIONS:
-        raise InvalidFeatureParameters(
-            f"production RSI_14 resolution must be one of {PRODUCTION_RSI_14_RESOLUTIONS}"
-        )
-    return FeatureDefinition._assemble(
+        raise InvalidFeatureParameters(f"production RSI_14 resolution must be one of {PRODUCTION_RSI_14_RESOLUTIONS}")
+    definition_id, definition_hash = PRODUCTION_RSI_14_IDENTITIES[resolution]
+    return FeatureDefinition(
+        id=definition_id,
         element_catalog_version_id=PRODUCTION_ELEMENT_CATALOG_ID,
         feature_code="RSI_14",
         calculator_version="rsi:1.0.0",
@@ -83,6 +103,7 @@ def production_rsi_14_definition(resolution: str) -> FeatureDefinition:
         normalized_parameters=OFFICIAL_RSI_14_PARAMETERS,
         output_value_type="NUMBER",
         required_history_points=15,
+        definition_hash=definition_hash,
     )
 
 
@@ -126,7 +147,7 @@ class FeatureDefinition:
     def __post_init__(self) -> None:
         if not self.verify:
             return
-        if self._is_official_rsi_14():
+        if self._is_official_rsi_14() or self._is_production_rsi_14():
             return
         if not is_sha256_hex(self.definition_hash):
             raise DefinitionIntegrityError(
@@ -161,9 +182,7 @@ class FeatureDefinition:
         calculator = get_calculator(code, version)
         normalized = calculator.normalize_parameters(parameters)
         return cls._assemble(
-            element_catalog_version_id=_require_uuid_like(
-                element_catalog_version_id, "element_catalog_version_id"
-            ),
+            element_catalog_version_id=_require_uuid_like(element_catalog_version_id, "element_catalog_version_id"),
             feature_code=code,
             calculator_version=version,
             resolution=_require_text(resolution, "resolution", limit=30),
@@ -239,9 +258,7 @@ class FeatureDefinition:
             raise DefinitionIntegrityError(f"feature_definitions row is missing {missing}")
         parameters = record["normalized_parameters"]
         if not isinstance(parameters, Mapping):
-            raise DefinitionIntegrityError(
-                f"normalized_parameters must be an object, got {type(parameters).__name__}"
-            )
+            raise DefinitionIntegrityError(f"normalized_parameters must be an object, got {type(parameters).__name__}")
         return cls(
             id=str(record["id"]),
             element_catalog_version_id=str(record["element_catalog_version_id"]),
@@ -289,11 +306,28 @@ class FeatureDefinition:
         return get_calculator(self.feature_code, self.calculator_version)
 
     def _uses_rsi_14_adapter(self) -> bool:
-        return self._is_official_rsi_14() or (
-            self.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+        return (
+            self._is_official_rsi_14()
+            or self._is_production_rsi_14()
+            or (
+                self.element_catalog_version_id == LEGACY_PRODUCTION_ELEMENT_CATALOG_ID
+                and self.feature_code == "RSI_14"
+                and self.calculator_version == "rsi:1.0.0"
+                and self.resolution in PRODUCTION_RSI_14_RESOLUTIONS
+                and self.normalized_parameters == OFFICIAL_RSI_14_PARAMETERS
+                and self.output_value_type == "NUMBER"
+                and self.required_history_points == 15
+            )
+        )
+
+    def _is_production_rsi_14(self) -> bool:
+        identity = PRODUCTION_RSI_14_IDENTITIES.get(self.resolution)
+        return (
+            identity is not None
+            and (self.id, self.definition_hash) == identity
+            and self.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
             and self.feature_code == "RSI_14"
             and self.calculator_version == "rsi:1.0.0"
-            and self.resolution in PRODUCTION_RSI_14_RESOLUTIONS
             and self.normalized_parameters == OFFICIAL_RSI_14_PARAMETERS
             and self.output_value_type == "NUMBER"
             and self.required_history_points == 15
@@ -336,9 +370,7 @@ class _OfficialRsi14CalculatorAdapter:
     def compute(self, bars: Any, parameters: Mapping[str, Any]) -> Any:
         if dict(parameters) != OFFICIAL_RSI_14_PARAMETERS:
             raise DefinitionIntegrityError("official RSI_14 parameters drifted")
-        return get_calculator("RSI", "1.0.0").compute(
-            bars, {"period": 14, "price_field": "close"}
-        )
+        return get_calculator("RSI", "1.0.0").compute(bars, {"period": 14, "price_field": "close"})
 
 
 def _payload_of(
@@ -385,9 +417,7 @@ class FeatureDefinitionRegistry:
 
     # -- writes ------------------------------------------------------------------------
 
-    def publish(
-        self, definition: FeatureDefinition, *, created_at: datetime | None = None
-    ) -> FeatureDefinition:
+    def publish(self, definition: FeatureDefinition, *, created_at: datetime | None = None) -> FeatureDefinition:
         """Append a definition, or return the identical one already published.
 
         Raises `FeatureDefinitionImmutable` when a row with this `id` exists and differs.
@@ -396,9 +426,7 @@ class FeatureDefinitionRegistry:
         existing = self._row_by_id(definition.id)
         if existing is not None:
             differences = [
-                column
-                for column in _IDENTITY_COLUMNS
-                if existing.get(column) != definition.to_record()[column]
+                column for column in _IDENTITY_COLUMNS if existing.get(column) != definition.to_record()[column]
             ]
             if differences:
                 raise FeatureDefinitionImmutable(
@@ -431,9 +459,7 @@ class FeatureDefinitionRegistry:
     def is_published(self, definition: FeatureDefinition) -> bool:
         return self._row_by_id(definition.id) is not None
 
-    def versions(
-        self, *, feature_code: str, element_catalog_version_id: str
-    ) -> tuple[FeatureDefinition, ...]:
+    def versions(self, *, feature_code: str, element_catalog_version_id: str) -> tuple[FeatureDefinition, ...]:
         """Every published version of one feature, in publication order.
 
         There is no `version` column in the canonical schema; a version *is* a row, and

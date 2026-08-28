@@ -3,7 +3,7 @@
 The gap this closes
 -------------------
 C's market gateway publishes every market event through
-``RedisMarketEventPublisher`` -- Redis Streams, one Lua script, five keys.  D's
+``RedisMarketEventPublisher`` -- Redis Streams, one Lua script, four keys.  D's
 realtime ingest (:mod:`market_pipeline_lib.realtime_ingest`) consumed **SQS**.
 No event C emits could ever reach D; the two halves of D90 were never connected,
 whatever either side's tests said.
@@ -24,17 +24,18 @@ C's contract, and where each line of it was read
 ``redis/RedisMarketEventPublisher.java``
     ``:310-318``
         The key base is ``"{" + keyPrefix + ":market}"``.  The braces are a Redis
-        Cluster hash tag: all three keys of the publish script land in one slot,
+        Cluster hash tag: all four keys of the publish script land in one slot,
         which is what lets the script be atomic on a clustered deployment.  A
         prefix containing braces of its own is refused, and so is a blank one.
     ``:252-264``
-        ``<base>:events`` (stream), ``<base>:seen`` (set), and
-        ``<base>:latest:<instrumentId>:<EVENT_TYPE>`` (hash).
+        ``<base>:events`` (stream), ``<base>:latest:<instrumentId>:<EVENT_TYPE>``
+        (hash), ``<base>:seen:v2`` (bounded sorted set), and
+        ``<base>:bars:<instrumentId>:1m`` (bounded sorted set).
     ``:46-48``
-        ``SADD`` on ``:seen`` is the **publish gate**.  The member is the
-        ``eventId``, and an ``eventId`` already in the set is never appended to the
-        stream again.  So duplicate suppression happens *at the producer*: any
-        repeat D sees is a redelivery of one stream entry, never a second entry.
+        ``ZSCORE``/``ZADD`` on ``:seen:v2`` is the **publish gate**.  The member is
+        the ``eventId`` and its score is the receive timestamp.  Recent duplicate
+        event IDs are never appended to the stream again; old entries are trimmed
+        so the producer-side index remains bounded.
     ``:50-64``
         The thirteen ``XADD`` fields, in order, all Redis strings -- see
         :data:`C_STREAM_FIELDS`.  ``correctionOfEventId`` is written as ``""``
@@ -110,16 +111,15 @@ __all__ = [
 
 LOGGER = logging.getLogger("market_pipeline_lib.redis_ingest")
 
-#: The five ``KEYS`` of C's publish script and their Redis roles
+#: The four ``KEYS`` of C's publish script and their Redis roles
 #: (``RedisMarketEventPublisher.java:36-53``).  Pinned because the script asserts
 #: the types before it writes anything, so a D-side helper that built the keys in
 #: another order would make C's own script fail closed against its own data.
-C_PUBLISH_KEY_ROLES: tuple[str, str, str, str, str] = (
+C_PUBLISH_KEY_ROLES: tuple[str, str, str, str] = (
     "stream",
     "hash",
-    "set",
     "zset",
-    "channel",
+    "zset",
 )
 
 #: Every field C's ``XADD`` writes, in C's order
@@ -194,9 +194,9 @@ def stream_key(key_prefix: str) -> str:
 
 
 def deduplication_key(key_prefix: str) -> str:
-    """C's producer-side de-duplication set of ``eventId``s -- ``:256-258``."""
+    """C's bounded producer-side de-duplication ZSET of ``eventId``s."""
 
-    return f"{market_key_base(key_prefix)}:seen"
+    return f"{market_key_base(key_prefix)}:seen:v2"
 
 
 def latest_key(key_prefix: str, instrument_id: str, event_type: str) -> str:
@@ -616,14 +616,14 @@ class RedisMarketEventSource:
 
     # -- reading C's own projections ----------------------------------------------
     def producer_published(self, event_id: str) -> bool:
-        """Whether C's de-duplication set records having published `event_id`.
+        """Whether C's bounded de-duplication ZSET contains `event_id`.
 
-        C's ``SADD`` gate (``RedisMarketEventPublisher.java:46-48``) means this set is
-        the producer's own record of what it emitted.  Read-only from D: writing to it
-        would make C's next publish of that event a no-op and lose the event outright.
+        C's ``ZSCORE``/``ZADD`` gate makes this index the producer's own record of
+        recently emitted events.  Read-only from D: writing to it would make C's next
+        publish of that event a no-op and lose the event outright.
         """
 
-        return bool(self._client.sismember(self._deduplication_key, event_id))
+        return self._client.zscore(self._deduplication_key, event_id) is not None
 
     def latest_observation(self, instrument_id: str, event_type: str) -> dict[str, Any] | None:
         """C's ``:latest:`` hash for one instrument and type, or ``None``.

@@ -1150,7 +1150,7 @@ def test_an_official_rsi_materialization_has_a_pinned_result_hash(
     assert result.input_dataset_set_hash == SOURCE_BUNDLE_FINGERPRINT
     expected_payload = (
         "{"
-        f'"definition_hash":"{definition.definition_hash}",'
+        f'"definition_hash":"{definition.definition_hash.removeprefix("sha256:")}",'
         f'"input_dataset_set_hash":"{SOURCE_BUNDLE_FINGERPRINT}",'
         f'"instrument_id":"{INSTRUMENT_A}",'
         '"period_end":"2026-03-02T00:00:00Z",'
@@ -1186,7 +1186,7 @@ def test_recomputing_an_official_rsi_materialization_reproduces_the_same_hash(
     assert first.result_hash == second.result_hash
     assert first.result_hash == sha256_of(
         "{"
-        f'"definition_hash":"{definition.definition_hash}",'
+        f'"definition_hash":"{definition.definition_hash.removeprefix("sha256:")}",'
         f'"input_dataset_set_hash":"{SOURCE_BUNDLE_FINGERPRINT}",'
         f'"instrument_id":"{INSTRUMENT_A}",'
         '"period_end":"2026-03-02T00:00:00Z",'

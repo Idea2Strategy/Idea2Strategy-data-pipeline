@@ -39,7 +39,7 @@ from market_pipeline_lib.features import (
 )
 from market_pipeline_lib.features.definitions import (
     OFFICIAL_RSI_14_ID,
-    PRODUCTION_ELEMENT_CATALOG_ID,
+    PRODUCTION_ELEMENT_CATALOG_IDS,
     PRODUCTION_RSI_14_RESOLUTIONS,
 )
 from market_pipeline_lib.features.hashing import canonical_sha256, iso_utc
@@ -56,9 +56,13 @@ MAX_FEATURE_SOURCE_ROWS = 2_000_000
 MAX_FEATURE_SOURCE_BYTES = 512 * 1024 * 1024
 FEATURE_READ_BATCH_ROWS = 65_536
 LEGACY_LOADER_SCHEMA_VERSION = "market-bars/1"
-SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS = frozenset(
-    {SCHEMA_VERSION, LEGACY_LOADER_SCHEMA_VERSION}
-)
+PRODUCTION_RSI_14_FEED_IDS = {
+    "30m": "57794d8c-2254-53e4-966e-44f97edd9e6a",
+    "1h": "28012549-4f45-56d3-8bb6-329e4c7a9d77",
+    "4h": "e1d7d508-aaf1-5ae9-8098-c4af870f6fa4",
+    "1d": "6d2647f8-5caf-55ee-8821-869dc693f68a",
+}
+SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, LEGACY_LOADER_SCHEMA_VERSION})
 
 
 def _legacy_loader_bar_schemas() -> tuple[pa.Schema, pa.Schema]:
@@ -77,16 +81,14 @@ def _matches_source_parquet_schema(
     actual: pa.Schema,
     *,
     manifest: Mapping[str, Any],
+    accepted_manifest_ids: frozenset[str] | None = None,
 ) -> bool:
     schema_version = str(manifest["schema_version"])
     if schema_version == SCHEMA_VERSION:
         return bool(actual.equals(bar_schema(False), check_metadata=False))
     if schema_version != LEGACY_LOADER_SCHEMA_VERSION:
         return False
-    if not any(
-        actual.equals(candidate, check_metadata=False)
-        for candidate in _legacy_loader_bar_schemas()
-    ):
+    if not any(actual.equals(candidate, check_metadata=False) for candidate in _legacy_loader_bar_schemas()):
         return False
     metadata = actual.metadata or {}
     expected_metadata = {
@@ -96,9 +98,13 @@ def _matches_source_parquet_schema(
         b"adjustment": b"all",
         b"session_scope": b"regular",
         b"resolution": str(manifest["resolution"]).encode("ascii"),
-        b"manifest_id": str(manifest["id"]).encode("ascii"),
     }
-    return all(metadata.get(key) == value for key, value in expected_metadata.items())
+    trusted_manifest_ids = accepted_manifest_ids or frozenset({str(manifest["id"])})
+    embedded_manifest_id = metadata.get(b"manifest_id", b"").decode("ascii", errors="ignore")
+    return (
+        all(metadata.get(key) == value for key, value in expected_metadata.items())
+        and embedded_manifest_id in trusted_manifest_ids
+    )
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -149,18 +155,14 @@ def _token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
 
 
-def _source_targets_instrument(
-    manifest: Mapping[str, Any], relation: Mapping[str, Any], instrument_id: str
-) -> bool:
+def _source_targets_instrument(manifest: Mapping[str, Any], relation: Mapping[str, Any], instrument_id: str) -> bool:
     manifest_instrument = manifest.get("instrument_id")
     if manifest_instrument is not None:
         return str(manifest_instrument) == instrument_id
     shard_key = str(relation.get("shard_key", ""))
     match = re.fullmatch(r"s\d+-of-(\d+)", shard_key)
     if match is None or int(match.group(1)) < 1:
-        raise MalformedEventError(
-            "multi-instrument source must declare a canonical stable shard key"
-        )
+        raise MalformedEventError("multi-instrument source must declare a canonical stable shard key")
     expected_shard: str = stable_shard_key(instrument_id, int(match.group(1)))
     return expected_shard == shard_key
 
@@ -170,6 +172,13 @@ def feature_output_provider_id() -> str:
 
 
 def feature_output_feed_id(definition: FeatureDefinition) -> str:
+    if (
+        definition.element_catalog_version_id in PRODUCTION_ELEMENT_CATALOG_IDS
+        and definition.feature_code == "RSI_14"
+        and definition.calculator_version == "rsi:1.0.0"
+        and definition.resolution in PRODUCTION_RSI_14_FEED_IDS
+    ):
+        return PRODUCTION_RSI_14_FEED_IDS[definition.resolution]
     return str(
         deterministic_uuid(
             "feature-output-feed",
@@ -185,7 +194,7 @@ def feature_output_feed_code(definition: FeatureDefinition) -> str:
     if definition.id == OFFICIAL_RSI_14_ID:
         return "FEATURE_RSI_14_1M_RSI_1_0_0"
     if (
-        definition.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+        definition.element_catalog_version_id in PRODUCTION_ELEMENT_CATALOG_IDS
         and definition.feature_code == "RSI_14"
         and definition.calculator_version == "rsi:1.0.0"
         and definition.resolution in PRODUCTION_RSI_14_RESOLUTIONS
@@ -208,7 +217,7 @@ def feature_output_feed_code(definition: FeatureDefinition) -> str:
 
 def feature_output_feed_version(definition: FeatureDefinition) -> str:
     if definition.id == OFFICIAL_RSI_14_ID or (
-        definition.element_catalog_version_id == PRODUCTION_ELEMENT_CATALOG_ID
+        definition.element_catalog_version_id in PRODUCTION_ELEMENT_CATALOG_IDS
         and definition.feature_code == "RSI_14"
         and definition.calculator_version == "rsi:1.0.0"
         and definition.resolution in PRODUCTION_RSI_14_RESOLUTIONS
@@ -242,6 +251,27 @@ class CanonicalFeatureSourceReader:
         self._catalog = catalog
         self._object_store = object_store
 
+    def _accepted_manifest_ids(
+        self,
+        manifest: Mapping[str, Any],
+        relation: Mapping[str, Any],
+    ) -> frozenset[str]:
+        manifest_id = str(manifest["id"])
+        accepted = {manifest_id}
+        lineages = self._catalog.records(
+            "market_data.dataset_lineage",
+            where={"derived_manifest_id": manifest_id, "relation_type": "COMPOSED_FROM"},
+        )
+        for lineage in lineages:
+            source_manifest_id = str(lineage["source_manifest_id"])
+            source_relations = self._catalog.records(
+                "market_data.dataset_objects",
+                where={"dataset_manifest_id": source_manifest_id},
+            )
+            if any(str(candidate["object_id"]) == str(relation["object_id"]) for candidate in source_relations):
+                accepted.add(source_manifest_id)
+        return frozenset(accepted)
+
     def read(
         self,
         object_ids: Sequence[Any],
@@ -266,17 +296,13 @@ class CanonicalFeatureSourceReader:
         relations: dict[str, dict[str, Any]] = {}
         manifests: dict[str, dict[str, Any]] = {}
         for object_id in wanted:
-            matches = self._catalog.records(
-                "market_data.dataset_objects", where={"id": object_id}
-            )
+            matches = self._catalog.records("market_data.dataset_objects", where={"id": object_id})
             if not matches:
                 raise MalformedEventError(f"canonical dataset object is missing: {object_id}")
             relations[object_id] = matches[0]
             manifest_id = str(matches[0]["dataset_manifest_id"])
             if manifest_id not in manifests:
-                manifest_rows = self._catalog.records(
-                    "market_data.dataset_manifests", where={"id": manifest_id}
-                )
+                manifest_rows = self._catalog.records("market_data.dataset_manifests", where={"id": manifest_id})
                 if not manifest_rows:
                     raise MalformedEventError(f"canonical source receipt is incomplete: {object_id}")
                 manifests[manifest_id] = manifest_rows[0]
@@ -291,18 +317,14 @@ class CanonicalFeatureSourceReader:
             if not _source_targets_instrument(manifest, relation, instrument_id):
                 raise MalformedEventError(f"source {object_id} belongs to another instrument shard")
             if manifest["resolution"] != definition.resolution:
-                raise MalformedEventError(
-                    f"source {object_id} resolution does not match the definition"
-                )
+                raise MalformedEventError(f"source {object_id} resolution does not match the definition")
             if manifest["schema_version"] not in SUPPORTED_MARKET_BAR_SCHEMA_VERSIONS:
                 raise MalformedEventError(f"source {object_id} schema version is not canonical")
         feed_ids = {str(row["feed_id"]) for row in selected_manifests}
         if len(feed_ids) != 1:
             raise MalformedEventError("canonical sources must belong to one feed")
         feed_id = next(iter(feed_ids))
-        feed_manifests = self._catalog.records(
-            "market_data.dataset_manifests", where={"feed_id": feed_id}
-        )
+        feed_manifests = self._catalog.records("market_data.dataset_manifests", where={"feed_id": feed_id})
         for selected in selected_manifests:
             identity = (
                 str(selected.get("instrument_id")),
@@ -345,9 +367,7 @@ class CanonicalFeatureSourceReader:
                 break
             cursor = max(cursor, end)
         if cursor < period_end:
-            raise MalformedEventError(
-                "canonical source manifest set does not cover the complete requested period"
-            )
+            raise MalformedEventError("canonical source manifest set does not cover the complete requested period")
 
         authoritative_ids: set[str] = set()
         object_coverage: list[tuple[datetime, datetime]] = []
@@ -363,9 +383,7 @@ class CanonicalFeatureSourceReader:
                 relation_end = _timestamp(relation["period_end"], "dataset_object.period_end")
                 if relation_start < period_end and relation_end > period_start:
                     authoritative_ids.add(str(relation["id"]))
-                    object_coverage.append(
-                        (max(period_start, relation_start), min(period_end, relation_end))
-                    )
+                    object_coverage.append((max(period_start, relation_start), min(period_end, relation_end)))
         if set(wanted) != authoritative_ids:
             raise MalformedEventError(
                 "source IDs must equal the complete authoritative object set for the requested period"
@@ -376,9 +394,7 @@ class CanonicalFeatureSourceReader:
                 break
             cursor = max(cursor, end)
         if cursor < period_end:
-            raise MalformedEventError(
-                "canonical source objects contain a period gap in the requested interval"
-            )
+            raise MalformedEventError("canonical source objects contain a period gap in the requested interval")
         sources: list[SourceObject] = []
         bars_by_start: dict[datetime, BarPoint] = {}
         receipts: list[dict[str, Any]] = []
@@ -387,9 +403,7 @@ class CanonicalFeatureSourceReader:
         for object_id in sorted(wanted):
             relation = relations[object_id]
             manifest = manifests[str(relation["dataset_manifest_id"])]
-            storage_rows = self._catalog.records(
-                "storage.objects", where={"id": str(relation["object_id"])}
-            )
+            storage_rows = self._catalog.records("storage.objects", where={"id": str(relation["object_id"])})
             receipt = storage_rows[0] if storage_rows else None
             if receipt is None:
                 raise MalformedEventError(f"canonical source receipt is incomplete: {object_id}")
@@ -412,18 +426,14 @@ class CanonicalFeatureSourceReader:
                 raise MalformedEventError(f"source {object_id} row count receipt mismatch")
             total_bytes += int(receipt["byte_size"])
             if total_bytes > MAX_FEATURE_SOURCE_BYTES:
-                raise MalformedEventError(
-                    "canonical source set exceeds the bounded feature materialization budget"
-                )
+                raise MalformedEventError("canonical source set exceeds the bounded feature materialization budget")
             relation_start = _timestamp(relation["period_start"], "dataset_object.period_start")
             relation_end = _timestamp(relation["period_end"], "dataset_object.period_end")
             storage_start = _timestamp(receipt["period_start"], "storage_object.period_start")
             storage_end = _timestamp(receipt["period_end"], "storage_object.period_end")
             if (relation_start, relation_end) != (storage_start, storage_end):
                 raise MalformedEventError(f"source {object_id} period receipt mismatch")
-            if not self._object_store.owns_receipt(
-                str(receipt["storage_provider"]), str(receipt["bucket_name"])
-            ):
+            if not self._object_store.owns_receipt(str(receipt["storage_provider"]), str(receipt["bucket_name"])):
                 raise MalformedEventError(f"source {object_id} storage identity does not match the reader")
 
             verified = self._object_store.verify_version(
@@ -444,22 +454,18 @@ class CanonicalFeatureSourceReader:
                         downloaded.update(chunk)
                         downloaded_size += len(chunk)
                         seekable.write(chunk)
-                    if (
-                        downloaded.hexdigest() != str(receipt["content_hash"])
-                        or downloaded_size != int(receipt["byte_size"])
+                    if downloaded.hexdigest() != str(receipt["content_hash"]) or downloaded_size != int(
+                        receipt["byte_size"]
                     ):
-                        raise MalformedEventError(
-                            f"source {object_id} downloaded object hash or size mismatch"
-                        )
+                        raise MalformedEventError(f"source {object_id} downloaded object hash or size mismatch")
                     seekable.seek(0)
                     parquet = pq.ParquetFile(seekable)
                     if not _matches_source_parquet_schema(
                         parquet.schema_arrow,
                         manifest=manifest,
+                        accepted_manifest_ids=self._accepted_manifest_ids(manifest, relation),
                     ):
-                        raise MalformedEventError(
-                            f"source {object_id} Parquet schema does not match canonical bars"
-                        )
+                        raise MalformedEventError(f"source {object_id} Parquet schema does not match canonical bars")
                     decoded_rows = 0
                     previous: datetime | None = None
                     for batch in parquet.iter_batches(batch_size=FEATURE_READ_BATCH_ROWS):
@@ -467,9 +473,7 @@ class CanonicalFeatureSourceReader:
                         for row_index, row in enumerate(batch.to_pylist(), start=decoded_rows - batch.num_rows):
                             if str(row["instrument_id"]) != instrument_id:
                                 continue
-                            moment = _timestamp(
-                                row["bar_start_at"], f"source {object_id} row {row_index}.bar_start_at"
-                            )
+                            moment = _timestamp(row["bar_start_at"], f"source {object_id} row {row_index}.bar_start_at")
                             if previous is not None and moment <= previous:
                                 raise MalformedEventError(
                                     f"source {object_id} bars are not strictly ordered and unique"
@@ -487,20 +491,15 @@ class CanonicalFeatureSourceReader:
                                 existing = bars_by_start.get(moment)
                                 if existing is not None:
                                     if existing != bar:
-                                        raise MalformedEventError(
-                                            "conflicting canonical source bars overlap"
-                                        )
+                                        raise MalformedEventError("conflicting canonical source bars overlap")
                                     continue
                                 if len(bars_by_start) >= MAX_FEATURE_SOURCE_ROWS:
                                     raise MalformedEventError(
-                                        "canonical source set exceeds the bounded feature "
-                                        "materialization budget"
+                                        "canonical source set exceeds the bounded feature materialization budget"
                                     )
                                 bars_by_start[moment] = bar
                     if decoded_rows != int(receipt["row_count"]):
-                        raise MalformedEventError(
-                            f"source {object_id} decoded row count does not match receipt"
-                        )
+                        raise MalformedEventError(f"source {object_id} decoded row count does not match receipt")
             sources.append(
                 SourceObject(
                     dataset_object_id=object_id,
@@ -583,9 +582,7 @@ class DeterministicFeatureOutputResolver:
         manifest_id = str(
             deterministic_uuid("feature-output-manifest", materialization_id, FEATURE_SERIES_SCHEMA_VERSION)
         )
-        existing_rows = self._catalog.records(
-            "market_data.dataset_manifests", where={"id": manifest_id}
-        )
+        existing_rows = self._catalog.records("market_data.dataset_manifests", where={"id": manifest_id})
         existing = existing_rows[0] if existing_rows else None
         if existing is not None:
             expected_existing = {
@@ -612,9 +609,7 @@ class DeterministicFeatureOutputResolver:
             return FeatureOutputTarget(feed_id, manifest_id, int(existing["revision_number"]))
         siblings = [
             row
-            for row in self._catalog.records(
-                "market_data.dataset_manifests", where={"feed_id": feed_id}
-            )
+            for row in self._catalog.records("market_data.dataset_manifests", where={"feed_id": feed_id})
             if str(row.get("instrument_id")) == instrument_id
             and row["data_layer"] == "DERIVED"
             and row["resolution"] == resolution

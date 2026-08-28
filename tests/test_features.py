@@ -53,6 +53,7 @@ from market_pipeline_lib.features import (
     SourceObject,
     get_calculator,
     input_bundle_fingerprint,
+    materialization_version,
     parse_feature_materialization_version,
 )
 from market_pipeline_lib.features.errors import (
@@ -310,9 +311,7 @@ def test_a_definition_for_an_unknown_calculator_cannot_be_created() -> None:
         )
 
 
-def test_publish_writes_one_canonical_row(
-    catalog: LocalCatalog, registry: FeatureDefinitionRegistry
-) -> None:
+def test_publish_writes_one_canonical_row(catalog: LocalCatalog, registry: FeatureDefinitionRegistry) -> None:
     definition = registry.publish(sma_definition())
     rows = catalog.records(FEATURE_DEFINITIONS)
     assert len(rows) == 1
@@ -657,8 +656,7 @@ def plan(*definitions: FeatureDefinition, instruments: tuple[str, ...] = (INSTRU
     return SnapshotBatchPlan(
         definition_hashes=tuple(item.definition_hash for item in definitions),
         market_inputs=tuple(
-            MarketInput(instrument_id=instrument, input_dataset_set_hash=fingerprint)
-            for instrument in instruments
+            MarketInput(instrument_id=instrument, input_dataset_set_hash=fingerprint) for instrument in instruments
         ),
         period_start=PERIOD_START,
         period_end=PERIOD_END,
@@ -687,9 +685,7 @@ def test_batch_identity_ignores_the_order_definitions_are_listed_in() -> None:
     assert plan(sma, ema).id == plan(ema, sma).id
 
 
-def test_opening_a_batch_writes_a_pending_row(
-    catalog: LocalCatalog, registry: FeatureDefinitionRegistry
-) -> None:
+def test_opening_a_batch_writes_a_pending_row(catalog: LocalCatalog, registry: FeatureDefinitionRegistry) -> None:
     definition = registry.publish(sma_definition())
     builder = FeatureSnapshotBatchBuilder(catalog, registry)
     batch_plan = plan(definition)
@@ -764,8 +760,7 @@ def test_a_complete_batch_seals_with_a_pinned_batch_hash(
     assert sealed.row_count == 6
     assert sealed.status == "SUCCEEDED"
     assert sealed.feature_materialization_version == (
-        f"fmv1:b:{batch_plan.feature_set_hash[:16]}:{batch_plan.input_market_set_hash[:16]}"
-        f":{sealed.batch_hash[:16]}"
+        f"fmv1:b:{batch_plan.feature_set_hash[:16]}:{batch_plan.input_market_set_hash[:16]}:{sealed.batch_hash[:16]}"
     )
 
     row = catalog.records(FEATURE_SNAPSHOT_BATCHES)[0]
@@ -893,9 +888,7 @@ def test_two_materializations_cannot_share_an_output_manifest(
     ema = registry.publish(ema_definition())
     materializer.materialize(request(sma, pipeline_run_id=RUN_1))
     with pytest.raises(MaterializationConflict, match="output manifest"):
-        materializer.materialize(
-            request(ema, pipeline_run_id=RUN_2, output_manifest_id=OUTPUT_MANIFESTS[RUN_1])
-        )
+        materializer.materialize(request(ema, pipeline_run_id=RUN_2, output_manifest_id=OUTPUT_MANIFESTS[RUN_1]))
 
 
 def test_row_count_refuses_a_result_the_catalog_did_not_record(
@@ -914,13 +907,37 @@ def test_row_count_refuses_a_result_the_catalog_did_not_record(
 
 
 def test_the_version_string_round_trips_through_its_parser() -> None:
-    parsed = parse_feature_materialization_version(
-        "fmv1:b:0123456789abcdef:fedcba9876543210:00112233445566ff"
-    )
+    parsed = parse_feature_materialization_version("fmv1:b:0123456789abcdef:fedcba9876543210:00112233445566ff")
     assert parsed.scope == "b"
     assert parsed.identity_prefix == "0123456789abcdef"
     assert parsed.inputs_prefix == "fedcba9876543210"
     assert parsed.result_prefix == "00112233445566ff"
+
+
+def test_materialization_version_normalizes_the_canonical_sha256_prefix() -> None:
+    digest = "a" * 64
+
+    bare = materialization_version(
+        definition_hash=digest,
+        input_dataset_set_hash="b" * 64,
+        result_hash="c" * 64,
+    )
+    prefixed = materialization_version(
+        definition_hash=f"sha256:{digest}",
+        input_dataset_set_hash="b" * 64,
+        result_hash="c" * 64,
+    )
+
+    assert prefixed == bare
+
+
+def test_materialization_version_rejects_a_non_sha256_prefix() -> None:
+    with pytest.raises(ValueError, match="identity component"):
+        materialization_version(
+            definition_hash=f"md5:{'a' * 64}",
+            input_dataset_set_hash="b" * 64,
+            result_hash="c" * 64,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1239,9 +1256,7 @@ def test_postgres_refuses_a_second_materialization_on_one_pipeline_run(
     ema = registry.publish(ema_definition())
     materializer.materialize(request(sma, pipeline_run_id=RUN_1))
     with pytest.raises(MaterializationConflict):
-        materializer.materialize(
-            request(ema, pipeline_run_id=RUN_1, output_manifest_id=OUTPUT_MANIFESTS[RUN_2])
-        )
+        materializer.materialize(request(ema, pipeline_run_id=RUN_1, output_manifest_id=OUTPUT_MANIFESTS[RUN_2]))
     assert len(postgres_catalog.records(FEATURE_MATERIALIZATIONS)) == 1
 
 

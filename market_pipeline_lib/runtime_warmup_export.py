@@ -122,7 +122,7 @@ def _receipt(bundle_root: Path, manifest: Mapping[str, Any], input_digest: str) 
                 "object_role": str(item["object_role"]),
                 "schema_version": str(item["schema_version"]),
                 "sha256": actual,
-                "byte_size": path.stat().st_size,
+                "byte_size": Path(long_path(path)).stat().st_size,
             }
         )
     return {
@@ -135,7 +135,7 @@ def _receipt(bundle_root: Path, manifest: Mapping[str, Any], input_digest: str) 
             "revision": int(manifest["revision"]),
             "status": str(manifest["status"]),
             "sha256": _sha256(manifest_path),
-            "byte_size": manifest_path.stat().st_size,
+            "byte_size": Path(long_path(manifest_path)).stat().st_size,
         },
         "objects": objects,
     }
