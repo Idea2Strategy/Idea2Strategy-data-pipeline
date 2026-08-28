@@ -115,9 +115,13 @@ def compact_utc(value: datetime) -> str:
 
 
 def _version(scope: str, identity: str, inputs: str, result: str) -> str:
+    normalized = []
     for label, digest in (("identity", identity), ("inputs", inputs), ("result", result)):
-        if not is_sha256_hex(digest):
-            raise ValueError(f"{label} component must be 64 lowercase hex characters, got {digest!r}")
+        value = digest.removeprefix("sha256:")
+        if not is_sha256_hex(value):
+            raise ValueError(f"{label} component must be a SHA-256 digest, got {digest!r}")
+        normalized.append(value)
+    identity, inputs, result = normalized
     return ":".join(
         (
             FEATURE_VERSION_PREFIX,

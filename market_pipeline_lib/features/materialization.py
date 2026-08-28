@@ -334,9 +334,14 @@ def _result_hash(
     period_end: datetime,
     values: Sequence[FeatureValue],
 ) -> str:
+    # Cross-service canonical payloads contain the 64-character digest, not the
+    # optional wire/storage ``sha256:`` algorithm label.  Official definitions
+    # use the labelled form in PostgreSQL while custom definitions use the bare
+    # form; normalising here keeps both producers byte-identical to consumers.
+    canonical_definition_hash = definition_hash.removeprefix("sha256:")
     return canonical_sha256(
         {
-            "definition_hash": definition_hash,
+            "definition_hash": canonical_definition_hash,
             "input_dataset_set_hash": input_dataset_set_hash,
             "instrument_id": instrument_id,
             "period_end": iso_utc(period_end),
