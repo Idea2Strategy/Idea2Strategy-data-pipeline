@@ -248,6 +248,8 @@ _EMPTY_V001_CANONICAL_DRIFT = frozenset(
         "market_data.dataset_objects.partition_end: column is missing",
         "market_data.dataset_objects.period_start: column is missing",
         "market_data.dataset_objects.period_end: column is missing",
+        "market_data.dataset_objects.actual_start_at: column is missing",
+        "market_data.dataset_objects.actual_end_at: column is missing",
         "market_data.dataset_objects.shard_key: column is missing",
         "market_data.dataset_objects.part_number: column is missing",
         "market_data.dataset_objects.min_instrument_id: column is missing",
@@ -260,6 +262,8 @@ _EMPTY_V001_CANONICAL_DRIFT = frozenset(
         "market_data.quality_incidents.period_start: nullable is True, expected False",
         "market_data.quality_incidents.evidence_object_id: column is missing",
         "market_data.dataset_object_lineage: table is missing",
+        "market_data.dataset_manifests.actual_start_at: column is missing",
+        "market_data.dataset_manifests.actual_end_at: column is missing",
     }
 )
 
@@ -319,6 +323,9 @@ _EMPTY_V001_CHANGED_TABLES = frozenset(
         "market_data.quality_incidents",
     }
 )
+_EMPTY_V001_CANONICAL_EXTENDED_TABLES: dict[str, frozenset[str]] = {
+    "market_data.dataset_manifests": frozenset({"actual_start_at", "actual_end_at"}),
+}
 _EMPTY_V001_MISSING_TABLES = frozenset(
     {
         "market_data.dataset_object_lineage",
@@ -705,6 +712,8 @@ def _translate_legacy_v001(
                     "status": row["status"],
                     "period_start": _utc_start(row["period_start"]),
                     "period_end": _utc_start(row["period_end"]),
+                    "actual_start_at": None,
+                    "actual_end_at": None,
                     "schema_version": next(iter(formats)),
                     "dataset_hash": str(row["manifest_hash"]).strip(),
                     "supersedes_manifest_id": row["supersedes_manifest_id"],
@@ -815,6 +824,8 @@ def _translate_legacy_v001(
                     "partition_end": manifest["period_end"],
                     "period_start": _utc_start(manifest["period_start"]),
                     "period_end": _utc_start(manifest["period_end"]),
+                    "actual_start_at": None,
+                    "actual_end_at": None,
                     "shard_key": f"s{shard_number:02d}-of-{total_shards}",
                     "part_number": int(part),
                     "row_count": row["row_count"],
@@ -939,11 +950,12 @@ class _ImmutableLegacyCatalog(PostgresCatalog):
                 raise BootstrapConflict(
                     f"legacy source is not the exact retired V001 schema: missing {table}"
                 )
-            expected_columns = (
-                _V001_TABLE_COLUMNS[table]
-                if table in _EMPTY_V001_CHANGED_TABLES
-                else _canonical_columns(table)
-            )
+            if table in _EMPTY_V001_CHANGED_TABLES:
+                expected_columns = _V001_TABLE_COLUMNS[table]
+            else:
+                expected_columns = _canonical_columns(table) - (
+                    _EMPTY_V001_CANONICAL_EXTENDED_TABLES.get(table, frozenset())
+                )
             actual_columns = frozenset(
                 column["name"] for column in inspector.get_columns(name, schema=schema)
             )
@@ -960,7 +972,7 @@ class _ImmutableLegacyCatalog(PostgresCatalog):
                 raise BootstrapConflict(
                     f"legacy source is not the exact retired V001 schema: {table} uniqueness differs"
                 )
-        for table in _EMPTY_V001_CHANGED_TABLES:
+        for table in _EMPTY_V001_CHANGED_TABLES | _EMPTY_V001_CANONICAL_EXTENDED_TABLES.keys():
             schema, name = table.split(".", 1)
             count = connection.execute(
                 text(f'SELECT count(*) FROM "{schema}"."{name}"')
@@ -980,7 +992,9 @@ class _ImmutableLegacyCatalog(PostgresCatalog):
         if self._schema_mode is None:
             self.verify_schema()
         if self._schema_mode == "legacy-empty-v001" and (
-            table in _EMPTY_V001_CHANGED_TABLES or table in _EMPTY_V001_MISSING_TABLES
+            table in _EMPTY_V001_CHANGED_TABLES
+            or table in _EMPTY_V001_MISSING_TABLES
+            or table in _EMPTY_V001_CANONICAL_EXTENDED_TABLES
         ):
             canonical_filter(table, where or {})
             return []

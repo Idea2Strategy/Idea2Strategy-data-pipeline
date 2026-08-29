@@ -526,6 +526,9 @@ class MarketPipelineEngine:
                     period_start = pd.Timestamp(
                         timestamps.min()
                     ).to_pydatetime()
+                    actual_end = pd.Timestamp(
+                        timestamps.max()
+                    ).to_pydatetime()
                     period_end = _table_period_end(candidate, contract)
                     object_id = deterministic_uuid(
                         "storage-object",
@@ -577,6 +580,8 @@ class MarketPipelineEngine:
                         "partition_end": partition_end.isoformat(),
                         "period_start": iso_utc(period_start),
                         "period_end": iso_utc(period_end),
+                        "actual_start_at": iso_utc(period_start),
+                        "actual_end_at": iso_utc(actual_end),
                         "shard_key": shard_key,
                         "part_number": part_number,
                         "row_count": candidate.num_rows,
@@ -693,6 +698,8 @@ class MarketPipelineEngine:
             "status": "BUILDING",
             "period_start": iso_utc(partition_utc_bounds(year_start, "YEAR")[0]),
             "period_end": iso_utc(partition_utc_bounds(year_start, "YEAR")[1]),
+            "actual_start_at": None,
+            "actual_end_at": None,
             "schema_version": SCHEMA_VERSION,
             "dataset_hash": hashlib.sha256(b"BUILDING").hexdigest(),
             "supersedes_manifest_id": previous["id"] if previous else None,
@@ -753,11 +760,21 @@ class MarketPipelineEngine:
             (item.relation["period_end"] for item in all_objects),
             default=building["period_start"],
         )
+        actual_start = min(
+            (item.relation["actual_start_at"] for item in all_objects),
+            default=building["period_start"],
+        )
+        actual_end = max(
+            (item.relation["actual_end_at"] for item in all_objects),
+            default=building["period_start"],
+        )
         manifest = {
             **building,
             "status": status,
             "period_start": observed_start,
             "period_end": observed_end,
+            "actual_start_at": actual_start,
+            "actual_end_at": actual_end,
             "dataset_hash": canonical_dataset_hash(canonical),
             "available_at": now if status == "AVAILABLE" else None,
         }

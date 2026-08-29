@@ -81,25 +81,79 @@ def test_compact_projection_declares_adjusted_semantics_and_timeframe() -> None:
                 "volume": 1200,
             }
         ],
+        manifest_ids=("manifest-2026",),
+        dataset_hashes=("a" * 64,),
+        object_hashes=("b" * 64,),
+        revision=1,
+        provider="ALPACA",
+        feed="ALPACA_SIP_ALL_4H",
     )
 
     payload = json.loads(encoded)
-    assert payload == {
-        "schemaVersion": 1,
-        "adjustment": "all",
-        "timeframe": "4h",
-        "instrumentId": "70000000-0000-4000-8000-000000000001",
-        "bars": [
+    assert payload["schemaVersion"] == 2
+    assert payload["adjustment"] == "all"
+    assert payload["timeframe"] == "4h"
+    assert payload["instrumentId"] == "70000000-0000-4000-8000-000000000001"
+    assert payload["bars"] == [{
+        "t": "2026-08-10T13:30:00Z",
+        "o": 100.0,
+        "h": 102.0,
+        "l": 99.0,
+        "c": 101.0,
+        "v": 1200,
+    }]
+
+
+def test_compact_projection_binds_bars_to_verified_manifest_and_object_hashes() -> None:
+    encoded = compact_history_payload(
+        "70000000-0000-4000-8000-000000000001",
+        "1d",
+        [
             {
-                "t": "2026-08-10T13:30:00Z",
-                "o": 100.0,
-                "h": 102.0,
-                "l": 99.0,
-                "c": 101.0,
-                "v": 1200,
-            }
+                "bar_start_at": datetime(2026, 8, 7, 13, 30, tzinfo=UTC),
+                "open": 100.0,
+                "high": 103.0,
+                "low": 99.0,
+                "close": 102.0,
+                "volume": 1200,
+            },
+            {
+                "bar_start_at": datetime(2026, 8, 10, 13, 30, tzinfo=UTC),
+                "open": 102.0,
+                "high": 104.0,
+                "low": 101.0,
+                "close": 103.0,
+                "volume": 1400,
+            },
         ],
-    }
+        manifest_ids=("manifest-2026",),
+        dataset_hashes=("a" * 64,),
+        object_hashes=("b" * 64,),
+        revision=2,
+        provider="ALPACA",
+        feed="ALPACA_SIP_ALL_1D",
+    )
+
+    payload = json.loads(encoded)
+    assert payload["schemaVersion"] == 2
+    assert payload["manifestIds"] == ["manifest-2026"]
+    assert payload["datasetHashes"] == ["a" * 64]
+    assert payload["objectHashes"] == ["b" * 64]
+    assert payload["revision"] == 2
+    assert payload["actualFrom"] == "2026-08-07T13:30:00Z"
+    assert payload["actualTo"] == "2026-08-10T13:30:00Z"
+    assert payload["rowCount"] == 2
+    assert payload["provider"] == "ALPACA"
+    assert payload["feed"] == "ALPACA_SIP_ALL_1D"
+    assert len(payload["projectionHash"]) == 64
+
+    changed = json.loads(encoded)
+    changed["bars"][0]["c"] = 999.0
+    changed_without_hash = {key: value for key, value in changed.items() if key != "projectionHash"}
+    changed_hash = hashlib.sha256(
+        json.dumps(changed_without_hash, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert changed_hash != payload["projectionHash"]
 
 
 def test_pipeline_worker_exposes_the_scheduled_history_sync(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,9 +197,10 @@ def test_projection_reads_exact_available_s3_versions_and_writes_separate_histor
             "data_layer": "ADJUSTED" if timeframe == "30m" else "DERIVED",
             "resolution": timeframe,
             "period_start": "2026-08-10T13:30:00Z",
-            "period_end": "2026-08-10T20:00:00Z",
-            "revision_number": 1,
-        }
+                "period_end": "2026-08-10T20:00:00Z",
+                "revision_number": 1,
+                "dataset_hash": f"{timeframe}-dataset-hash",
+            }
         for timeframe in ("30m", "1h", "4h", "1d")
     ]
 
@@ -156,6 +211,8 @@ def test_projection_reads_exact_available_s3_versions_and_writes_separate_histor
 
         def objects_for_manifest(self, manifest_id: str) -> list[dict[str, object]]:
             return [{
+                "id": f"relation-{manifest_id}",
+                "dataset_manifest_id": manifest_id,
                 "period_start": "2026-08-10T13:30:00Z",
                 "period_end": "2026-08-10T20:00:00Z",
                 "shard_key": "s00-of-16",
@@ -220,6 +277,7 @@ def test_instrument_map_uses_only_the_active_primary_symbol(tmp_path: Path) -> N
             if table == "market_data.instruments":
                 return [{
                     "id": "70000000-0000-4000-8000-000000000001",
+                    "asset_type": "STOCK",
                     "primary_exchange_mic": "XNAS",
                     "listed_at": "2020-01-01",
                     "delisted_at": None,
@@ -272,6 +330,53 @@ def test_publication_is_a_no_op_when_the_available_manifest_is_current(tmp_path:
     )
 
     assert report["status"] == "CURRENT"
+
+
+def test_instrument_map_never_sends_cash_indices_to_the_equity_provider(tmp_path: Path) -> None:
+    class Catalog:
+        def records(self, table: str) -> list[dict[str, object]]:
+            if table == "market_data.instruments":
+                return [
+                    {
+                        "id": "70000000-0000-4000-8000-000000000001",
+                        "asset_type": "STOCK",
+                        "primary_exchange_mic": "XNAS",
+                        "listed_at": "1980-12-12",
+                        "delisted_at": None,
+                    },
+                    {
+                        "id": "70000000-0000-4000-8000-000000000500",
+                        "asset_type": "INDEX",
+                        "primary_exchange_mic": "XNYS",
+                        "listed_at": "1957-03-04",
+                        "delisted_at": None,
+                    },
+                ]
+            assert table == "market_data.instrument_symbols"
+            return [
+                {
+                    "instrument_id": "70000000-0000-4000-8000-000000000001",
+                    "exchange_mic": "XNAS",
+                    "symbol": "AAPL",
+                    "effective_from": "1980-12-12T00:00:00Z",
+                    "effective_to": None,
+                },
+                {
+                    "instrument_id": "70000000-0000-4000-8000-000000000500",
+                    "exchange_mic": "XNYS",
+                    "symbol": "SPX",
+                    "effective_from": "1957-03-04T00:00:00Z",
+                    "effective_to": None,
+                },
+            ]
+
+    output = tmp_path / "active.csv"
+
+    assert _write_instrument_map(Catalog(), output, datetime(2026, 8, 10, tzinfo=UTC)) == 1
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        "provider_symbol,instrument_id",
+        "AAPL,70000000-0000-4000-8000-000000000001",
+    ]
 
 
 def test_publication_commits_recoverable_session_batches(

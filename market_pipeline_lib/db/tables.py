@@ -325,6 +325,11 @@ dataset_manifests = Table(
     Column("status", _dataset_status(), nullable=False),
     Column("period_start", TIMESTAMP(timezone=True), nullable=False),
     Column("period_end", TIMESTAMP(timezone=True), nullable=False),
+    # Physical Parquet bounds. The declared partition remains period_start/end;
+    # these values are measured from the verified rows and may only be absent on
+    # legacy manifests created before V20260829090000.
+    Column("actual_start_at", TIMESTAMP(timezone=True)),
+    Column("actual_end_at", TIMESTAMP(timezone=True)),
     Column("schema_version", VARCHAR(40), nullable=False),
     Column("dataset_hash", VARCHAR(128), nullable=False),
     Column(
@@ -373,6 +378,8 @@ dataset_objects = Table(
     Column("partition_end", Date, nullable=False),
     Column("period_start", TIMESTAMP(timezone=True), nullable=False),
     Column("period_end", TIMESTAMP(timezone=True), nullable=False),
+    Column("actual_start_at", TIMESTAMP(timezone=True)),
+    Column("actual_end_at", TIMESTAMP(timezone=True)),
     Column("shard_key", VARCHAR(120), nullable=False),
     Column("part_number", Integer, nullable=False),
     Column("row_count", BigInteger, nullable=False),

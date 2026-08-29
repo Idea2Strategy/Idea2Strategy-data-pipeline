@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -41,6 +41,7 @@ class HistorySyncConfig:
     api_key: str
     api_secret: str
     state_root: Path
+    aws_endpoint_url: str | None = None
 
     @classmethod
     def from_environment(
@@ -80,6 +81,7 @@ class HistorySyncConfig:
             api_key=required["ALPACA_API_KEY"],
             api_secret=required["ALPACA_SECRET_KEY"],
             state_root=state_root,
+            aws_endpoint_url=(values.get("PIPELINE_WORKER_AWS_ENDPOINT_URL", "").strip() or None),
         )
 
 
@@ -132,6 +134,8 @@ def _write_instrument_map(catalog: Any, output: Path, now: datetime) -> int:
     for symbol in catalog.records("market_data.instrument_symbols"):
         instrument = instruments.get(str(symbol["instrument_id"]))
         if instrument is None:
+            continue
+        if instrument.get("asset_type") not in {"STOCK", "ETF"}:
             continue
         if symbol["exchange_mic"] != instrument["primary_exchange_mic"]:
             continue
@@ -245,13 +249,35 @@ def _verified_parquet(
 
 
 def compact_history_payload(
-    instrument_id: str, timeframe: str, bars: list[Mapping[str, Any]]
+    instrument_id: str,
+    timeframe: str,
+    bars: list[Mapping[str, Any]],
+    *,
+    manifest_ids: tuple[str, ...],
+    dataset_hashes: tuple[str, ...],
+    object_hashes: tuple[str, ...],
+    revision: int,
+    provider: str,
+    feed: str,
 ) -> str:
+    if not bars:
+        raise ValueError("canonical history projection requires at least one bar")
+    if not manifest_ids or not dataset_hashes or not object_hashes:
+        raise ValueError("canonical history projection requires immutable provenance")
     payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "adjustment": "all",
         "timeframe": timeframe,
         "instrumentId": instrument_id,
+        "provider": provider,
+        "feed": feed,
+        "manifestIds": sorted(set(manifest_ids)),
+        "datasetHashes": sorted(set(dataset_hashes)),
+        "objectHashes": sorted(set(object_hashes)),
+        "revision": revision,
+        "actualFrom": bars[0]["bar_start_at"].astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "actualTo": bars[-1]["bar_start_at"].astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "rowCount": len(bars),
         "bars": [
             {
                 "t": bar["bar_start_at"].astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -264,6 +290,8 @@ def compact_history_payload(
             for bar in bars
         ],
     }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    payload["projectionHash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
@@ -295,9 +323,9 @@ def _project_history(
                 if _timestamp(manifest["period_end"]) > cutoff
             ]
             manifest_ids.extend(str(row["id"]) for row in selected)
-            bars_by_instrument: dict[str, deque[dict[str, Any]]] = defaultdict(
-                lambda: deque(maxlen=config.limit)
-            )
+            candidates_by_instrument: dict[
+                str, dict[datetime, tuple[tuple[int, int], dict[str, Any], dict[str, Any], dict[str, Any]]]
+            ] = defaultdict(dict)
             relations = [
                 relation
                 for manifest in selected
@@ -311,6 +339,7 @@ def _project_history(
                     int(row["part_number"]),
                 )
             )
+            manifests_by_id = {str(row["id"]): row for row in selected}
             for relation in relations:
                 path = _verified_parquet(
                     object_store,
@@ -327,14 +356,47 @@ def _project_history(
                     filters=[("bar_start_at", ">=", cutoff)],
                 ).sort_by([("instrument_id", "ascending"), ("bar_start_at", "ascending")])
                 for bar in table.to_pylist():
-                    bars_by_instrument[str(bar["instrument_id"])].append(bar)
+                    instrument_id = str(bar["instrument_id"])
+                    manifest = manifests_by_id[str(relation["dataset_manifest_id"])]
+                    priority = (
+                        1 if str(manifest.get("instrument_id")) == instrument_id else 0,
+                        int(manifest["revision_number"]),
+                    )
+                    at = bar["bar_start_at"].astimezone(UTC)
+                    existing = candidates_by_instrument[instrument_id].get(at)
+                    if existing is None or priority > existing[0]:
+                        candidates_by_instrument[instrument_id][at] = (
+                            priority, bar, manifest, relation
+                        )
                 path.unlink(missing_ok=True)
-            counts[timeframe] = sum(len(bars) for bars in bars_by_instrument.values())
-            for instrument_id, bars in bars_by_instrument.items():
+            counts[timeframe] = sum(
+                min(len(candidates), config.limit)
+                for candidates in candidates_by_instrument.values()
+            )
+            for instrument_id, candidates in candidates_by_instrument.items():
+                selected_candidates = [
+                    candidates[at] for at in sorted(candidates)[-config.limit:]
+                ]
+                bars = [candidate[1] for candidate in selected_candidates]
+                contributing_manifests = {candidate[2]["id"]: candidate[2] for candidate in selected_candidates}
+                contributing_relations = {candidate[3]["id"]: candidate[3] for candidate in selected_candidates}
                 key = f"{hash_tag}:history:bars:{instrument_id}:{timeframe}"
                 redis_client.set(
                     key,
-                    compact_history_payload(instrument_id, timeframe, list(bars)),
+                    compact_history_payload(
+                        instrument_id,
+                        timeframe,
+                        bars,
+                        manifest_ids=tuple(str(value["id"]) for value in contributing_manifests.values()),
+                        dataset_hashes=tuple(str(value["dataset_hash"]) for value in contributing_manifests.values()),
+                        object_hashes=tuple(
+                            str(value["storage"]["content_hash"])
+                            for value in contributing_relations.values()
+                        ),
+                        revision=max(int(value["revision_number"]) for value in contributing_manifests.values()),
+                        provider="ALPACA",
+                        feed=f"ALPACA_SIP_ALL_{timeframe.upper()}",
+                    ),
                 )
                 projected_keys += 1
     metadata = {
@@ -367,7 +429,10 @@ def execute(
         artifact_root=config.state_root / "market-history" / "catalog-artifacts",
         storage_objects=StorageObjectsPolicy.WRITE_D_OWNED,
     )
-    object_store = S3ObjectStore(config.bucket, client=boto3.client("s3"))
+    object_store = S3ObjectStore(
+        config.bucket,
+        client=boto3.client("s3", endpoint_url=config.aws_endpoint_url),
+    )
     redis_client = redis.Redis.from_url(config.redis_uri, decode_responses=True)
     try:
         catalog.verify_schema()
