@@ -11,7 +11,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +34,13 @@ FEATURE_SERIES_SCHEMA = pa.schema(
     ]
 )
 FEATURE_OBJECT_LINEAGE_RELATION = "FEATURE_MATERIALIZED_FROM"
+
+
+def _instant(value: object) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    if not isinstance(parsed, datetime) or parsed.tzinfo is None:
+        raise ValueError("feature manifest period must be a timezone-aware datetime")
+    return parsed.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,27 @@ class FeatureOutputPublisher:
     ) -> PreparedFeatureOutput:
         """Render, upload, and read back the exact returned object version."""
 
+        available_scope = [
+            row
+            for row in self.catalog.records("market_data.dataset_manifests")
+            if row.get("status") == "AVAILABLE"
+            and str(row.get("feed_id")) == str(request.output_feed_id)
+            and str(row.get("instrument_id")) == request.instrument_id
+            and row.get("data_layer") == "DERIVED"
+            and row.get("resolution") == request.definition.resolution
+            and _instant(row["period_start"]).year
+            == request.period_start.astimezone(UTC).year
+        ]
+        if any(
+            _instant(row["period_start"]) != request.period_start.astimezone(UTC)
+            or _instant(row["period_end"]) != request.period_end.astimezone(UTC)
+            for row in available_scope
+        ):
+            raise ValueError(
+                "an AVAILABLE feature output already owns this feed/instrument/resolution/year "
+                "with a different period; publish a canonical period instead of superseding it"
+            )
+
         table = self._table(result)
         work = self.staging_root / result.materialization_id
         path = work / "feature-series.parquet"
@@ -103,7 +131,8 @@ class FeatureOutputPublisher:
             object_key = (
                 f"features/schema={FEATURE_SERIES_SCHEMA_VERSION}/"
                 f"definition={request.definition.id}/instrument={request.instrument_id}/"
-                f"materialization={result.materialization_id}/feature-series.parquet"
+                f"materialization={result.materialization_id}/"
+                f"manifest_id={request.output_dataset_manifest_id}/feature-series.parquet"
             )
             receipt = self.object_store.put(path, object_key)
             with self.object_store.open_version(
@@ -189,6 +218,11 @@ class FeatureOutputPublisher:
                     "schema_version": FEATURE_SERIES_SCHEMA_VERSION,
                 }
             )
+            previous = max(
+                available_scope,
+                key=lambda row: int(row["revision_number"]),
+                default=None,
+            )
             common = {
                 "id": request.output_dataset_manifest_id,
                 "feed_id": request.output_feed_id,
@@ -199,7 +233,7 @@ class FeatureOutputPublisher:
                 "period_start": iso_utc(request.period_start),
                 "period_end": iso_utc(request.period_end),
                 "schema_version": FEATURE_SERIES_SCHEMA_VERSION,
-                "supersedes_manifest_id": None,
+                "supersedes_manifest_id": None if previous is None else previous["id"],
                 "created_at": now,
             }
             building = {
@@ -249,6 +283,14 @@ class FeatureOutputPublisher:
                     "relation_type": FEATURE_OBJECT_LINEAGE_RELATION,
                 }
             )
+        supersedes = prepared.available_manifest.get("supersedes_manifest_id")
+        if supersedes is not None:
+            previous_rows = self.catalog.records(
+                "market_data.dataset_manifests", where={"id": str(supersedes)}
+            )
+            if len(previous_rows) != 1 or previous_rows[0].get("status") != "AVAILABLE":
+                raise ValueError("feature output supersession target is not uniquely AVAILABLE")
+            self.catalog.publish_manifest({**previous_rows[0], "status": "SUPERSEDED"})
         self.catalog.publish_manifest(prepared.available_manifest)
 
     def cleanup(self, prepared: PreparedFeatureOutput) -> None:

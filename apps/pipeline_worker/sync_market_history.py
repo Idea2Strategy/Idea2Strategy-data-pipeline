@@ -92,6 +92,18 @@ def _timestamp(value: object) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _scoped_manifest_covers(
+    manifests: list[dict[str, Any]],
+    instrument_id: str,
+    at: datetime,
+) -> bool:
+    return any(
+        str(manifest.get("instrument_id")) == instrument_id
+        and _timestamp(manifest["period_start"]) <= at < _timestamp(manifest["period_end"])
+        for manifest in manifests
+    )
+
+
 def completed_sessions_after(
     latest_period_end: datetime, now: datetime, calendar_name: str = "XNYS"
 ) -> list[date]:
@@ -315,7 +327,10 @@ def _project_history(
             manifests = manifest_selector(catalog, timeframe, layer)
             if not manifests:
                 raise RuntimeError(f"no AVAILABLE adjusted history for {timeframe}")
-            historical_through = max(_timestamp(row["period_end"]) for row in manifests)
+            historical_through = max(
+                _timestamp(row.get("actual_end_at") or row["period_end"])
+                for row in manifests
+            )
             cutoff = historical_through - timedelta(days=lookback_days)
             selected = [
                 manifest
@@ -340,6 +355,9 @@ def _project_history(
                 )
             )
             manifests_by_id = {str(row["id"]): row for row in selected}
+            scoped_manifests = [
+                row for row in selected if row.get("instrument_id") is not None
+            ]
             for relation in relations:
                 path = _verified_parquet(
                     object_store,
@@ -358,11 +376,16 @@ def _project_history(
                 for bar in table.to_pylist():
                     instrument_id = str(bar["instrument_id"])
                     manifest = manifests_by_id[str(relation["dataset_manifest_id"])]
+                    at = bar["bar_start_at"].astimezone(UTC)
+                    if (
+                        manifest.get("instrument_id") is None
+                        and _scoped_manifest_covers(scoped_manifests, instrument_id, at)
+                    ):
+                        continue
                     priority = (
                         1 if str(manifest.get("instrument_id")) == instrument_id else 0,
                         int(manifest["revision_number"]),
                     )
-                    at = bar["bar_start_at"].astimezone(UTC)
                     existing = candidates_by_instrument[instrument_id].get(at)
                     if existing is None or priority > existing[0]:
                         candidates_by_instrument[instrument_id][at] = (

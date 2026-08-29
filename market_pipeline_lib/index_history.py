@@ -86,7 +86,10 @@ def parse_yahoo_chart(
     for index, raw_timestamp in enumerate(timestamps):
         values = [column[index] for column in columns]
         if any(value is None for value in values):
-            raise ValueError(f"Yahoo chart contains missing OHLCV at row {index}")
+            # Yahoo occasionally emits a timestamp with a wholly or partially null
+            # quote for cash indices.  Omitting that provider row preserves the
+            # observed values without fabricating a price or volume.
+            continue
         open_, high, low, close = (float(value) for value in values[:4])
         volume = int(values[4])
         if min(open_, high, low, close) <= 0 or volume < 0:
@@ -102,7 +105,7 @@ def parse_yahoo_chart(
             "volume": volume,
         })
     if not bars:
-        raise ValueError("Yahoo chart returned no bars")
+        raise ValueError("Yahoo chart returned no complete bars")
     if bars != sorted(bars, key=lambda row: row["bar_start_at"]):
         raise ValueError("Yahoo chart timestamps are not ordered")
     if len({row["bar_start_at"] for row in bars}) != len(bars):

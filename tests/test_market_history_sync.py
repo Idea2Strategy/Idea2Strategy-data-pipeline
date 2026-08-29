@@ -16,6 +16,7 @@ from apps.pipeline_worker.sync_market_history import (
     HistorySyncConfig,
     _project_history,
     _publish_missing_history,
+    _scoped_manifest_covers,
     _write_instrument_map,
     compact_history_payload,
     completed_sessions_after,
@@ -197,7 +198,8 @@ def test_projection_reads_exact_available_s3_versions_and_writes_separate_histor
             "data_layer": "ADJUSTED" if timeframe == "30m" else "DERIVED",
             "resolution": timeframe,
             "period_start": "2026-08-10T13:30:00Z",
-                "period_end": "2026-08-10T20:00:00Z",
+            "period_end": "2027-01-01T00:00:00Z",
+            "actual_end_at": "2026-08-10T20:00:00Z",
                 "revision_number": 1,
                 "dataset_hash": f"{timeframe}-dataset-hash",
             }
@@ -269,6 +271,26 @@ def test_projection_reads_exact_available_s3_versions_and_writes_separate_histor
         f"{{i2s:market}}:history:bars:{instrument_id}:{timeframe}"
         for timeframe in ("30m", "1h", "4h", "1d")
     }
+
+
+def test_instrument_scoped_manifest_replaces_shared_rows_for_its_entire_period() -> None:
+    instrument_id = "70000000-0000-4000-8000-000000000001"
+    scoped = [{
+        "instrument_id": instrument_id,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2027-01-01T00:00:00Z",
+    }]
+
+    assert _scoped_manifest_covers(
+        scoped,
+        instrument_id,
+        datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert not _scoped_manifest_covers(
+        scoped,
+        instrument_id,
+        datetime(2025, 12, 31, 23, 59, tzinfo=UTC),
+    )
 
 
 def test_instrument_map_uses_only_the_active_primary_symbol(tmp_path: Path) -> None:

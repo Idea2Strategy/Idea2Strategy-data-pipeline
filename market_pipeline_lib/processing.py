@@ -307,6 +307,53 @@ def derive_regular_bars(
     return sort_bar_table(table).replace_schema_metadata(bar_schema(True).metadata)
 
 
+def filter_regular_session_bars(
+    provider_table: pa.Table,
+    calendar_name: str = CALENDAR_NAME,
+) -> pa.Table:
+    """Keep observed provider bars whose starts fall inside the exchange session."""
+    if provider_table.num_rows == 0:
+        return pa.Table.from_pylist([], schema=bar_schema(False))
+    source = provider_table.to_pandas()
+    source["bar_start_at"] = pd.to_datetime(source["bar_start_at"], utc=True)
+    schedule = _schedule(
+        source["session_date_et"].min(),
+        source["session_date_et"].max(),
+        calendar_name,
+    )
+    schedule_by_date = {
+        pd.Timestamp(index).date(): (
+            pd.Timestamp(row["market_open"]).tz_convert("UTC"),
+            pd.Timestamp(row["market_close"]).tz_convert("UTC"),
+        )
+        for index, row in schedule.iterrows()
+    }
+    regular = []
+    for (_, session_date), group in source.groupby(
+        ["instrument_id", "session_date_et"],
+        sort=True,
+    ):
+        bounds = schedule_by_date.get(session_date)
+        if bounds is None:
+            continue
+        market_open, market_close = bounds
+        selected = group[
+            (group["bar_start_at"] >= market_open)
+            & (group["bar_start_at"] < market_close)
+        ]
+        if not selected.empty:
+            regular.append(selected)
+    if not regular:
+        return pa.Table.from_pylist([], schema=bar_schema(False))
+    table = pa.Table.from_pandas(
+        pd.concat(regular, ignore_index=True),
+        schema=bar_schema(False),
+        preserve_index=False,
+        safe=True,
+    )
+    return sort_bar_table(table).replace_schema_metadata(bar_schema(False).metadata)
+
+
 def quality_findings(
     table: pa.Table,
     contract: DatasetContract,

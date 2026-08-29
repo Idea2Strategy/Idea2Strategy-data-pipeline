@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -117,6 +117,7 @@ def test_feature_values_are_published_as_a_version_pinned_strict_parquet_dataset
     assert storage[0]["schema_version"] == FEATURE_SERIES_SCHEMA_VERSION
     assert storage[0]["provider_version_id"]
     assert storage[0]["content_hash"] == result.output_content_hash
+    assert f"/manifest_id={OUTPUT_MANIFEST}/" in storage[0]["object_key"]
     assert store.verify(storage[0]["object_key"], storage[0]["content_hash"]).ok
 
     with store.open_version(storage[0]["object_key"], storage[0]["provider_version_id"]) as stream:
@@ -152,6 +153,52 @@ def test_feature_values_are_published_as_a_version_pinned_strict_parquet_dataset
     assert catalog.events.index(("manifest", "AVAILABLE")) < catalog.events.index(
         ("materialization", "SUCCEEDED")
     )
+
+
+def test_new_feature_source_revision_atomically_supersedes_the_previous_output(tmp_path: Path) -> None:
+    catalog, _store, materializer, published = make_materializer(tmp_path)
+    first_request = request(published)
+    materializer.materialize(first_request)
+    second_manifest = "60000000-0000-4000-8000-000000000002"
+    second_request = replace(
+        first_request,
+        pipeline_run_id="30000000-0000-4000-8000-000000000002",
+        sources=(replace(
+            first_request.sources[0],
+            dataset_object_id="50000000-0000-4000-8000-000000000002",
+            content_hash="b" * 64,
+        ),),
+        output_dataset_manifest_id=second_manifest,
+        output_revision_number=2,
+    )
+
+    materializer.materialize(second_request)
+
+    manifests = {row["id"]: row for row in catalog.records("market_data.dataset_manifests")}
+    assert manifests[OUTPUT_MANIFEST]["status"] == "SUPERSEDED"
+    assert manifests[second_manifest]["status"] == "AVAILABLE"
+    assert manifests[second_manifest]["supersedes_manifest_id"] == OUTPUT_MANIFEST
+
+
+def test_same_year_different_feature_window_does_not_supersede_existing_output(tmp_path: Path) -> None:
+    catalog, _store, materializer, published = make_materializer(tmp_path)
+    first_request = request(published)
+    materializer.materialize(first_request)
+    second_manifest = "60000000-0000-4000-8000-000000000003"
+    second_request = replace(
+        first_request,
+        pipeline_run_id="30000000-0000-4000-8000-000000000003",
+        period_end=first_request.period_end + timedelta(days=1),
+        output_dataset_manifest_id=second_manifest,
+        output_revision_number=2,
+    )
+
+    with pytest.raises(ValueError, match="different period"):
+        materializer.materialize(second_request)
+
+    manifests = {row["id"]: row for row in catalog.records("market_data.dataset_manifests")}
+    assert manifests[OUTPUT_MANIFEST]["status"] == "AVAILABLE"
+    assert second_manifest not in manifests
 
 
 def test_version_pinned_readback_supports_an_unseekable_object_stream(tmp_path: Path) -> None:

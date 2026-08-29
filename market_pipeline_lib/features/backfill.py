@@ -90,6 +90,7 @@ class BackfillCommand:
                 self.instrument_id,
                 _stamp(self.period_start),
                 _stamp(self.period_end),
+                list(self.source_dataset_object_ids),
             ],
             separators=(",", ":"),
         ).encode("utf-8")
@@ -190,6 +191,15 @@ def plan_feature_backfill(
                 if row.get("instrument_id") is None
                 or str(row["instrument_id"]) == instrument_id
             ]
+            scoped = [
+                row for row in owned if str(row.get("instrument_id")) == instrument_id
+            ]
+            owned = [
+                row
+                for row in owned
+                if row.get("instrument_id") is not None
+                or not _fully_covered_by_manifests(row, scoped)
+            ]
             if not owned:
                 warnings.append(BackfillWarning(
                     code="NO_COVERAGE",
@@ -241,7 +251,14 @@ def plan_feature_backfill(
                 ))
                 continue
 
-            if _is_satisfied(catalog, definition, instrument_id, start, end):
+            if _is_satisfied(
+                catalog,
+                definition,
+                instrument_id,
+                start,
+                end,
+                {item[2] for item in objects},
+            ):
                 satisfied.append((definition.resolution, instrument_id))
                 if not include_satisfied:
                     continue
@@ -318,6 +335,26 @@ def _available_bar_manifests(catalog: FeatureCatalog, resolution: str) -> list[d
         if held is None or int(row["revision_number"]) > int(held["revision_number"]):
             current[identity] = row
     return list(current.values())
+
+
+def _fully_covered_by_manifests(
+    target: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> bool:
+    start = _time(target["period_start"])
+    end = _time(target["period_end"])
+    cursor = start
+    for candidate in sorted(candidates, key=lambda row: _time(row["period_start"])):
+        candidate_start = _time(candidate["period_start"])
+        candidate_end = _time(candidate["period_end"])
+        if candidate_end <= cursor or candidate_start >= end:
+            continue
+        if candidate_start > cursor:
+            return False
+        cursor = max(cursor, candidate_end)
+        if cursor >= end:
+            return True
+    return False
 
 
 def _covered_instruments(
@@ -428,14 +465,43 @@ def _is_satisfied(
     instrument_id: str,
     start: datetime,
     end: datetime,
+    source_object_ids: set[str],
 ) -> bool:
     """Whether a SUCCEEDED materialization already covers the whole span."""
     rows = catalog.records(
         "market_data.feature_materializations",
         where={"feature_definition_id": definition.id, "instrument_id": instrument_id},
     )
+    manifest_status = {
+        str(row["id"]): row.get("status")
+        for row in catalog.records("market_data.dataset_manifests")
+    }
+    output_relations = catalog.records("market_data.dataset_objects")
+    object_lineage = catalog.records("market_data.dataset_object_lineage")
+
+    def uses_current_sources(row: Mapping[str, Any]) -> bool:
+        output_manifest_id = row.get("output_dataset_manifest_id")
+        if output_manifest_id is None:
+            return False
+        derived_ids = {
+            str(relation["id"])
+            for relation in output_relations
+            if str(relation.get("dataset_manifest_id")) == str(output_manifest_id)
+        }
+        if len(derived_ids) != 1:
+            return False
+        materialized_sources = {
+            str(lineage["source_dataset_object_id"])
+            for lineage in object_lineage
+            if str(lineage.get("derived_dataset_object_id")) in derived_ids
+        }
+        return materialized_sources == source_object_ids
+
     return any(
         row.get("status") == "SUCCEEDED"
+        and row.get("output_dataset_manifest_id") is not None
+        and manifest_status.get(str(row["output_dataset_manifest_id"])) == _AVAILABLE
+        and uses_current_sources(row)
         and _time(row["period_start"]) <= start
         and _time(row["period_end"]) >= end
         for row in rows

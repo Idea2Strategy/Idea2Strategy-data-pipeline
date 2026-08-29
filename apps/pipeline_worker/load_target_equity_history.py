@@ -17,6 +17,7 @@ from market_pipeline_lib.equity_history import (
     TARGET_SYMBOLS,
     derive_required_resolutions,
     fetch_adjusted_30m,
+    latest_permitted_sip_30m_end,
     publish_instrument_year,
 )
 from market_pipeline_lib.storage import S3ObjectStore
@@ -70,7 +71,7 @@ def execute() -> dict[str, object]:
             config.api_secret,
             mappings,
             datetime(2015, 1, 1, tzinfo=UTC),
-            observed_at,
+            latest_permitted_sip_30m_end(observed_at),
         )
         publication_count = 0
         rows: dict[str, dict[str, int]] = {}

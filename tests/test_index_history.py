@@ -75,6 +75,31 @@ def test_yahoo_index_parser_rejects_missing_or_impossible_ohlcv() -> None:
         parse_yahoo_chart(payload, expected_symbol="^NDX")
 
 
+def test_yahoo_index_parser_omits_incomplete_provider_rows_without_inventing_values() -> None:
+    payload = _payload()
+    payload["chart"]["result"][0]["indicators"]["quote"][0]["close"][0] = None
+
+    bars = parse_yahoo_chart(payload, expected_symbol="^NDX")
+
+    assert bars == [{
+        "bar_start_at": datetime.fromtimestamp(1735914600, UTC),
+        "open": 21100.0,
+        "high": 21200.0,
+        "low": 21050.0,
+        "close": 21180.0,
+        "volume": 8214050000,
+    }]
+
+
+def test_yahoo_index_parser_rejects_a_response_with_no_complete_provider_rows() -> None:
+    payload = _payload()
+    quotes = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    quotes["close"] = [None, None]
+
+    with pytest.raises(ValueError, match="no complete bars"):
+        parse_yahoo_chart(payload, expected_symbol="^NDX")
+
+
 def test_yahoo_index_parser_rejects_symbol_or_column_length_mismatch() -> None:
     payload = _payload()
     payload["chart"]["result"][0]["indicators"]["quote"][0]["volume"].pop()

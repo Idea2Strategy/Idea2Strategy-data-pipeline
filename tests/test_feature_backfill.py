@@ -59,6 +59,7 @@ class FakeCatalog:
         ]
         self.manifests: list[dict[str, Any]] = []
         self.objects: list[dict[str, Any]] = []
+        self.object_lineage: list[dict[str, Any]] = []
         self.materializations: list[dict[str, Any]] = []
 
     def add_manifest(
@@ -119,6 +120,7 @@ class FakeCatalog:
             "market_data.instruments": self.instruments,
             "market_data.dataset_manifests": self.manifests,
             "market_data.dataset_objects": self.objects,
+            "market_data.dataset_object_lineage": self.object_lineage,
             "market_data.feature_materializations": self.materializations,
         }[table]
         if not where:
@@ -361,6 +363,16 @@ class TestTheCommandIsResumable:
 
         assert whole.command_id != clamped.command_id
 
+    def test_a_new_source_object_revision_is_a_different_command(self) -> None:
+        first_catalog = _one_month()
+        second_catalog = _one_month()
+        second_catalog.objects[0]["id"] = "object-revision-2"
+
+        first = plan_feature_backfill(first_catalog, [_definition("30m")]).commands[0]
+        second = plan_feature_backfill(second_catalog, [_definition("30m")]).commands[0]
+
+        assert first.command_id != second.command_id
+
     def test_the_command_id_fits_the_worker_identifier_contract(self) -> None:
         command = plan_feature_backfill(_one_month(), [_definition("30m")]).commands[0]
 
@@ -381,11 +393,46 @@ class TestTheCommandIsResumable:
 
 
 class TestAlreadyMaterializedWorkIsNotRepeated:
-    def test_a_succeeded_materialization_covering_the_span_is_skipped(self) -> None:
+    def test_a_legacy_success_without_a_verified_output_is_planned_again(self) -> None:
         catalog = _one_month()
         catalog.materializations.append({
             "feature_definition_id": _definition("30m").id,
             "instrument_id": INSTRUMENT,
+            "status": "SUCCEEDED",
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+
+        assert len(plan_feature_backfill(catalog, [_definition("30m")]).commands) == 1
+
+    def test_a_succeeded_materialization_with_current_available_output_is_skipped(self) -> None:
+        catalog = _one_month()
+        output_manifest = "00000000-0000-4000-8000-000000000496"
+        output_object = "00000000-0000-4000-8000-000000000495"
+        catalog.manifests.append({
+            "id": output_manifest,
+            "feed_id": "feature-output",
+            "instrument_id": INSTRUMENT,
+            "resolution": "30m",
+            "data_layer": "FEATURE",
+            "status": "AVAILABLE",
+            "revision_number": 1,
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        catalog.objects.append({
+            "id": output_object,
+            "dataset_manifest_id": output_manifest,
+            "object_kind": "FEATURE_SERIES",
+        })
+        catalog.object_lineage.append({
+            "derived_dataset_object_id": output_object,
+            "source_dataset_object_id": catalog.objects[0]["id"],
+        })
+        catalog.materializations.append({
+            "feature_definition_id": _definition("30m").id,
+            "instrument_id": INSTRUMENT,
+            "output_dataset_manifest_id": output_manifest,
             "status": "SUCCEEDED",
             "period_start": _utc("2016-01-01T00:00:00+00:00"),
             "period_end": _utc("2016-02-01T00:00:00+00:00"),
@@ -402,6 +449,102 @@ class TestAlreadyMaterializedWorkIsNotRepeated:
             "feature_definition_id": _definition("30m").id,
             "instrument_id": INSTRUMENT,
             "status": "FAILED",
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+
+        assert len(plan_feature_backfill(catalog, [_definition("30m")]).commands) == 1
+
+    def test_a_succeeded_materialization_with_a_superseded_output_is_planned_again(self) -> None:
+        catalog = _one_month()
+        output_manifest = "00000000-0000-4000-8000-000000000499"
+        catalog.manifests.append({
+            "id": output_manifest,
+            "feed_id": "feature-output",
+            "instrument_id": INSTRUMENT,
+            "resolution": "30m",
+            "data_layer": "FEATURE",
+            "status": "SUPERSEDED",
+            "revision_number": 1,
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        catalog.materializations.append({
+            "feature_definition_id": _definition("30m").id,
+            "instrument_id": INSTRUMENT,
+            "output_dataset_manifest_id": output_manifest,
+            "status": "SUCCEEDED",
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+
+        assert len(plan_feature_backfill(catalog, [_definition("30m")]).commands) == 1
+
+    def test_a_succeeded_materialization_from_an_old_source_revision_is_planned_again(self) -> None:
+        catalog = _one_month()
+        output_manifest = "00000000-0000-4000-8000-000000000498"
+        output_object = "00000000-0000-4000-8000-000000000497"
+        catalog.manifests.append({
+            "id": output_manifest,
+            "feed_id": "feature-output",
+            "instrument_id": INSTRUMENT,
+            "resolution": "30m",
+            "data_layer": "FEATURE",
+            "status": "AVAILABLE",
+            "revision_number": 1,
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        catalog.objects.append({
+            "id": output_object,
+            "dataset_manifest_id": output_manifest,
+            "object_kind": "FEATURE_SERIES",
+        })
+        catalog.object_lineage.append({
+            "derived_dataset_object_id": output_object,
+            "source_dataset_object_id": "old-source-object",
+        })
+        catalog.materializations.append({
+            "feature_definition_id": _definition("30m").id,
+            "instrument_id": INSTRUMENT,
+            "output_dataset_manifest_id": output_manifest,
+            "status": "SUCCEEDED",
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+
+        assert len(plan_feature_backfill(catalog, [_definition("30m")]).commands) == 1
+
+    def test_a_succeeded_materialization_with_multiple_output_objects_is_planned_again(self) -> None:
+        catalog = _one_month()
+        output_manifest = "00000000-0000-4000-8000-000000000492"
+        catalog.manifests.append({
+            "id": output_manifest,
+            "feed_id": "feature-output",
+            "instrument_id": INSTRUMENT,
+            "resolution": "30m",
+            "data_layer": "FEATURE",
+            "status": "AVAILABLE",
+            "revision_number": 1,
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        for suffix in ("490", "491"):
+            output_object = f"00000000-0000-4000-8000-000000000{suffix}"
+            catalog.objects.append({
+                "id": output_object,
+                "dataset_manifest_id": output_manifest,
+                "object_kind": "FEATURE_SERIES",
+            })
+            catalog.object_lineage.append({
+                "derived_dataset_object_id": output_object,
+                "source_dataset_object_id": catalog.objects[0]["id"],
+            })
+        catalog.materializations.append({
+            "feature_definition_id": _definition("30m").id,
+            "instrument_id": INSTRUMENT,
+            "output_dataset_manifest_id": output_manifest,
+            "status": "SUCCEEDED",
             "period_start": _utc("2016-01-01T00:00:00+00:00"),
             "period_end": _utc("2016-02-01T00:00:00+00:00"),
         })
@@ -580,6 +723,71 @@ def test_the_object_cap_matches_the_worker() -> None:
     assert MAX_SOURCE_OBJECTS_PER_COMMAND == MAX_FEATURE_SOURCE_OBJECTS
 
 
+def test_instrument_scoped_manifest_replaces_shared_sources_for_the_same_period() -> None:
+    catalog = FakeCatalog()
+    catalog.add_manifest(
+        "shared", resolution="30m", instrument_id=None,
+        start="2016-01-01T00:00:00+00:00", end="2016-02-01T00:00:00+00:00",
+    )
+    catalog.add_object(
+        "shared-object", manifest_id="shared",
+        start="2016-01-01T00:00:00+00:00", end="2016-02-01T00:00:00+00:00",
+        shard_key=stable_shard_key(INSTRUMENT, 8),
+    )
+    catalog.add_manifest(
+        "scoped", resolution="30m", instrument_id=INSTRUMENT,
+        start="2016-01-01T00:00:00+00:00", end="2016-02-01T00:00:00+00:00",
+    )
+    catalog.add_object(
+        "scoped-object", manifest_id="scoped",
+        start="2016-01-01T00:00:00+00:00", end="2016-02-01T00:00:00+00:00",
+    )
+
+    command = plan_feature_backfill(
+        catalog,
+        [_definition("30m")],
+        instrument_ids=[INSTRUMENT],
+    ).commands[0]
+
+    assert command.source_dataset_object_ids == ("scoped-object",)
+
+
+def test_adjacent_scoped_manifests_collectively_replace_a_wider_shared_source() -> None:
+    catalog = FakeCatalog()
+    catalog.add_manifest(
+        "shared-wide", resolution="30m", instrument_id=None,
+        start="2016-01-01T00:00:00+00:00", end="2016-03-01T00:00:00+00:00",
+    )
+    catalog.add_object(
+        "shared-wide-object", manifest_id="shared-wide",
+        start="2016-01-01T00:00:00+00:00", end="2016-03-01T00:00:00+00:00",
+        shard_key=stable_shard_key(INSTRUMENT, 8),
+    )
+    for month, start, end in (
+        ("jan", "2016-01-01T00:00:00+00:00", "2016-02-01T00:00:00+00:00"),
+        ("feb", "2016-02-01T00:00:00+00:00", "2016-03-01T00:00:00+00:00"),
+    ):
+        catalog.add_manifest(
+            f"scoped-{month}", resolution="30m", instrument_id=INSTRUMENT,
+            start=start, end=end,
+        )
+        catalog.add_object(
+            f"scoped-{month}-object", manifest_id=f"scoped-{month}",
+            start=start, end=end,
+        )
+
+    command = plan_feature_backfill(
+        catalog,
+        [_definition("30m")],
+        instrument_ids=[INSTRUMENT],
+    ).commands[0]
+
+    assert command.source_dataset_object_ids == (
+        "scoped-jan-object",
+        "scoped-feb-object",
+    )
+
+
 def test_a_naive_timestamp_in_the_catalog_is_refused() -> None:
     """The pipeline works in ET and UTC; a naive instant is ambiguous, not a default."""
     catalog = _one_month()
@@ -644,6 +852,29 @@ class TestTheEntryPointPlansBeforeItSends:
             "status": "SUCCEEDED",
             "period_start": _utc("2016-01-01T00:00:00+00:00"),
             "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        output_manifest = "00000000-0000-4000-8000-000000000494"
+        output_object = "00000000-0000-4000-8000-000000000493"
+        catalog.materializations[-1]["output_dataset_manifest_id"] = output_manifest
+        catalog.manifests.append({
+            "id": output_manifest,
+            "feed_id": "feature-output",
+            "instrument_id": INSTRUMENT,
+            "resolution": "30m",
+            "data_layer": "FEATURE",
+            "status": "AVAILABLE",
+            "revision_number": 1,
+            "period_start": _utc("2016-01-01T00:00:00+00:00"),
+            "period_end": _utc("2016-02-01T00:00:00+00:00"),
+        })
+        catalog.objects.append({
+            "id": output_object,
+            "dataset_manifest_id": output_manifest,
+            "object_kind": "FEATURE_SERIES",
+        })
+        catalog.object_lineage.append({
+            "derived_dataset_object_id": output_object,
+            "source_dataset_object_id": catalog.objects[0]["id"],
         })
         sent: list[tuple[str, str]] = []
 
