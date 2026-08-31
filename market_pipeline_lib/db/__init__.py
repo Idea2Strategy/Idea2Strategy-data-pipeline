@@ -1,7 +1,6 @@
 """SQLAlchemy Core access to the canonical `market_data` schema.
 
-Spec section 0.3 and `docs/backend-implementation-master-checklist.md` line 75 allow
-Python exactly one database technique: SQLAlchemy Core, no ORM session, no Alembic.
+The database boundary uses SQLAlchemy Core, with no ORM session and no Alembic.
 This package is that boundary.  psycopg appears only as SQLAlchemy's driver.
 
 Layout mirrors the sibling `backtest-engine` persistence package so the two D-bundle

@@ -45,8 +45,7 @@ that materializations already cite.
    The contents of `_OFFICIAL_V1_ENTRIES`, and the `formula_rules` they bind, are a
    product-meaning contract.  They are pinned here and covered by
    `tests/test_feature_catalog.py` so that they are reviewable, not because they are
-   settled: every one of them is listed in this card's report as a decision awaiting
-   product-authority approval.  Approving a change means a new ``catalog_version`` and a
+   silently mutable. Publishing a change means a new ``catalog_version`` and a
    new set of entry hashes, never an edit in place.
 """
 
