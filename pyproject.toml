@@ -59,7 +59,7 @@ test = [
 ]
 
 [project.scripts]
-# Execution apps named by docs/backend-implementation-master-checklist.md (D01).
+# Market-data and corporate-action execution apps.
 pipeline-worker = "apps.pipeline_worker.main:main"
 market-pipeline = "market_pipeline_lib.cli:main"
 daily-pipeline = "daily_pipeline:main"
