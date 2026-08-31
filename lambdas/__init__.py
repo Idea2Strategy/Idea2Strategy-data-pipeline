@@ -1,7 +1,6 @@
 """AWS Lambda handlers for the D bundle.
 
-`docs/backend-implementation-master-checklist.md` names three Lambdas for the
-`data-pipeline` repository:
+The `data-pipeline` repository exposes three Lambdas:
 
 * ``lambdas.pipeline_trigger``           - schedules pipeline commands onto the worker queue
 * ``lambdas.lightweight_validation``     - cheap contract validation of published documents
