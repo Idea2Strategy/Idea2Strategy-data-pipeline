@@ -73,7 +73,10 @@ class InvalidTradingSession(ReferenceDataError, ValueError):
 
 
 class CalendarSourceDrift(ReferenceDataError, RuntimeError):
-    """The installed calendar library is not the one `calendar_version` names.
+    """An installed calendar library is not the release `calendar_version` stands for.
+
+    Either `pandas_market_calendars` itself or `exchange_calendars`, which its XNYS
+    mirror takes holidays and early closes from.
 
     `trading_sessions.calendar_version` is what a backtest, a realtime evaluation
     and a weekly object check pin their session boundaries to.  Emitting rows

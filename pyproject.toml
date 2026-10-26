@@ -27,6 +27,10 @@ dependencies = [
   # `market_pipeline_lib.reference.sessions` refuses any release but the one its XNYS
   # boundaries were verified against (XNYS_CALENDAR_LIBRARY_VERSION). Bump both together.
   "pandas-market-calendars==5.4.0",
+  # pandas-market-calendars 5.4.0 serves "XNYS" from its exchange-calendars mirror, which
+  # supplies the holidays, early closes and session times, so the same refusal covers this
+  # release too (XNYS_EXCHANGE_CALENDARS_VERSION). Bump both together.
+  "exchange-calendars==4.13.2",
   "psycopg[binary]>=3.2,<4",
   # Parquet contract fixtures include the producer version in their metadata.
   # Keep the writer exact so byte-for-byte determinism is portable across CI and local runs.
@@ -221,6 +225,8 @@ module = [
   "boto3.*",
   "botocore",
   "botocore.*",
+  "exchange_calendars",
+  "exchange_calendars.*",
   "pandas_market_calendars",
   "pandas_market_calendars.*",
   "pyarrow",
