@@ -402,8 +402,14 @@ jobs:
           --health-interval 10s --health-timeout 5s --health-retries 12
     env:
       # The vendored bundle under db/migration-contributions/fixtures is the
-      # only source available to a bare checkout; leaving this unset would make
-      # conftest search for a superproject that CI does not check out.
+      # only source available to a bare checkout. With I2S_SUPERPROJECT_ROOT
+      # unset, conftest walks the ancestors and siblings of this checkout
+      # looking for a superproject CI never checks out, which is how
+      # /home/packer once errored every DB test. Pointing it at this checkout,
+      # which is not a superproject, turns that search off, so the run always
+      # applies the vendored bundle.
+      I2S_SUPERPROJECT_ROOT: ${{ github.workspace }}
+      # The image Testcontainers starts; conftest defaults to the same tag.
       PIPELINE_TEST_POSTGRES_IMAGE: postgres:16-alpine
       LOCALSTACK_ENDPOINT_URL: http://localhost:4566
       AWS_ACCESS_KEY_ID: test
