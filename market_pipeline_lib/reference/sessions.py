@@ -8,14 +8,26 @@ work from.  That makes two things load-bearing.
 **The source has to be real.**  Sessions come from `pandas_market_calendars`, the
 same library `engine.py`, `processing.py` and `quality.py` already use for XNYS,
 including its own `early_closes` classification.  Nothing here re-derives a
-holiday rule.
+holiday rule.  For "XNYS" that library is itself a mirror: its holidays, early
+closes and session times come from `exchange_calendars`, so both releases decide
+the boundaries.
 
 **The version has to be honest.**  `calendar_version` is the label downstream
 replay pins to, so it names the library release that produced the boundaries and
-`xnys_sessions` refuses to emit rows under that label from any other release.  A
-recalculated calendar is therefore a *new version* -- the unique index is
-``(exchange_mic, session_date, calendar_version)``, so old rows survive and a
-completed backtest's boundaries cannot be silently rewritten.
+`xnys_sessions` refuses to emit rows under that label from any other release of
+either library.  A recalculated calendar is therefore a *new version* -- the
+unique index is ``(exchange_mic, session_date, calendar_version)``, so old rows
+survive and a completed backtest's boundaries cannot be silently rewritten.
+
+The label names only the `pandas_market_calendars` release.  It was not widened to
+name `exchange_calendars` as well when that pin was added: the refusal above
+already ties ``XNYS/mcal-5.4.0`` to exactly one pair of releases, and renaming the
+label would re-key every published row (the id hashes it), strand any reader
+configured with the old label, and leave a database holding two XNYS versions,
+which the superproject's replay oracle
+(``scripts/integration/backtest_actual_run_oracle.py``) rejects.  The next bump of
+either release is a new version anyway, and that label should name both, e.g.
+``XNYS/mcal-5.5.0+xcals-4.14.0`` (29 of the 40 characters).
 
 A row is emitted for every date in the requested range, not only for trading days.
 "Is 2024-11-28 a session?" is then one lookup with no weekend/holiday fallback
@@ -33,6 +45,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import exchange_calendars as xcals
 import pandas as pd
 import pandas_market_calendars as mcal
 
@@ -47,6 +60,7 @@ __all__ = [
     "SESSION_TYPE_REGULAR",
     "XNYS_CALENDAR_LIBRARY_VERSION",
     "XNYS_CALENDAR_VERSION",
+    "XNYS_EXCHANGE_CALENDARS_VERSION",
     "XNYS_MIC",
     "TradingSession",
     "TradingSessionRegistry",
@@ -66,6 +80,11 @@ SESSION_TYPES: tuple[str, ...] = (SESSION_TYPE_REGULAR, SESSION_TYPE_EARLY_CLOSE
 
 #: The `pandas_market_calendars` release these boundaries were verified against.
 XNYS_CALENDAR_LIBRARY_VERSION = "5.4.0"
+
+#: The `exchange_calendars` release behind them.  `pandas_market_calendars` 5.4.0
+#: serves "XNYS" from its `calendars/mirror.py`, which delegates holidays, early
+#: closes and session times to this library.
+XNYS_EXCHANGE_CALENDARS_VERSION = "4.13.2"
 
 #: `varchar(40)`.  Names the calendar and the library release that produced it.
 XNYS_CALENDAR_VERSION = f"XNYS/mcal-{XNYS_CALENDAR_LIBRARY_VERSION}"
@@ -89,6 +108,12 @@ def _installed_calendar_library_version() -> str:
     """Read at call time, so a version change is caught on the next call."""
 
     return str(getattr(mcal, "__version__", "unknown"))
+
+
+def _installed_exchange_calendars_version() -> str:
+    """Read at call time, like `_installed_calendar_library_version`."""
+
+    return str(getattr(xcals, "__version__", "unknown"))
 
 
 @dataclass(frozen=True)
@@ -189,9 +214,10 @@ def xnys_sessions(start: date, end: date) -> tuple[TradingSession, ...]:
     """Every date in ``[start, end]``, classified from the pinned XNYS calendar.
 
     Raises `CalendarSourceDrift` when the installed `pandas_market_calendars` is
-    not the release `XNYS_CALENDAR_VERSION` names: the label is what downstream
-    replay pins its boundaries to, so it may not be attached to rows a different
-    release produced.
+    not the release `XNYS_CALENDAR_VERSION` names, or the installed
+    `exchange_calendars` is not `XNYS_EXCHANGE_CALENDARS_VERSION`: the label is
+    what downstream replay pins its boundaries to, so it may not be attached to
+    rows a different release produced.
     """
 
     installed = _installed_calendar_library_version()
@@ -201,6 +227,17 @@ def xnys_sessions(start: date, end: date) -> tuple[TradingSession, ...]:
             f"labels boundaries produced by {XNYS_CALENDAR_LIBRARY_VERSION}. Re-verify the "
             "XNYS holiday and early-close facts against the new release, then bump "
             "XNYS_CALENDAR_LIBRARY_VERSION and the pinned expectations in "
+            "tests/test_reference_catalog.py."
+        )
+    installed_mirror = _installed_exchange_calendars_version()
+    if installed_mirror != XNYS_EXCHANGE_CALENDARS_VERSION:
+        raise CalendarSourceDrift(
+            f"exchange-calendars {installed_mirror} is installed but {XNYS_CALENDAR_VERSION} "
+            "labels boundaries produced with exchange-calendars "
+            f"{XNYS_EXCHANGE_CALENDARS_VERSION}, which supplies pandas-market-calendars' "
+            "XNYS holidays and early closes. Re-verify the XNYS facts against the new "
+            "release, then bump XNYS_EXCHANGE_CALENDARS_VERSION, mint a calendar_version "
+            "that names both releases, and update the pinned expectations in "
             "tests/test_reference_catalog.py."
         )
     if end < start:
