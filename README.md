@@ -401,8 +401,12 @@ python market_pipeline.py register-reference-data ... --target postgres --execut
 ```
 
 `calendar_version`은 경계를 생성한 라이브러리 릴리스를 이름에 담습니다
-(`XNYS/mcal-5.4.0`). 다른 릴리스가 설치되어 있으면 `CalendarSourceDrift`로
-거부합니다. 재계산된 캘린더는 새 버전이며 기존 행을 덮어쓰지 않습니다.
+(`XNYS/mcal-5.4.0`). pandas-market-calendars 5.4.0의 XNYS는 exchange-calendars를
+미러링하므로(휴장일·조기 폐장·세션 시각) 두 라이브러리를 모두 고정합니다
+(`pandas-market-calendars==5.4.0`, `exchange-calendars==4.13.2`). 어느 쪽이든 다른
+릴리스가 설치되어 있으면 `CalendarSourceDrift`로 거부합니다. 재계산된 캘린더는 새
+버전이며 기존 행을 덮어쓰지 않습니다. 다음에 두 릴리스 중 하나를 올릴 때는 두
+릴리스를 모두 담은 새 버전 이름을 씁니다(예: `XNYS/mcal-5.5.0+xcals-4.14.0`).
 
 DBML 계약 검증 및 별도 export:
 

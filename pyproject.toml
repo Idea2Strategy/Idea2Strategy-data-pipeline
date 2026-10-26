@@ -20,6 +20,11 @@ authors = [{ name = "Idea2Strategy D bundle" }]
 dependencies = [
   "alpaca-py>=0.43,<1",
   "boto3>=1.40,<2",
+  # pandas-market-calendars 5.4.0 resolves "XNYS" through its exchange-calendars mirror,
+  # which supplies the holidays, early closes and session times, so pinning only the
+  # former leaves the boundaries free to move. `xnys_sessions` refuses any other release
+  # (XNYS_EXCHANGE_CALENDARS_VERSION). Bump both together.
+  "exchange-calendars==4.13.2",
   "jsonschema>=4.23,<5",
   "lxml>=6,<7",
   "numpy>=2,<3",
@@ -37,14 +42,18 @@ dependencies = [
   # only transport that can actually receive them.  A runtime dependency, not a
   # test one: the realtime consumer does not work without it.
   "redis>=5,<7",
-  "SQLAlchemy>=2.0,<3",
+  # Capped below the next minor, not the next major: SQLAlchemy 2.1 retyped `Result`,
+  # which is enough to fail a type gate, so moving past 2.1 is a deliberate bump.
+  "SQLAlchemy>=2.0,<2.2",
 ]
 
 [project.optional-dependencies]
 dev = [
   "freezegun>=1.5,<2",
   "httpx>=0.28,<1",
-  "mypy>=1.17",
+  # Pinned for the same reason as ruff, and to the release backtest-engine pins: a
+  # new mypy can report new errors, so a floating one moves the type gate by itself.
+  "mypy==2.3.0",
   "pytest>=8.4",
   "pytest-cov>=6.2",
   # Pinned, not floating. An unpinned linter means CI and a developer machine
@@ -221,6 +230,8 @@ module = [
   "boto3.*",
   "botocore",
   "botocore.*",
+  "exchange_calendars",
+  "exchange_calendars.*",
   "pandas_market_calendars",
   "pandas_market_calendars.*",
   "pyarrow",

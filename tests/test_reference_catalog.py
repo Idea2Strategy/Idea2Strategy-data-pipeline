@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from importlib.metadata import requires
 from typing import Any
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from market_pipeline_lib.catalog import LocalCatalog, PostgresCatalog, StorageObjectsPolicy
 from market_pipeline_lib.cli import build_parser, execute
@@ -38,7 +41,9 @@ from market_pipeline_lib.reference import (
     INSTRUMENT_SYMBOLS,
     INSTRUMENTS,
     TRADING_SESSIONS,
+    XNYS_CALENDAR_LIBRARY_VERSION,
     XNYS_CALENDAR_VERSION,
+    XNYS_EXCHANGE_CALENDARS_VERSION,
     XNYS_MIC,
     CalendarSourceDrift,
     InstrumentIdentityConflict,
@@ -750,6 +755,44 @@ def test_a_different_calendar_library_version_refuses_to_produce_sessions(
 
     assert "5.5.0" in str(failure.value)
     assert "5.4.0" in str(failure.value)
+
+
+def test_a_different_exchange_calendars_version_refuses_to_produce_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pandas-market-calendars 5.4.0 serves XNYS from an exchange-calendars mirror.
+
+    The holidays and early closes come from there, so pinning pandas-market-calendars
+    alone would not pin the boundaries the label vouches for.
+    """
+
+    import exchange_calendars
+
+    monkeypatch.setattr(exchange_calendars, "__version__", "4.14.0", raising=False)
+
+    with pytest.raises(CalendarSourceDrift) as failure:
+        xnys_sessions(date(2024, 11, 27), date(2024, 11, 27))
+
+    assert "4.14.0" in str(failure.value)
+    assert XNYS_EXCHANGE_CALENDARS_VERSION in str(failure.value)
+
+
+def test_the_distribution_pins_exactly_the_calendar_releases_the_label_was_verified_against() -> None:
+    """`xnys_sessions` refuses any other release, so the dependency has to as well.
+
+    A range would let a fresh install resolve a newer release and turn the calendar
+    into a runtime refusal -- how pandas-market-calendars 5.5.0 reached CI.  Read from
+    the installed metadata, which is what pip actually resolved against.
+    """
+
+    pins = {
+        canonicalize_name(requirement.name): str(requirement.specifier)
+        for requirement in map(Requirement, requires("idea2strategy-data-pipeline") or [])
+        if requirement.marker is None
+    }
+
+    assert pins["pandas-market-calendars"] == f"=={XNYS_CALENDAR_LIBRARY_VERSION}"
+    assert pins["exchange-calendars"] == f"=={XNYS_EXCHANGE_CALENDARS_VERSION}"
 
 
 def test_a_backwards_range_is_refused() -> None:
