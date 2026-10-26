@@ -72,15 +72,29 @@ source_minutes int16  # DERIVED에만 존재
 
 ## 설치
 
+`pyproject.toml`의 `requires-python`은 `>=3.12,<3.13`이고 CI와 런타임
+이미지는 CPython 3.12.13(COM02)을 씁니다.
+
 ```powershell
-py -3.11 -m venv .venv
+uv venv --python 3.12.13 .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+uv pip install -e ".[dev]"
 ```
 
+uv가 없으면 표준 venv로 같은 환경을 만듭니다.
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+실행만 필요하면 `.[dev]` 대신 `.`을 설치합니다.
+
 `.env.example`을 참고하여 Alpaca 키를 환경변수로 제공합니다. S3와
-PostgreSQL 실행은 각각 선택 의존성 `boto3`, `psycopg[binary]`가 필요합니다.
+PostgreSQL 경로가 쓰는 `boto3`, `psycopg[binary]`, `SQLAlchemy`는 선택
+의존성이 아니라 런타임 의존성이므로 위 설치에 함께 포함됩니다.
 인증정보는 객체, Catalog, 상태, 보고서에 저장하지 않습니다.
 
 `instrument_map.csv`에는 최소 다음 열이 필요합니다.
