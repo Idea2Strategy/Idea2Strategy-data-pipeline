@@ -464,9 +464,7 @@ def resume(
             database.close()
 
 
-def _validation_rows(
-    settings: EnvironmentSettings, manifest_id: UUID
-) -> list[dict[str, Any]]:
+def _validation_rows(settings: EnvironmentSettings, manifest_id: UUID) -> list[dict[str, Any]]:
     database = _database(settings)
     try:
         with database.transaction() as connection:
