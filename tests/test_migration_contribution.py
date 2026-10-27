@@ -273,6 +273,40 @@ class ContributionRejectionTests(unittest.TestCase):
                 validator.check_migration_directory(contribution)
 
 
+class VendoredCentralBundleTests(unittest.TestCase):
+    """The vendored central bundle must stay byte-identical to the LF central bytes.
+
+    Gate 8 checks the same digests, but only after Docker starts; a CRLF copy or a
+    file missing from the digest list should fail the fast gates instead.
+    """
+
+    fixtures = CONTRIBUTION_ROOT / "fixtures"
+    vendored = fixtures / "central-migration"
+    digest_file = fixtures / "central-migration.sha256"
+
+    def _recorded(self) -> dict[str, str]:
+        recorded: dict[str, str] = {}
+        for line in self.digest_file.read_text(encoding="utf-8").splitlines():
+            digest, _, name = line.partition("  ")
+            recorded[name] = digest
+        return recorded
+
+    def test_every_vendored_file_has_a_matching_recorded_digest(self) -> None:
+        import hashlib
+
+        files = {path.name: path for path in self.vendored.iterdir() if path.is_file()}
+        recorded = self._recorded()
+        self.assertEqual(set(files), set(recorded))
+        for name, path in files.items():
+            with self.subTest(migration=name):
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), recorded[name])
+
+    def test_vendored_files_and_digests_are_lf_only(self) -> None:
+        for path in [self.digest_file, *self.vendored.iterdir()]:
+            with self.subTest(file=path.name):
+                self.assertNotIn(b"\r", path.read_bytes())
+
+
 class ValidatorCliTests(unittest.TestCase):
     def test_cli_reports_success_for_this_repository(self) -> None:
         self.assertEqual(validator.main([str(CONTRIBUTION_ROOT)]), 0)
