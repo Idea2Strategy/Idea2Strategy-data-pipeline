@@ -14,7 +14,27 @@ def test_pipeline_worker_image_is_arm64_portable_and_runs_without_root() -> None
     assert "--platform=linux/amd64" not in document
     assert "USER 10001:10001" in document
     assert 'ENTRYPOINT ["pipeline-worker"]' in document
-    assert "pip install --no-cache-dir ." in document
+
+
+def _instructions() -> list[str]:
+    """Dockerfile instructions with continuations joined and whitespace collapsed."""
+
+    document = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    lines = document.replace("\\\n", " ").splitlines()
+    return [" ".join(line.split()) for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
+def test_pipeline_worker_image_installs_third_party_packages_only_from_the_hash_lock() -> None:
+    pip_installs = [line for line in _instructions() if "pip install" in line]
+
+    assert pip_installs[0] == (
+        "RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: "
+        "-r requirements/runtime.txt"
+    )
+    assert pip_installs[1].startswith(
+        "RUN python -m pip install --no-cache-dir --no-deps . && python -m pip check && "
+    )
+    assert len(pip_installs) == 2
 
 
 def test_pipeline_worker_image_removes_runtime_unneeded_perl() -> None:
