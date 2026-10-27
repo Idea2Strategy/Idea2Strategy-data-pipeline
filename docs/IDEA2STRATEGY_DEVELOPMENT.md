@@ -80,6 +80,44 @@ corporate action 등록, adjusted dataset 재생성, 전략 판단 입력은 이
 - Parquet 연산은 Polars·PyArrow가 담당합니다.
 - Alembic은 사용하지 않으며 DBML·Flyway는 루트 저장소가 통합 관리합니다.
 
+## 의존성 잠금
+
+`pyproject.toml` 은 허용 범위를, `requirements/` 는 그 범위 안에서 실제로 설치하는 정확한
+버전과 해시를 기록합니다. backtest-engine 과 같은 방식입니다.
+
+| 파일 | 내용 | 사용하는 곳 |
+|---|---|---|
+| `requirements/runtime.txt` | 런타임 의존성 | `Dockerfile`, CI gate5·gate7 |
+| `requirements/dev.txt` | 런타임 + `dev` extra | 나머지 CI gate, 로컬 개발 |
+
+설치는 항상 두 단계입니다. 잠금 파일을 해시 검증으로 설치한 뒤 프로젝트 자체는 의존성 없이
+설치합니다.
+
+```text
+python -m pip install --require-hashes -r requirements/dev.txt
+python -m pip install --no-deps -e .
+```
+
+재생성은 저장소 루트에서 uv(0.13.1에서 확인)로 합니다.
+
+```text
+uv pip compile pyproject.toml --python-version 3.12 --universal --generate-hashes -o requirements/runtime.txt
+uv pip compile pyproject.toml --python-version 3.12 --universal --generate-hashes --extra dev -o requirements/dev.txt
+```
+
+- `pyproject.toml` 의 의존성을 바꾸면 같은 커밋에서 두 파일을 다시 생성합니다. 출력 파일이
+  이미 있으면 uv는 기존 버전을 유지하고 바뀐 요구만 다시 풉니다.
+- 버전을 올릴 때만 `--upgrade-package <이름>` (전체는 `--upgrade`) 을 붙이고, 두 명령에 같은
+  옵션을 줍니다. 두 파일에 함께 있는 패키지는 버전이 같아야 합니다.
+- `--universal` 이므로 Linux amd64·arm64 이미지와 macOS·Windows 개발 환경이 같은 파일을
+  씁니다. 플랫폼 전용 패키지는 환경 마커로 남습니다.
+- 잠금이 어긋나면 CI가 실패합니다. gate5와 이미지 빌드는 `pip check` 로 런타임 의존성을,
+  gate2는 `dev` extra와 두 파일 사이의 버전 일치까지 검사합니다.
+- 빌드 백엔드 `setuptools`·`wheel` 은 해시 검증 대상이 아닙니다. pip가 격리된 빌드 환경에
+  따로 설치하며 이미지에는 남지 않습니다.
+- `idea2strategy-market-loader/` 는 자체 `uv.lock` 을 쓰는 별도 프로젝트이며 이 잠금에
+  포함되지 않습니다.
+
 ## Git Flow
 
 - `develop`: 기본 개발·통합 브랜치

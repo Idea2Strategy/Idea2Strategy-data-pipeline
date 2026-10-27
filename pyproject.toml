@@ -24,7 +24,13 @@ dependencies = [
   "lxml>=6,<7",
   "numpy>=2,<3",
   "pandas>=3,<4",
-  "pandas-market-calendars>=5.4,<6",
+  # `market_pipeline_lib.reference.sessions` refuses any release but the one its XNYS
+  # boundaries were verified against (XNYS_CALENDAR_LIBRARY_VERSION). Bump both together.
+  "pandas-market-calendars==5.4.0",
+  # pandas-market-calendars 5.4.0 serves "XNYS" from its exchange-calendars mirror, which
+  # supplies the holidays, early closes and session times, so the same refusal covers this
+  # release too (XNYS_EXCHANGE_CALENDARS_VERSION). Bump both together.
+  "exchange-calendars==4.13.2",
   "psycopg[binary]>=3.2,<4",
   # Parquet contract fixtures include the producer version in their metadata.
   # Keep the writer exact so byte-for-byte determinism is portable across CI and local runs.
@@ -35,14 +41,18 @@ dependencies = [
   # only transport that can actually receive them.  A runtime dependency, not a
   # test one: the realtime consumer does not work without it.
   "redis>=5,<7",
-  "SQLAlchemy>=2.0,<3",
+  # Capped below the next minor, not the next major: SQLAlchemy 2.1 retyped `Result`,
+  # which is enough to fail a type gate, so moving past 2.1 is a deliberate bump.
+  "SQLAlchemy>=2.0,<2.2",
 ]
 
 [project.optional-dependencies]
 dev = [
   "freezegun>=1.5,<2",
   "httpx>=0.28,<1",
-  "mypy>=1.17",
+  # Pinned for the same reason as ruff, and to the release backtest-engine pins: a
+  # new mypy can report new errors, so a floating one moves the type gate by itself.
+  "mypy==2.3.0",
   "pytest>=8.4",
   "pytest-cov>=6.2",
   # Pinned, not floating. An unpinned linter means CI and a developer machine
@@ -219,6 +229,8 @@ module = [
   "boto3.*",
   "botocore",
   "botocore.*",
+  "exchange_calendars",
+  "exchange_calendars.*",
   "pandas_market_calendars",
   "pandas_market_calendars.*",
   "pyarrow",

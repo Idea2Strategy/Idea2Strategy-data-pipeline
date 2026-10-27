@@ -494,7 +494,7 @@ def _legacy_schema_metadata(connection: Connection) -> dict[str, Any]:
         )
         """
     )
-    value = connection.execute(statement).scalar_one()
+    value: dict[str, Any] = connection.execute(statement).scalar_one()
     _require(isinstance(value, dict), "legacy schema metadata query did not return an object")
     return value
 
@@ -962,7 +962,7 @@ class _ImmutableLegacyCatalog(PostgresCatalog):
                 )
         for table in _EMPTY_V001_CHANGED_TABLES:
             schema, name = table.split(".", 1)
-            count = connection.execute(
+            count: int = connection.execute(
                 text(f'SELECT count(*) FROM "{schema}"."{name}"')
             ).scalar_one()
             if count:
